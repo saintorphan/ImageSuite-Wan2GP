@@ -73,7 +73,9 @@ def build_settings_panel(native_dl_choices=None):
                              ("SDXL LoRAs", "sdxl_loras"),
                              ("Face / swap weights", "face"),
                              ("ADetailer / person-seg (body)", "body"),
-                             ("BiRefNet (body-swap seg)", "birefnet")], scale=2)
+                             ("BiRefNet (body-swap seg)", "birefnet"),
+                             ("InsightFace buffalo_l (face detect)", "buffalo_l")],
+                    scale=2)
                 c["link_btn"] = gr.Button("🔗 Link", scale=1)
             c["dirs_status"] = gr.Markdown("")
 

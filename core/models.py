@@ -75,10 +75,11 @@ class ModelSpec:
     def is_present(self) -> bool:
         if self.repo:
             local = self.local_dir()
-            if local:
-                d = Path(local)
-                return d.is_dir() and any(d.iterdir())
-            try:  # cache check, no network
+            if local and Path(local).is_dir() and any(Path(local).iterdir()):
+                return True
+            # Fall back to the HF cache (the loader uses the repo id when the local
+            # dir is absent, e.g. BiRefNet) so a cached model isn't read as missing.
+            try:
                 from huggingface_hub import snapshot_download
                 snapshot_download(self.repo, local_files_only=True)
                 return True
@@ -86,7 +87,15 @@ class ModelSpec:
                 return False
         if self.extract:
             d = Path(self.extract_to)
-            return d.is_dir() and any(d.iterdir())
+            if d.is_dir() and any(d.iterdir()):
+                return True
+            if self.key == "buffalo_l":
+                # Also accept the shared-dir layout the face loader looks in.
+                face = paths.models_dir() / "face"
+                for alt in (face / "buffalo_l", face / "models" / "buffalo_l"):
+                    if alt.is_dir() and any(alt.iterdir()):
+                        return True
+            return False
         return (paths.models_dir() / self.subpath).is_file()
 
 

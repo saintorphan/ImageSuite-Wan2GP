@@ -245,7 +245,7 @@ def _shared_dir(key: str, default_leaf: str) -> Path:
 # Logical link targets → the dir the loader actually scans. Resolved through the
 # SAME functions consumers use (honours a configured custom dir) AND placing the
 # face/body/birefnet weights in the partitioned subdirs the loaders expect.
-LINK_TARGETS = ["sdxl_models", "sdxl_loras", "face", "body", "birefnet"]
+LINK_TARGETS = ["sdxl_models", "sdxl_loras", "face", "body", "birefnet", "buffalo_l"]
 
 
 def link_target_dir(target: str) -> Path:
@@ -254,6 +254,9 @@ def link_target_dir(target: str) -> Path:
         return sdxl_models_dir()
     if target == "sdxl_loras":
         return sdxl_loras_dir()
+    if target == "buffalo_l":
+        # InsightFace expects the buffalo_l PACK as a subdir of the face dir.
+        return models_dir() / "face" / "buffalo_l"
     if target in ("face", "body", "birefnet"):
         return models_dir() / target  # loaders read models_dir()/<face|body|birefnet>
     return models_dir() / target

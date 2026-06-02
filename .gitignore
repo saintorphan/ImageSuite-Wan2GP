@@ -6,14 +6,32 @@ __pycache__/
 venv/
 env/
 
-# Generated images / downloaded models + local config
+# Generated images, downloaded models, and local/persisted config.
+# These normally live under the Wan2GP root (outside this repo); ignored
+# defensively so a generation, a persisted prompt, or a model can never be
+# committed even if a folder ends up inside the repo.
 image_suite/
+orphansuite/
+outputs/
+character_lab/
+# persisted config (the ui_state in .imagesuite.json holds your last prompts)
 .imagesuite.json
+.orphansuite.json
+.replicant_charlab.json
+# model weights
 *.safetensors
 *.ckpt
 *.gguf
 *.onnx
 *.pth
+*.pt
+*.bin
+*.sft
+*.vae
+# generated stills (the committed logo/banner are PNGs, so .png is left tracked)
+*.jpg
+*.jpeg
+*.webp
 
 # OS / editor
 .DS_Store

@@ -181,9 +181,11 @@ def get_shared(key, default=None):
 
 def set_shared(key, value) -> None:
     """Persist any JSON value to the cross-plugin .orphansuite.json (shared across
-    saintorphan plugins — e.g. shared dirs and per-family gen_defaults)."""
+    saintorphan plugins — e.g. shared dirs and per-family gen_defaults). Re-reads
+    the file fresh and MERGES, so a concurrent sibling plugin's keys aren't
+    clobbered (last-writer-wins)."""
     global _orphan_cfg, _orphan_cfg_mtime
-    cfg = load_shared_config()
+    cfg = reload_shared_config()  # fresh from disk, not the (possibly stale) cache
     cfg[key] = value
     _orphan_cfg = cfg
     p = Path(os.getcwd()) / _ORPHAN_CONFIG_NAME
@@ -223,26 +225,43 @@ def _shared_dir(key: str, default_leaf: str) -> Path:
     return shared
 
 
+# Logical link targets → the dir the loader actually scans. Resolved through the
+# SAME functions consumers use (honours a configured custom dir) AND placing the
+# face/body/birefnet weights in the partitioned subdirs the loaders expect.
+LINK_TARGETS = ["sdxl_models", "sdxl_loras", "face", "body", "birefnet"]
+
+
+def link_target_dir(target: str) -> Path:
+    """Resolve a logical link target to the exact dir its loader scans."""
+    if target == "sdxl_models":
+        return sdxl_models_dir()
+    if target == "sdxl_loras":
+        return sdxl_loras_dir()
+    if target in ("face", "body", "birefnet"):
+        return models_dir() / target  # loaders read models_dir()/<face|body|birefnet>
+    return models_dir() / target
+
+
 def shared_resource_dir(leaf: str) -> Path:
-    """The canonical OrphanSuite home for a shared resource (where 'link existing
-    folder' symlinks into), ignoring legacy fallbacks."""
+    """Back-compat shim: the canonical home for a shared resource. Prefer
+    ``link_target_dir`` (which honours configured dirs + subdir layout)."""
     return orphansuite_root() / leaf
 
 
 def link_existing_into_shared(
-        source_dir: str, leaf: str,
+        source_dir: str, target: str,
         exts=(".safetensors", ".ckpt", ".pt", ".pth", ".gguf", ".bin",
               ".onnx", ".sft", ".vae")) -> str:
-    """Symlink model files from ``source_dir`` into the OrphanSuite shared area
-    (orphansuite/<leaf>), so models you already keep (a1111 / Forge / a drive
-    folder) are reused without copying or moving the originals. Real symlinks on
-    POSIX; copies as a fallback on Windows where symlinks need admin. Existing
-    symlinks in source are followed to their real target. Returns a summary."""
+    """Symlink model files from ``source_dir`` into the dir its loader actually
+    scans (``link_target_dir`` — honours a configured custom dir AND the
+    face/body/birefnet subdir layout), so models you already keep (a1111 / Forge /
+    a drive folder) are reused without copying or moving the originals. Real
+    symlinks on POSIX; copies as a fallback on Windows. Returns a summary."""
     import shutil
     src = Path(source_dir).expanduser()
     if not src.is_dir():
         raise ValueError(f"Not a folder: {source_dir}")
-    dst_root = shared_resource_dir(leaf)
+    dst_root = link_target_dir(target)
     dst_root.mkdir(parents=True, exist_ok=True)
     linked = copied = skipped = 0
     for f in sorted(src.iterdir()):

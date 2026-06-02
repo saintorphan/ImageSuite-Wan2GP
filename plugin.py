@@ -1909,10 +1909,10 @@ class ImageSuite(WAN2GPPlugin):
         # to orphansuite once it holds files).
         def _link_existing(src, leaf):
             try:
+                # Links straight into the dir the loader scans (resolved through the
+                # configured/shared dirs incl. the face/body/birefnet subdirs), so no
+                # separate shared-dir override is needed — see paths.link_target_dir.
                 msg = f"🔗 {paths.link_existing_into_shared(src, leaf)}"
-                # Point the shared config at the OrphanSuite area so every plugin
-                # follows (overrides any stale per-plugin dir like CharLab's).
-                paths.set_shared_dir(f"{leaf}_dir", str(paths.shared_resource_dir(leaf)))
             except Exception as e:
                 msg = f"⚠️ {e}"
             return ([msg] + _fresh_choices()

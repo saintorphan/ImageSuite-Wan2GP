@@ -278,6 +278,8 @@ def link_existing_into_shared(
     src = Path(source_dir).expanduser()
     if not src.is_dir():
         raise ValueError(f"Not a folder: {source_dir}")
+    if target == "birefnet":
+        exts = None  # an HF model dir: bring config.json + *.py modeling code + weights
     dst_root = link_target_dir(target)
     dst_root.mkdir(parents=True, exist_ok=True)
     linked = copied = skipped = 0

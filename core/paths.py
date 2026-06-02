@@ -14,10 +14,13 @@ Two kinds of location:
         sdxl_loras_dir   SDXL-family LoRAs
         models_dir       face / ADetailer / face-swap weights
 
-Any dir can be repointed from the Settings panel (persisted to .imagesuite.json).
-Shared dirs fall back to a legacy ``<root>/character_lab/<leaf>`` location for
-back-compat, and the Settings "link existing folder" action symlinks models you
-already have (a1111/Forge/…) into the shared area without copying.
+Any dir can be repointed from the Settings panel. The SHARED dirs persist to the
+cross-plugin ``<cwd>/.orphansuite.json`` (so every saintorphan plugin follows),
+while plugin-specific paths (outputs) and per-tab UI state persist to
+``<cwd>/.imagesuite.json``. Shared dirs fall back to a legacy
+``<root>/character_lab/<leaf>`` location for back-compat, and the Settings
+"link existing folder" action symlinks models you already have (a1111/Forge/…)
+into the shared area without copying.
 """
 from __future__ import annotations
 
@@ -131,6 +134,7 @@ _ORPHAN_CONFIG_NAME = ".orphansuite.json"
 _ORPHAN_SUBDIR = "orphansuite"
 _LEGACY_SUBDIR = "character_lab"
 _orphan_cfg: dict | None = None
+_orphan_cfg_mtime: float | None = None
 
 
 def orphansuite_root() -> Path:
@@ -141,15 +145,31 @@ def orphansuite_root() -> Path:
     return Path(os.getcwd()) / _ORPHAN_SUBDIR
 
 
+def reload_shared_config() -> dict:
+    """Force a re-read of the cross-plugin .orphansuite.json from disk."""
+    global _orphan_cfg, _orphan_cfg_mtime
+    p = Path(os.getcwd()) / _ORPHAN_CONFIG_NAME
+    try:
+        _orphan_cfg_mtime = p.stat().st_mtime
+        _orphan_cfg = json.loads(p.read_text())
+    except Exception:
+        _orphan_cfg = {}
+        _orphan_cfg_mtime = None
+    return _orphan_cfg if isinstance(_orphan_cfg, dict) else {}
+
+
 def load_shared_config() -> dict:
-    """The cross-plugin .orphansuite.json (shared model/dir settings)."""
-    global _orphan_cfg
-    if _orphan_cfg is None:
-        try:
-            _orphan_cfg = json.loads(
-                (Path(os.getcwd()) / _ORPHAN_CONFIG_NAME).read_text())
-        except Exception:
-            _orphan_cfg = {}
+    """The cross-plugin .orphansuite.json (shared model/dir settings). Cached by
+    mtime and reloaded when the file changes on disk, so foreign writes from a
+    sibling saintorphan plugin (or a manual edit) are picked up within a session."""
+    global _orphan_cfg, _orphan_cfg_mtime
+    p = Path(os.getcwd()) / _ORPHAN_CONFIG_NAME
+    try:
+        mtime = p.stat().st_mtime
+    except Exception:
+        mtime = None
+    if _orphan_cfg is None or mtime != _orphan_cfg_mtime:
+        return reload_shared_config()
     return _orphan_cfg if isinstance(_orphan_cfg, dict) else {}
 
 
@@ -162,12 +182,14 @@ def get_shared(key, default=None):
 def set_shared(key, value) -> None:
     """Persist any JSON value to the cross-plugin .orphansuite.json (shared across
     saintorphan plugins — e.g. shared dirs and per-family gen_defaults)."""
-    global _orphan_cfg
+    global _orphan_cfg, _orphan_cfg_mtime
     cfg = load_shared_config()
     cfg[key] = value
     _orphan_cfg = cfg
+    p = Path(os.getcwd()) / _ORPHAN_CONFIG_NAME
     try:
-        (Path(os.getcwd()) / _ORPHAN_CONFIG_NAME).write_text(json.dumps(cfg, indent=2))
+        p.write_text(json.dumps(cfg, indent=2))
+        _orphan_cfg_mtime = p.stat().st_mtime  # keep cache fresh after our own write
     except Exception:
         logger.warning("could not write %s", _ORPHAN_CONFIG_NAME, exc_info=True)
 

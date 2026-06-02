@@ -10,6 +10,7 @@ against path traversal: resolved targets must stay inside the overlays root.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -48,7 +49,8 @@ def _folder_dir(folder: str) -> Path:
 def list_folders() -> list[str]:
     """Folder names (one level), with the root pseudo-folder first."""
     root = _root()
-    subs = sorted(p.name for p in root.iterdir() if p.is_dir())
+    subs = sorted(p.name for p in root.iterdir()
+                  if p.is_dir() and not p.is_symlink())
     return [ROOT_LABEL] + subs
 
 
@@ -93,10 +95,22 @@ def save_uploads(folder: str, file_paths: list[str]) -> int:
         src = Path(fp)
         if src.suffix.lower() not in IMAGE_EXTS:
             continue
-        dst = _unique(d / src.name)
+        dst = _unique(d / _safe_name(src.name))
         shutil.copy2(src, dst)
         n += 1
     return n
+
+
+def _safe_name(name: str) -> str:
+    """Sanitize an uploaded filename: keep the (allow-listed image) extension,
+    strip path separators, allow only safe characters, and cap the length."""
+    base = Path(name or "").name  # drop any path separators / traversal
+    stem, suf = Path(base).stem, Path(base).suffix
+    if suf.lower() not in IMAGE_EXTS:
+        stem, suf = base, ""
+    # Allow-list: letters, digits, and a few safe punctuation marks.
+    stem = re.sub(r"[^A-Za-z0-9 ._()\-]", "_", stem).strip(" .") or "overlay"
+    return (stem[:120] + suf)
 
 
 def _unique(dst: Path) -> Path:
@@ -136,13 +150,14 @@ def delete_image(folder: str, name: str) -> None:
     src.unlink()
 
 
-def move_image(folder: str, name: str, dest_folder: str) -> None:
+def move_image(folder: str, name: str, dest_folder: str) -> str:
     src = _safe(folder, name) if folder and folder != ROOT_LABEL else _safe(name)
     if not src.is_file():
         raise ValueError("Pick an image to move.")
     dst_dir = _folder_dir(dest_folder)
+    if dst_dir == src.parent:
+        return src.name  # same folder, no-op
     dst_dir.mkdir(parents=True, exist_ok=True)
     dst = _unique(dst_dir / src.name)
-    if dst.parent == src.parent:
-        return  # same folder, no-op
     shutil.move(str(src), str(dst))
+    return dst.name

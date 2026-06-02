@@ -132,11 +132,9 @@ def _native_from_model(model_value, get_default_settings) -> dict:
     if isinstance(g, (int, float)):
         # Distilled native models use guidance 0/None; clamp into the slider.
         out["cfg"] = float(max(_CFG_MIN, min(_CFG_MAX, g))) if g else _CFG_MIN
-    try:
-        w, h = str(d.get("resolution")).lower().split("x")
-        out["width"], out["height"] = _snap(int(w)), _snap(int(h))
-    except Exception:
-        pass
+    w, h = discovery.parse_size(str(d.get("resolution") or ""))
+    if w > 0 and h > 0:
+        out["width"], out["height"] = _snap(w), _snap(h)
     return out
 
 

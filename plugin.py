@@ -10,6 +10,7 @@ handed to the Video Generator (Img2Vid), or downloaded (Save As).
 NOTE: not an official plugin. Distribute via the plugin-manager "add from GitHub
 URL" flow; do not add to the bundled plugins.json without dbm's approval.
 """
+import functools
 import time
 import traceback
 
@@ -95,16 +96,18 @@ class ImageSuite(WAN2GPPlugin):
     # not our external SDXL/diffusers pipeline — so we bridge both directions:
     #   acquire: take the lock, then release_model() to free Wan2GP's native model
     #            so our SDXL checkpoint has room.
-    #   release: keep our SDXL cached but register gen_sd.release_sd as a GPU-resident
-    #            callback, so when the main app / another plugin next acquires the GPU
-    #            our VRAM is reclaimed automatically (acquire_main runs the callbacks).
+    #   release: keep our SDXL cached but register _release_all_vram as a GPU-resident
+    #            callback (frees the main SD pipe + standalone inpaint/IP pipe +
+    #            segmentation + faceswap sessions), so when the main app / another
+    #            plugin next acquires the GPU our VRAM is reclaimed automatically
+    #            (acquire_main runs the callbacks).
     def _gpu_busy(self, state) -> bool:
         return bool(_HAVE_LOCKS and any_GPU_process_running(state, PLUGIN_ID))
 
     def _abort(self, state):
         """Stop the current generation — native via the session's cancel(), SD via
-        the cooperative abort flag (checked between batch images + by the swap
-        pipelines), plus the base app's gen abort flag."""
+        the cooperative abort flag (checked between batch images and mid-image via
+        the diffusers step callback), plus the base app's gen abort flag."""
         try:
             gen_sd.request_abort()
         except Exception:
@@ -114,22 +117,37 @@ class ImageSuite(WAN2GPPlugin):
                 self._api.cancel()
         except Exception:
             traceback.print_exc()
-        # Clear any stale GPU-lock flags so a stranded gen can't block forever.
+        # Only clear the host-GLOBAL generation lock when WE own it — otherwise a
+        # legitimate Video Generator render (or another plugin's gen) would be
+        # cancelled out from under it. Ownership is the recorded lock holder; an
+        # absent/None holder means there's no foreign owner to protect, so a stale
+        # empty lock is safe to clear.
+        gen = state.get("gen") if isinstance(state, dict) else None
+        owner = gen.get("main_process_running") if isinstance(gen, dict) else None
+        we_own = owner in (None, "", PLUGIN_ID, PLUGIN_NAME)
+        # Always set our own abort flag so OUR queued/running gen stops cooperatively.
         try:
-            if callable(set_main_generation_running):
-                set_main_generation_running(state, False)
-        except Exception:
-            pass
-        try:
-            gen = state.get("gen") if isinstance(state, dict) else None
             if isinstance(gen, dict):
                 gen["abort"] = True
-                gen["process_status"] = None
-                gen.pop("main_process_running", None)
         except Exception:
             pass
-        gr.Info("Abort requested — stopping the current generation (and clearing any "
-                "stuck lock).")
+        if we_own:
+            try:
+                if callable(set_main_generation_running):
+                    set_main_generation_running(state, False)
+            except Exception:
+                pass
+            try:
+                if isinstance(gen, dict):
+                    gen["process_status"] = None
+                    gen.pop("main_process_running", None)
+            except Exception:
+                pass
+            gr.Info("Abort requested — stopping the current generation (and clearing "
+                    "any stuck lock).")
+        else:
+            gr.Info("Abort requested — stopping Image Suite's work. (A Video Generator "
+                    "render appears to own the GPU; its lock was left intact.)")
 
     def acquire_gpu(self, state):
         if not _HAVE_LOCKS:
@@ -147,16 +165,31 @@ class ImageSuite(WAN2GPPlugin):
                 traceback.print_exc()
         return True
 
+    def _release_all_vram(self):
+        """Combined GPU-resident release callback: free EVERY plugin-held GPU
+        consumer — the main SD pipe, the standalone inpaint+IP pipe and the
+        segmentation model (gen_sd.release_all), plus the InsightFace/ONNX face
+        swap sessions — so when the host/another plugin next acquires the GPU,
+        none of our VRAM leaks into video generation."""
+        try:
+            gen_sd.release_all()
+        except Exception:
+            traceback.print_exc()
+        try:
+            self._release_faceswap()
+        except Exception:
+            traceback.print_exc()
+
     def release_gpu(self, state):
         if not _HAVE_LOCKS:
             return
         try:
             release_GPU_ressources(
                 state, PLUGIN_ID, keep_resident=True, process_name=PLUGIN_NAME,
-                release_vram_callback=gen_sd.release_sd, force_release_on_acquire=True)
+                release_vram_callback=self._release_all_vram, force_release_on_acquire=True)
         except TypeError:  # older process_locks without the keep_resident kwargs
             release_GPU_ressources(state, PLUGIN_ID)
-            gen_sd.release_sd()
+            self._release_all_vram()
 
     # -- preserve the Video Generator's setup across a native gen -----------
     # A native gen borrows Wan2GP's shared engine, which can change the current
@@ -254,16 +287,19 @@ class ImageSuite(WAN2GPPlugin):
             raise gr.Error("Select a result first.")
         if not ref:
             raise gr.Error("Add a reference face image.")
-        self._require(["inswapper_128", "buffalo_l"], "Face swap")
+        keys = ["inswapper_128", "buffalo_l"]
+        if enhancer and enhancer.lower() != "none":
+            keys.append(enhancer.lower())
+        self._require(keys, "Face swap")
         gen_sd.release_sd()
-        if not self.acquire_gpu(state):
-            return gr.update(), None, gr.update()
+        self.acquire_gpu(state)
         try:
             progress(0.3, desc="Face swap…")
             img = self._face_pipe().swap(
                 source_path=ref, target_path=picked, enhancer=(enhancer or None),
                 blend_ratio=float(blend), enhancer_strength=float(strength))
         finally:
+            self._release_faceswap()  # don't leak InsightFace/ONNX VRAM
             self.release_gpu(state)
         return self._enh_result(self._save_enh(img, "face"))
 
@@ -275,8 +311,7 @@ class ImageSuite(WAN2GPPlugin):
         self._require(["buffalo_l"] if detector == "face" else ["person_yolov8s_seg"],
                       f"{detector.title()} ADetailer")
         self._release_faceswap()
-        if not self.acquire_gpu(state):
-            return gr.update(), None, gr.update()
+        self.acquire_gpu(state)
         try:
             progress(0.3, desc=f"{detector.title()} ADetailer…")
             res = gen_sd.run_adetailer(ident, picked, pos, neg, "DPM++ 2M", "Karras",
@@ -300,9 +335,15 @@ class ImageSuite(WAN2GPPlugin):
             raise gr.Error("Pick an SDXL / Pony / Illustrious model for the body swap.")
         ident = self._sd_ident(body_model)
         self._require(models.BODY_SWAP_KEYS, "Body swap")
+        # The final body-ADetailer refine needs person_yolov8s_seg; it's gated
+        # separately from BODY_SWAP_KEYS, so warn (rather than silently no-op the
+        # refine) if it isn't downloaded.
+        if models.missing(["person_yolov8s_seg"]):
+            gr.Warning("ADetailer 'person_yolov8s-seg' isn't downloaded — the final "
+                       "body refine pass will be skipped. Get it in Settings → Models "
+                       "for a cleaner result.")
         self._release_faceswap()
-        if not self.acquire_gpu(state):
-            return gr.update(), None, gr.update()
+        self.acquire_gpu(state)
         try:
             progress(0.2, desc="Body swap…")
             res = gen_sd.body_swap(ident, picked, ref, "", "", ip_scale=0.8,
@@ -321,12 +362,15 @@ class ImageSuite(WAN2GPPlugin):
             raise gr.Error("Add a colour / style reference.")
         ident = self._sd_ident(model)
         self._require(["ip_adapter"], "Colour reference")
+        # Clear any stale abort flag from a prior cancelled gen — otherwise the
+        # IP-Adapter callback trips _interrupt on step 1 and discards the result,
+        # persistently breaking Colour Reference until an unrelated handler clears it.
+        gen_sd.clear_abort()
         from PIL import Image
         base = Image.open(picked).convert("RGB")
         mask = Image.new("L", base.size, 255)  # whole-image IP-Adapter restyle
         self._release_faceswap()
-        if not self.acquire_gpu(state):
-            return gr.update(), None, gr.update()
+        self.acquire_gpu(state)
         try:
             progress(0.2, desc="Colour reference…")
             res = gen_sd.ip_adapter_inpaint(ident, picked, ref, mask, "", "",
@@ -391,7 +435,7 @@ class ImageSuite(WAN2GPPlugin):
             return res[0] if isinstance(res, (list, tuple)) else res
         return gr.update()
 
-    def _interrogate(self, state, model, src, mode, progress=gr.Progress()):
+    def _interrogate(self, state, model, src, progress=gr.Progress(), *, mode):
         """Interrogate the page's image → prompt text. WD14 tags for booru
         families (Pony/Illustrious), BLIP caption otherwise. src is a filepath
         (txt2img result / img2img init) or the inpaint canvas composite data-URL."""
@@ -413,11 +457,17 @@ class ImageSuite(WAN2GPPlugin):
         fam = discovery.model_family(model)  # Pony/Illustrious/SDXL, or None (native)
         kind = "tags" if fam in _interro.BOORU_FAMILIES else "caption"
         progress(0.05, desc=f"Interrogating ({kind})…")
+        # Take the shared GPU lock like every other heavy op: registers interrogate
+        # as a GPU process (so it's visible to any_GPU_process_running), evicts the
+        # native model for headroom, and frees the ONNX/BLIP VRAM afterward.
+        self.acquire_gpu(state)
         try:
             text = _interro.interrogate(path, fam, progress=progress)
         except Exception as e:
             traceback.print_exc()
             raise gr.Error(f"Interrogation failed: {e}")
+        finally:
+            self.release_gpu(state)
         if not (text and text.strip()):
             raise gr.Error("Interrogation produced no text.")
         return text
@@ -516,42 +566,121 @@ class ImageSuite(WAN2GPPlugin):
         return discovery.build_model_choices(native, low_vram_only=paths.low_vram_only())
 
     @staticmethod
+    def _cache_allow_dirs():
+        """Real (symlink-resolved) directories whose files the relaxed file-cache
+        check accepts: Gradio's own cache dir, our .cache + outputs, and Wan2GP's
+        outputs. Anything outside these stays rejected (the original boundary)."""
+        import os
+        import tempfile
+        dirs = []
+
+        def _add(p):
+            try:
+                if p:
+                    dirs.append(os.path.realpath(str(p)))
+            except Exception:
+                pass
+
+        try:
+            from gradio.context import Context
+            _add(getattr(Context.root_block, "GRADIO_CACHE", None))
+        except Exception:
+            pass
+        try:
+            from gradio.utils import get_upload_folder
+            _add(get_upload_folder())
+        except Exception:
+            pass
+        _add(os.environ.get("GRADIO_TEMP_DIR"))
+        _add(os.path.join(tempfile.gettempdir(), "gradio"))
+        try:
+            _add(paths.cache_dir())
+        except Exception:
+            pass
+        try:
+            _add(paths.outputs_dir())
+        except Exception:
+            pass
+        _add(os.path.join(os.getcwd(), "outputs"))  # Wan2GP's own outputs
+        return [d for d in dirs if d]
+
+    @staticmethod
     def _install_file_cache_patch():
         """Relax Gradio 5's check_all_files_in_cache so it also accepts files that
-        actually exist on disk — not only files inside Gradio's cache dir.
+        actually exist on disk AND resolve inside an explicit allow-list (Gradio's
+        cache, our .cache/outputs, Wan2GP's outputs) — NOT every existing path.
 
         Wan2GP's galleries hold relative 'outputs/...' paths (its own generated
         files); any event that carries one (a gallery select / auto-select on the
         native result) otherwise throws 'File … is not in the cache folder and
         cannot be accessed'. We can't control Wan2GP's gallery contents, so we
-        loosen the check itself. Safe for a localhost single-user app; idempotent
-        and global (intended — it fixes the whole class of error)."""
+        loosen the check — but only for files under the allow-list, so the patch
+        can't become an arbitrary-local-file-read primitive once Wan2GP is exposed
+        via --listen/--share. Idempotent."""
         try:
             import os
             import gradio.processing_utils as _pu
             from gradio_client import utils as _cu
-            if getattr(_pu, "_imagesuite_cache_patch", False):
-                return
-            _orig = _pu.check_all_files_in_cache
-
-            def _lenient(data):
-                try:
-                    _orig(data)            # fast path: unchanged when already valid
-                except Exception:
-                    def _ok(d):
-                        p = d.get("path", "") if isinstance(d, dict) else ""
-                        if p and not _cu.is_http_url_like(p) and not os.path.exists(p):
-                            raise gr.Error(f"File {p} is not accessible.")
-                    _cu.traverse(data, _ok, _cu.is_file_obj)
-
-            _pu.check_all_files_in_cache = _lenient
-            _pu._imagesuite_cache_patch = True
-            print(">>> ImageSuite: relaxed Gradio file-cache check "
-                  "(existing local files now allowed) <<<", flush=True)
         except Exception:
+            # Gradio internals moved/absent — leave the original check untouched
+            # rather than silently turning the patch into a no-op via a broad catch.
+            print(">>> ImageSuite: could not locate Gradio file-cache internals; "
+                  "leaving the original check in place. <<<", flush=True)
             traceback.print_exc()
+            return
+        if getattr(_pu, "_imagesuite_cache_patch", False):
+            return
+        # The specific violation the original check raises (a ValueError). Narrow
+        # the except to it so unrelated failures aren't downgraded into the
+        # permissive path; re-raise everything else unchanged.
+        _orig = _pu.check_all_files_in_cache
+
+        def _within_allow_list(p):
+            try:
+                rp = os.path.realpath(p)
+            except Exception:
+                return False
+            for base in ImageSuite._cache_allow_dirs():
+                try:
+                    if os.path.commonpath([rp, base]) == base:
+                        return True
+                except (ValueError, OSError):
+                    continue
+            return False
+
+        def _lenient(data):
+            try:
+                _orig(data)            # fast path: unchanged when already valid
+            except ValueError:
+                def _ok(d):
+                    p = d.get("path", "") if isinstance(d, dict) else ""
+                    if not p or _cu.is_http_url_like(p):
+                        return
+                    if not (os.path.exists(p) and _within_allow_list(p)):
+                        raise gr.Error(f"File {p} is not accessible.")
+                _cu.traverse(data, _ok, _cu.is_file_obj)
+
+        _pu.check_all_files_in_cache = _lenient
+        _pu._imagesuite_cache_patch = True
+        print(">>> ImageSuite: relaxed Gradio file-cache check "
+              "(existing local files under the allow-list now allowed) <<<", flush=True)
 
     def create_ui(self, api_session):
+        # The host's plugin-tab loop calls this constructor with no guard, so a
+        # raise (e.g. PermissionError mid-discovery over a mis-pointed dir) would
+        # otherwise abort the whole shared Tabs build. Fall back to a minimal
+        # message UI instead of taking the rest of the app down.
+        try:
+            return self._build_ui(api_session)
+        except Exception:
+            traceback.print_exc()
+            return gr.Markdown(
+                "### Image Suite failed to load\n\n"
+                "Image Suite hit an error while building its UI — the rest of "
+                "Wan2GP is unaffected. Check the console/logs for the traceback "
+                "(commonly a mis-pointed models/outputs directory in Settings).")
+
+    def _build_ui(self, api_session):
         print("\n>>> ImageSuite UI build ORPHANSUITE-5 loaded "
               "(LoRAs in enhancements + per-family Default Generation Values) <<<\n",
               flush=True)
@@ -612,9 +741,16 @@ class ImageSuite(WAN2GPPlugin):
     @staticmethod
     def _sd_step_cb(progress, img_index, steps, total):
         """A diffusers ``callback_on_step_end`` that advances the Gradio progress
-        bar as SD sampling runs (the load is silent; this fills once steps begin).
+        bar as SD sampling runs (the load is silent; this fills once steps begin)
+        AND honours Abort mid-image: when gen_sd.was_aborted() it sets
+        pipe._interrupt so diffusers bails out of the current denoise loop.
         Must return the callback_kwargs dict diffusers hands it."""
         def _cb(pipe, step, timestep, cb_kwargs):
+            try:
+                if gen_sd.was_aborted():
+                    pipe._interrupt = True  # interrupt the running diffusers loop
+            except Exception:
+                pass
             try:
                 done = img_index * steps + step + 1
                 progress(done / max(1, total), desc=f"Generating… step {done}/{total}")
@@ -662,9 +798,10 @@ class ImageSuite(WAN2GPPlugin):
 
     @staticmethod
     def _native_lora_settings(selected_paths, mult_str):
-        """activated_loras (full paths) + loras_multipliers (space-separated) for
-        the native Wan2GP task settings. Native image models may ignore these
-        (Flux/Z-Image don't take user LoRAs); harmless when unsupported."""
+        """activated_loras (filenames, as the dropdown supplies) + loras_multipliers
+        (space-separated) for the native Wan2GP task settings. Native image models
+        may ignore these (Flux/Z-Image don't take user LoRAs); harmless when
+        unsupported."""
         paths_ = list(selected_paths or [])
         if not paths_:
             return {}
@@ -738,18 +875,39 @@ class ImageSuite(WAN2GPPlugin):
         return []
 
     # -- PaintShop canvas helpers ------------------------------------------
+    # Decompression-bomb guard: cap decoded image area + the base64 payload we'll
+    # even attempt to decode (a ~64 MP cap covers any realistic canvas/gallery).
+    _MAX_DECODE_PIXELS = 64 * 1024 * 1024  # ~64 megapixels
+    _MAX_DATAURL_BYTES = 96 * 1024 * 1024  # base64 string length cap (~72 MB raw)
+
     @staticmethod
     def _decode_dataurl(url):
-        """data:image/png;base64,… → PIL.Image (or None)."""
+        """data:image/png;base64,… → PIL.Image (or None). Guards against
+        decompression-bomb payloads (size + pixel cap)."""
         if not url or "," not in url:
             return None
         import base64
         import io
         from PIL import Image
+        b64 = url.split(",", 1)[1]
+        if len(b64) > ImageSuite._MAX_DATAURL_BYTES:
+            raise gr.Error("That image is too large to process.")
         try:
-            return Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1])))
+            raw = base64.b64decode(b64)
         except Exception:
             return None
+        prev = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = ImageSuite._MAX_DECODE_PIXELS
+        try:
+            im = Image.open(io.BytesIO(raw))
+            im.load()
+            return im
+        except Image.DecompressionBombError:
+            raise gr.Error("That image is too large to process.")
+        except Exception:
+            return None
+        finally:
+            Image.MAX_IMAGE_PIXELS = prev
 
     @staticmethod
     def _mask_nonempty(mask) -> bool:
@@ -796,10 +954,14 @@ class ImageSuite(WAN2GPPlugin):
         dest = os.path.join(cache, "imagesuite")
         os.makedirs(dest, exist_ok=True)
         served = []
-        for f in files or []:
+        for idx, f in enumerate(files or []):
             try:
                 src = os.path.abspath(str(f))  # resolve relative paths against cwd
-                dst = os.path.join(dest, os.path.basename(src))
+                # Prefix a unique token so a fixed-seed batch (deterministic SD
+                # filenames like sd_<seed>_0.png) doesn't collapse N results into
+                # one overwritten cache file (which would alias every gallery entry).
+                base = os.path.basename(src)
+                dst = os.path.join(dest, f"{int(time.time()*1000)}_{idx}_{base}")
                 if src != os.path.abspath(dst):
                     shutil.copy2(src, dst)
                 served.append(dst)
@@ -939,7 +1101,9 @@ class ImageSuite(WAN2GPPlugin):
             try:
                 if not sel:
                     raise ValueError("Select an overlay first.")
-                ov.move_image(folder, sel, dest); msg = f"Moved to '{dest}'."
+                name = ov.move_image(folder, sel, dest)
+                msg = (f"Moved '{sel}' to '{dest}' (renamed '{name}')."
+                       if name and name != sel else f"Moved '{sel}' to '{dest}'.")
             except Exception as e:
                 msg = f"⚠ {e}"
             return (*_refresh(folder), None, msg)
@@ -968,7 +1132,7 @@ class ImageSuite(WAN2GPPlugin):
                      "inpaint_fill", "inpaint_area", "padding"]
 
     def _wire_persist(self, ui):
-        """Persist each tab's settings to ~/.imagesuite.json on Generate and
+        """Persist each tab's settings to <wan2gp_root>/.imagesuite.json on Generate and
         restore them on page load. File-backed (survives restart) and isolated
         from the generation handlers, so a persistence hiccup can't break a gen."""
         pages = ui["pages"]
@@ -989,6 +1153,11 @@ class ImageSuite(WAN2GPPlugin):
                 comps.append(c[k])
 
         self._persist_spec = spec
+        # out_size components follow the model family (per page) but aren't a
+        # persisted key — restore them too so a restored SD model doesn't leave a
+        # stale (SDXL-default) outpaint size list.
+        out_size_extra = [(mode, c["out_size"]) for mode, c in pages.items()
+                          if "out_size" in c]
 
         def _restore():
             saved = {}
@@ -996,17 +1165,60 @@ class ImageSuite(WAN2GPPlugin):
                 saved = paths.get_ui_state()
             except Exception:
                 traceback.print_exc()
+            # Resolve, per mode, the model value we'll actually restore: a saved
+            # model is only valid if it's still in that mode's choices (it may have
+            # been deleted, the dir repointed, or hidden by the low-VRAM filter).
+            valid_model = {}
+            for mode in {m for m, _ in self._persist_spec}:
+                m = saved.get(mode) or {}
+                mv = m.get("model")
+                choices = {v for _, v in self._model_choices(mode)}
+                valid_model[mode] = mv if (mv and mv in choices) else None
             ups = []
             for mode, key in self._persist_spec:
                 m = saved.get(mode) or {}
-                ups.append(gr.update(value=m[key]) if key in m else gr.update())
+                mv = valid_model.get(mode)
+                if key == "model":
+                    # Skip an invalid/absent model rather than pushing an
+                    # out-of-choices value Gradio would silently drop.
+                    ups.append(gr.update(value=mv) if mv else gr.update())
+                elif key == "loras":
+                    # Re-scope choices/label to the restored model's family (the
+                    # programmatic value-set doesn't fire _on_model), keeping only
+                    # restored values that are still valid for that family.
+                    if mv:
+                        backend, ident = discovery.parse_model_value(mv)
+                        fam = discovery.model_family(mv)
+                        if backend == "native":
+                            cat = discovery.categorize_native(ident) or "Native"
+                            choices, label = self._native_loras(ident), f"{cat} LoRAs"
+                        else:
+                            choices = discovery.lora_choices(family=fam)
+                            label = f"{fam} LoRAs" if fam else "LoRAs (SDXL family)"
+                        keep = {v for _, v in choices}
+                        saved_loras = [v for v in (m.get("loras") or []) if v in keep]
+                        ups.append(gr.update(choices=choices, label=label,
+                                             value=saved_loras))
+                    else:
+                        ups.append(gr.update())
+                else:
+                    ups.append(gr.update(value=m[key]) if key in m else gr.update())
+            # Trailing out_size updates (re-scoped to the restored model family).
+            for mode, _comp in out_size_extra:
+                mv = valid_model.get(mode)
+                if mv:
+                    ups.append(gr.update(choices=["Custom (use px below)"]
+                                         + discovery.common_sizes(mv)))
+                else:
+                    ups.append(gr.update())
             return ups
 
         try:
             from gradio.context import Context
             root = Context.root_block
+            outputs = comps + [comp for _, comp in out_size_extra]
             if root is not None and comps:
-                root.load(_restore, inputs=None, outputs=comps)
+                root.load(_restore, inputs=None, outputs=outputs)
         except Exception:
             traceback.print_exc()
 
@@ -1105,8 +1317,11 @@ class ImageSuite(WAN2GPPlugin):
             src = {"txt2img": c.get("picked"), "img2img": c.get("input_image"),
                    "inpaint": c.get("composite")}.get(mode)
             if src is not None:
+                # Wire directly (functools.partial binds the mode) instead of a
+                # lambda, so Gradio injects its progress object into _interrogate's
+                # trailing progress= param — the lambda would drop it.
                 c["interrogate"].click(
-                    lambda s, m, img, _mode=mode: self._interrogate(s, m, img, _mode),
+                    functools.partial(self._interrogate, mode=mode),
                     inputs=[self.state, c["model"], src], outputs=[c["pos"]])
 
         # Face/body swap, ADetailer (face+body), colour reference — Run on selected.
@@ -1167,8 +1382,7 @@ class ImageSuite(WAN2GPPlugin):
                     self._restore_video_state(state, snap)
             else:  # sd
                 lora_list = self._lora_list(loras, mult)
-                if not self.acquire_gpu(state):
-                    return gr.update(), None, gr.update()
+                self.acquire_gpu(state)
                 try:
                     self._sd_loading(progress)
                     nsteps, total = int(steps), max(1, n) * max(1, int(steps))
@@ -1223,10 +1437,10 @@ class ImageSuite(WAN2GPPlugin):
                     self._restore_video_state(state, snap)
             else:  # sd
                 lora_list = self._lora_list(loras, mult)
-                if not self.acquire_gpu(state):
-                    return gr.update(), None, gr.update()
+                self.acquire_gpu(state)
                 try:
                     self._sd_loading(progress)
+                    nsteps, total = int(steps), max(1, n) * max(1, int(steps))
                     for i in range(n):
                         if gen_sd.was_aborted():
                             break
@@ -1234,11 +1448,16 @@ class ImageSuite(WAN2GPPlugin):
                         progress((i, n), desc=f"Reimagining {i + 1}/{n}")
                         files += gen_sd.generate_img2img(
                             ident, init_image, pos, neg, width, height, steps, cfg, sd,
-                            denoise=float(denoise), sampler=sampler, scheduler=scheduler,
-                            resize_mode=RESIZE.get(resize_mode, 0),
-                            clip_skip=int(clip_skip), loras=lora_list)
+                            denoise=float(denoise), sampler=sampler or "DPM++ 2M",
+                            scheduler=scheduler, resize_mode=RESIZE.get(resize_mode, 0),
+                            clip_skip=int(clip_skip), loras=lora_list,
+                            callback=self._sd_step_cb(progress, i, nsteps, total))
                 finally:
                     self.release_gpu(state)
+            # An abort interrupts the diffusers loop mid-image, leaving a partial
+            # (or no) result — discard it rather than presenting a half-denoised image.
+            if gen_sd.was_aborted():
+                raise gr.Error("img2img aborted.")
             if not files:
                 raise gr.Error("img2img produced no images.")
             return self._gallery_result(files)
@@ -1281,10 +1500,12 @@ class ImageSuite(WAN2GPPlugin):
             return files[0] if files else None
         # sd
         lora_list = self._lora_list(loras, mult)
-        if not self.acquire_gpu(state):
-            return None
+        self.acquire_gpu(state)
         try:
             self._sd_loading(progress)
+            nsteps = int(steps)
+            cb = (self._sd_step_cb(progress, 0, nsteps, nsteps)
+                  if progress is not None else None)
             outs = gen_sd.inpaint(
                 ident, comp, mask, pos, neg, denoise=float(denoise),
                 steps=int(steps), cfg=float(cfg), seed=int(seed),
@@ -1292,9 +1513,13 @@ class ImageSuite(WAN2GPPlugin):
                 clip_skip=int(clip_skip), mask_blur=int(feather),
                 inpainting_fill=self._FILL.get(inpaint_fill, 1),
                 full_res=bool(full_res), padding=int(padding),
-                progress=progress, loras=lora_list)
+                progress=progress, loras=lora_list, callback=cb)
         finally:
             self.release_gpu(state)
+        # Mid-image abort interrupted the diffusers loop → discard the partial; the
+        # callers already surface "Inpaint/Outpaint aborted." when was_aborted().
+        if gen_sd.was_aborted():
+            return None
         return outs[0] if outs else None
 
     def _make_inpaint(self, mode):
@@ -1386,10 +1611,33 @@ class ImageSuite(WAN2GPPlugin):
         return _run
 
     # -- right-click context menu router -----------------------------------
+    @staticmethod
+    def _allowed_local_file(path) -> str | None:
+        """Return path iff it's an existing file whose realpath resolves inside the
+        cache/outputs allow-list — so a client-supplied src can't read arbitrary
+        local files (e.g. /etc/passwd, ~/.ssh/id_rsa) once Wan2GP is exposed."""
+        import os
+        if not path:
+            return None
+        try:
+            rp = os.path.realpath(path)
+        except Exception:
+            return None
+        if not os.path.isfile(rp):
+            return None
+        for base in ImageSuite._cache_allow_dirs():
+            try:
+                if os.path.commonpath([rp, base]) == base:
+                    return rp
+            except (ValueError, OSError):
+                continue
+        return None
+
     def _resolve_src(self, src) -> str | None:
         """A media src from the context menu → a local file path. Handles PNG
         data-URLs (canvas export), Gradio-served '…file=<path>' URLs, plain local
-        paths, and remote http(s) URLs (downloaded to the cache)."""
+        paths (containment-checked against the cache/outputs allow-list), and
+        remote http(s) URLs (downloaded to the cache, capped + timed out)."""
         import base64
         import os
         import urllib.parse
@@ -1399,24 +1647,61 @@ class ImageSuite(WAN2GPPlugin):
         try:
             if src.startswith("data:"):
                 b64 = src.split(",", 1)[1]
+                if len(b64) > ImageSuite._MAX_DATAURL_BYTES:
+                    raise gr.Error("That image is too large to process.")
+                try:
+                    raw = base64.b64decode(b64)
+                except Exception:
+                    return None
+                # Validate it really decodes as an image under the pixel cap before
+                # persisting (no decompression-bomb).
+                import io
+                from PIL import Image
+                prev = Image.MAX_IMAGE_PIXELS
+                Image.MAX_IMAGE_PIXELS = ImageSuite._MAX_DECODE_PIXELS
+                try:
+                    with Image.open(io.BytesIO(raw)) as _im:
+                        _im.load()
+                except Image.DecompressionBombError:
+                    raise gr.Error("That image is too large to process.")
+                except Exception:
+                    return None
+                finally:
+                    Image.MAX_IMAGE_PIXELS = prev
                 out = paths.cache_dir() / "ctx"
                 out.mkdir(parents=True, exist_ok=True)
                 p = out / f"ctx_{int(time.time()*1000)}.png"
-                p.write_bytes(base64.b64decode(b64))
+                p.write_bytes(raw)
                 return str(p)
             if "file=" in src:
                 path = urllib.parse.unquote(src.split("file=", 1)[1].split("&")[0])
-                if os.path.isfile(path):
-                    return path
-            if os.path.isfile(src):
-                return src
-            if src.startswith("http"):
+                allowed = self._allowed_local_file(path)
+                if allowed:
+                    return allowed
+            allowed = self._allowed_local_file(src)
+            if allowed:
+                return allowed
+            scheme = urllib.parse.urlparse(src).scheme.lower()
+            if scheme in ("http", "https"):
                 out = paths.cache_dir() / "ctx"
                 out.mkdir(parents=True, exist_ok=True)
                 ext = os.path.splitext(urllib.parse.urlparse(src).path)[1] or ".png"
                 p = out / f"ctx_{int(time.time()*1000)}{ext}"
-                urllib.request.urlretrieve(src, p)
+                # Bounded fetch: connect timeout + a hard size cap so a hostile/large
+                # URL can't hang the handler or fill the disk.
+                MAX_BYTES = 64 * 1024 * 1024
+                req = urllib.request.Request(src, headers={"User-Agent": "ImageSuite"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    clen = resp.headers.get("Content-Length")
+                    if clen and int(clen) > MAX_BYTES:
+                        raise gr.Error("That remote image is too large.")
+                    data = resp.read(MAX_BYTES + 1)
+                if len(data) > MAX_BYTES:
+                    raise gr.Error("That remote image is too large.")
+                p.write_bytes(data)
                 return str(p)
+        except gr.Error:
+            raise
         except Exception:
             traceback.print_exc()
         return None

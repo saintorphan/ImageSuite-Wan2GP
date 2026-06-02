@@ -11,6 +11,7 @@ generator can route: "native::<model_type>" or "sd::<checkpoint_path>".
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from . import paths
@@ -31,12 +32,30 @@ def categorize_native(model_type: str) -> str | None:
     return None
 
 
+def _has_marker(name: str, markers) -> bool:
+    """True if any marker starts on a token boundary in name (preceded by the
+    string start or a non-alphanumeric char). Anchoring the *leading* edge lets
+    the common 'ponyDiffusionV6XL' / 'noobaiXL' / 'illustriousXL' naming style
+    match while rejecting unrelated names where the marker is embedded mid-token
+    (e.g. 'noob' inside 'snooball')."""
+    for m in markers:
+        if re.search(r"(?<![a-z0-9])" + re.escape(m), name):
+            return True
+    return False
+
+
 def categorize_sdxl(name: str) -> str:
-    """Name-based bucket for an SDXL-architecture checkpoint."""
+    """Name-based bucket for an SDXL-architecture checkpoint.
+
+    Markers are matched on a leading token boundary rather than as raw
+    substrings so unrelated names aren't misclassified. The over-broad generic
+    'illust' marker is intentionally dropped (it caught
+    'illustration'/'illustrated'); the full 'illustrious' marker is still
+    recognized."""
     n = (name or "").lower()
-    if "pony" in n:
+    if _has_marker(n, ("pony",)):
         return "Pony"
-    if "illustrious" in n or "illust" in n or "noob" in n:
+    if _has_marker(n, ("illustrious", "noob")):
         return "Illustrious"
     return "SDXL"
 

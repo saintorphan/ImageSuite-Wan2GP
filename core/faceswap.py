@@ -445,14 +445,17 @@ class FaceSwapPipeline:
                   (1.0 - matte_3ch) * result.astype(np.float32)
         return blended.astype(np.uint8)
 
-    def _enhance_source_face(self, source_path: str) -> str:
-        """Pre-enhance the source image's face with GFPGAN.
+    def _enhance_source_face(self, source_path: str, enhancer: str = "gfpgan") -> str:
+        """Pre-enhance the source image's face before embedding extraction.
 
         Inswapper's embedding extractor runs on an aligned 112×112 face crop;
         a sharper, less-noisy source face yields a stronger identity embedding
         and stronger downstream transfer. Returns a path to a temp PNG with the
         enhanced face composited back into the original source image. Falls
         back to ``source_path`` unchanged if no face is detected.
+
+        ``enhancer`` reuses the caller's requested enhancer (default gfpgan)
+        so we don't double-load a second model.
         """
         import tempfile
 
@@ -464,12 +467,22 @@ class FaceSwapPipeline:
             return source_path
         kps = np.array(faces[0]["kps"])
         aligned, M = self._align_face(img, kps, 512)
-        enhancer = self._load_enhancer("gfpgan")
-        enhanced, _scale = self._run_enhancer(enhancer, aligned, strength=1.0)
+        enhancer_model = self._load_enhancer(enhancer)
+        enhanced, _scale = self._run_enhancer(enhancer_model, aligned, strength=1.0)
         result = self._paste_back(img, enhanced, M, 512)
         tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        cv2.imwrite(tmp.name, result)
         tmp.close()
+        # Ensure the temp PNG is removed if the write (or anything after it)
+        # fails — otherwise it would orphan outside swap()'s try/finally.
+        try:
+            if not cv2.imwrite(tmp.name, result):
+                raise OSError(f"Failed to write enhanced source temp: {tmp.name}")
+        except Exception:
+            try:
+                Path(tmp.name).unlink()
+            except OSError:
+                pass
+            raise
         return tmp.name
 
     def swap(
@@ -500,12 +513,21 @@ class FaceSwapPipeline:
             enhancer_strength: CodeFormer fidelity weight (0=quality, 1=fidelity).
             source_face_map: Optional mapping {target_face_idx: source_face_idx}
                 for multi-source swap. Overrides source_face_idx when provided.
+
+        Note:
+            The per-face loop does not consult the generation abort flag, so a
+            swap in progress cannot be interrupted mid-pass. (Multi-face/video
+            loops are currently single-face/unwired from the UI; wire a
+            ``was_aborted()`` check here before exposing those paths.)
         """
         # Optional source pre-enhance — sharpens the source face before
         # InsightFace extracts the identity embedding.
         enhanced_tmp: str | None = None
         if enhance_source:
-            new_path = self._enhance_source_face(source_path)
+            src_enhancer = (
+                enhancer if enhancer and enhancer.lower() != "none" else "gfpgan"
+            )
+            new_path = self._enhance_source_face(source_path, src_enhancer)
             if new_path != source_path:
                 enhanced_tmp = new_path
             source_path = new_path
@@ -640,6 +662,11 @@ class FaceSwapPipeline:
                 backward compatibility with single-source callers.
 
         Returns the result as a BGR numpy array.
+
+        Note:
+            The per-face loop does not consult the generation abort flag, so a
+            frame swap cannot be interrupted mid-pass. Wire a ``was_aborted()``
+            check here before exposing a video/batch loop over this method.
         """
         swapper = self._load_swapper(swap_model)
         swap_size = swapper["size"]

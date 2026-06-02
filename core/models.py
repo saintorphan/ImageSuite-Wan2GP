@@ -27,8 +27,14 @@ logger = logging.getLogger("imagesuite.models")
 
 # BiRefNet (body-swap segmentation) downloads into the plugin's own models dir;
 # segment_foreground falls back to the HF model id if it isn't present there.
-_BIREFNET_DIR = str(paths.models_dir() / "birefnet")
+# Resolved lazily (NOT at import time) so it follows a later-repointed models dir —
+# otherwise the Models panel would download/report under the old dir while the
+# runtime body-swap path looks under the new one (see analysis M9).
 _BUFFALO_DIR = str(Path.home() / ".insightface" / "models" / "buffalo_l")
+
+
+def _birefnet_dir() -> str:
+    return str(paths.models_dir() / "birefnet")
 
 
 @dataclass
@@ -49,9 +55,17 @@ class ModelSpec:
     def downloadable(self) -> bool:
         return bool(self.url or self.repo)
 
+    def local_dir(self) -> str:
+        """Resolve the snapshot target dir lazily so it tracks a later-repointed
+        models dir. BiRefNet lives under models_dir()/birefnet; other repo
+        entries snapshot into the HF cache (empty)."""
+        if self.repo == "ZhengPeng7/BiRefNet":
+            return _birefnet_dir()
+        return self.repo_local_dir
+
     def display_path(self) -> str:
-        if self.repo and self.repo_local_dir:
-            return self.repo_local_dir
+        if self.repo and self.local_dir():
+            return self.local_dir()
         if self.repo:
             return f"HF cache · {self.repo}"
         if self.extract:
@@ -60,8 +74,9 @@ class ModelSpec:
 
     def is_present(self) -> bool:
         if self.repo:
-            if self.repo_local_dir:
-                d = Path(self.repo_local_dir)
+            local = self.local_dir()
+            if local:
+                d = Path(local)
                 return d.is_dir() and any(d.iterdir())
             try:  # cache check, no network
                 from huggingface_hub import snapshot_download
@@ -106,7 +121,7 @@ REGISTRY: list[ModelSpec] = [
     # --- body swap (SD-family only) ---
     ModelSpec("birefnet", "BiRefNet (body-swap segmentation)",
               "Body swap: person segmentation mask.", required=False,
-              repo="ZhengPeng7/BiRefNet", repo_local_dir=_BIREFNET_DIR,
+              repo="ZhengPeng7/BiRefNet",
               note="Loaded from a local dir, not HF cache."),
     ModelSpec("openpose_annotator", "OpenPose annotator (body swap)",
               "Body swap: extract a pose control image from the base.",
@@ -202,9 +217,10 @@ def _download_repo(spec, progress) -> str:
         except Exception:
             pass
     kwargs = {"tqdm_class": _gr_tqdm(progress, spec.name)}
-    if spec.repo_local_dir:
-        Path(spec.repo_local_dir).mkdir(parents=True, exist_ok=True)
-        kwargs["local_dir"] = spec.repo_local_dir
+    local = spec.local_dir()
+    if local:
+        Path(local).mkdir(parents=True, exist_ok=True)
+        kwargs["local_dir"] = local
     snapshot_download(spec.repo, **kwargs)
     return f"[Success] {spec.name} → {spec.display_path()}"
 
@@ -238,6 +254,13 @@ def _download_zip(spec, progress) -> str:
                 pass
     urllib.request.urlretrieve(spec.url, tmp, _hook)
     with zipfile.ZipFile(tmp) as z:
+        # Guard against zip-slip: every member must resolve under dst_dir.
+        base = dst_dir.resolve()
+        for member in z.namelist():
+            target = (dst_dir / member).resolve()
+            if base != target and base not in target.parents:
+                tmp.unlink(missing_ok=True)
+                raise ValueError(f"Unsafe path in archive: {member!r}")
         z.extractall(dst_dir)
     tmp.unlink(missing_ok=True)
     return f"[Success] {spec.name} → {dst_dir}"

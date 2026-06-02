@@ -2,7 +2,8 @@
 
 Two jobs:
   * Directories — view/repoint the output, SDXL-checkpoint, SDXL-LoRA and
-    face-model dirs (defaults shared with Replicant Character Lab), persisted to
+    face-model dirs (defaults shared with Replicant Character Lab). The shared
+    dirs persist to .orphansuite.json; only the outputs dir persists to
     .imagesuite.json. A Rescan refreshes every page's model + LoRA dropdowns.
   * Models — show the status of the optional face / ADetailer weights and
     download them on demand (nothing auto-downloads).
@@ -67,8 +68,7 @@ def build_settings_panel(native_dl_choices=None):
                 c["link_target"] = gr.Dropdown(
                     label="Into", value="sdxl_models",
                     choices=[("SDXL checkpoints", "sdxl_models"),
-                             ("SDXL LoRAs", "sdxl_loras"),
-                             ("Face / ADetailer weights", "models")], scale=2)
+                             ("SDXL LoRAs", "sdxl_loras")], scale=2)
                 c["link_btn"] = gr.Button("🔗 Link", scale=1)
             c["dirs_status"] = gr.Markdown("")
 

@@ -100,7 +100,6 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
   <div id="main">
     <div id="wrap"><div id="stage">
       <canvas id="bg"></canvas>
-      <canvas id="paintc"></canvas>
       <canvas id="maskv"></canvas>
       <canvas id="disp"></canvas>
       <canvas id="cursor"></canvas>
@@ -168,7 +167,7 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
         <input type="color" id="pick" value="#e83e8c" title="Custom colour">
         <div class="fld"><span>Size</span><span id="szv">14</span></div>
         <input type="range" id="size" min="1" max="200" value="14">
-        <div class="fld"><span>Hardness</span><span id="hdv">80</span></div>
+        <div class="fld" id="hardfld"><span>Hardness</span><span id="hdv">80</span></div>
         <input type="range" id="hard" min="0" max="100" value="80" title="Brush edge hardness (lower = softer)">
         <div class="fld"><span>Opacity</span><span id="opv">100</span></div>
         <input type="range" id="op" min="5" max="100" value="100">
@@ -253,13 +252,27 @@ function applyView(){ var s=baseScale*viewScale;
   [bg,maskv,disp,cursor].forEach(function(c){c.style.width='100%';c.style.height='100%';});
   var z=document.getElementById('zmv'); if(z) z.textContent=Math.round(s*100); }
 
-// undo across draw layers + mask (snapshot the active target)
-function pushUndo(ctx,tag){ try{ undoStack.push({ctx:ctx,tag:tag,data:ctx.getImageData(0,0,W,H)});}catch(e){}
+// undo across draw layers + mask. Each stack entry is a GROUP that restores
+// atomically: a pixel group ({kind:'pixels', frames:[{ctx,tag,data}...]}) or a
+// structural group ({kind:'struct', undo, redo}) for add/delete/reorder/paste.
+function pushEntry(entry){ undoStack.push(entry);
   if(undoStack.length>30) undoStack.shift(); redoStack=[]; }
-function snapshot(){ var t=paintTargets()[0]; pushUndo(t.ctx, t.isMask?'mask':'draw'); }
+// snapshot one or more ctxs as a single atomic pixel group
+function pushUndoGroup(ctxs){ var frames=[];
+  ctxs.forEach(function(c){ try{ frames.push({ctx:c.ctx,tag:c.tag,data:c.ctx.getImageData(0,0,W,H)}); }catch(e){} });
+  if(frames.length) pushEntry({kind:'pixels',frames:frames}); }
+function pushUndo(ctx,tag){ pushUndoGroup([{ctx:ctx,tag:tag}]); }
+// snapshot ALL paint targets together so Draw+Mask undo restores layer + mask atomically
+function snapshot(){ pushUndoGroup(paintTargets().map(function(t){ return {ctx:t.ctx,tag:t.isMask?'mask':'draw'}; })); }
+// record a structural change (undo()=revert, redo()=re-apply) on the active stack
+function pushStruct(undo,redo){ pushEntry({kind:'struct',undo:undo,redo:redo}); }
 function restore(stack,other){ if(!stack.length) return; var s=stack.pop();
-  try{ other.push({ctx:s.ctx,tag:s.tag,data:s.ctx.getImageData(0,0,W,H)});}catch(e){}
-  s.ctx.putImageData(s.data,0,0); compose(); }
+  if(s.kind==='struct'){ var inv={kind:'struct',undo:s.redo,redo:s.undo};
+    other.push(inv); s.undo(); compose(); renderLayers(); pushExport(); return; }
+  var cur={kind:'pixels',frames:[]};
+  s.frames.forEach(function(f){ try{ cur.frames.push({ctx:f.ctx,tag:f.tag,data:f.ctx.getImageData(0,0,W,H)}); }catch(e){}
+    f.ctx.putImageData(f.data,0,0); });
+  other.push(cur); compose(); }
 
 function compose(){
   dx.clearRect(0,0,W,H);
@@ -272,14 +285,31 @@ function compose(){
 }
 
 function pos(e){ var r=disp.getBoundingClientRect(),t=e.touches?e.touches[0]:e;
-  return {x:(t.clientX-r.left)/r.width*W, y:(t.clientY-r.top)/r.height*H}; }
+  var x=(t.clientX-r.left)/r.width*W, y=(t.clientY-r.top)/r.height*H;
+  // clamp inside the bitmap so getImageData/floodFill never index a row off the edge
+  return {x:Math.max(0,Math.min(W-1,x)), y:Math.max(0,Math.min(H-1,y))}; }
+// does this engine support 2D ctx.filter? (assigning an unsupported value is
+// silently ignored rather than thrown, so feature-detect explicitly)
+var _CTX_FILTER = (function(){ try{ var c=document.createElement('canvas').getContext('2d');
+  c.filter='blur(1px)'; return c.filter==='blur(1px)'; }catch(e){ return false; } })();
+// radial-gradient soft stamp fallback used when ctx.filter is unavailable
+function softStamp(ctx,x,y,rgb){ var r=Math.max(1,size/2);
+  var g=ctx.createRadialGradient(x,y,r*Math.max(0,hardness),x,y,r);
+  g.addColorStop(0,'rgba('+rgb[0]+','+rgb[1]+','+rgb[2]+','+opacity+')');
+  g.addColorStop(1,'rgba('+rgb[0]+','+rgb[1]+','+rgb[2]+',0)');
+  ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); }
 function strokeOn(ctx,isMask,x0,y0,x1,y1){
   ctx.save(); ctx.lineCap='round'; ctx.lineJoin='round'; ctx.lineWidth=size;
   if(tool==='eraser'){ ctx.globalCompositeOperation='destination-out'; ctx.strokeStyle='rgba(0,0,0,1)'; }
   else if(isMask){ ctx.strokeStyle='#ffffff'; }
   else { ctx.globalCompositeOperation='source-over'; ctx.globalAlpha=opacity; ctx.strokeStyle=color; }
-  // Soft brush: blur the stroke edge when hardness < 100% (paint/eraser only).
-  if(hardness<1 && tool!=='eraser' && !isMask){ try{ ctx.filter='blur('+(size*(1-hardness)/4).toFixed(1)+'px)'; }catch(e){} }
+  // Soft brush: blur the stroke edge when hardness < 100% (paint only, not mask/eraser).
+  if(hardness<1 && tool!=='eraser' && !isMask){
+    if(_CTX_FILTER){ try{ ctx.filter='blur('+(size*(1-hardness)/4).toFixed(1)+'px)'; }catch(e){} }
+    else { // radial-gradient soft-stamp fallback along the segment
+      var rgb=hex2rgb(color),dxs=x1-x0,dys=y1-y0,dist=Math.hypot(dxs,dys),steps=Math.max(1,Math.ceil(dist/(size/4)));
+      for(var s=0;s<=steps;s++){ softStamp(ctx,x0+dxs*s/steps,y0+dys*s/steps,rgb); }
+      ctx.restore(); return; } }
   ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke(); ctx.restore();
 }
 function stroke(x0,y0,x1,y1){ paintTargets().forEach(function(t){ strokeOn(t.ctx,t.isMask,x0,y0,x1,y1); }); }
@@ -352,19 +382,24 @@ function cloneStamp(x,y){ if(!cloneSrc) return; var l=activeLayer(),r=size/2,src
   l.ctx.drawImage(src, x+cloneOff.dx-r, y+cloneOff.dy-r, size, size, x-r, y-r, size, size); l.ctx.restore(); }
 // -- smudge: drag a sampled patch along the stroke to push/blend pixels --
 function smudgeStep(x0,y0,x1,y1){ var l=activeLayer(),r=size/2;
+  // sample from the flattened image so smudge works over background-only content,
+  // then paint the dragged patch onto the active layer
+  var src=flatCanvas();
   var patch=document.createElement('canvas'); patch.width=size||1; patch.height=size||1;
-  patch.getContext('2d').drawImage(l.cv, x0-r,y0-r,size,size, 0,0,size,size);
+  patch.getContext('2d').drawImage(src, x0-r,y0-r,size,size, 0,0,size,size);
   l.ctx.save(); l.ctx.globalAlpha=0.55; l.ctx.beginPath(); l.ctx.arc(x1,y1,r,0,Math.PI*2); l.ctx.clip();
   l.ctx.drawImage(patch, x1-r, y1-r, size, size); l.ctx.restore(); }
 // -- mask morphology: grow (dilate) / shrink (erode) --
 function dilateCtx(ctx,px){ if(px<=0) return; var tmp=document.createElement('canvas'); tmp.width=W;tmp.height=H;
   tmp.getContext('2d').drawImage(ctx.canvas,0,0);
   for(var a=0;a<16;a++){ var ang=a/16*Math.PI*2; ctx.drawImage(tmp,Math.cos(ang)*px,Math.sin(ang)*px); } }
-function growMask(){ pushUndo(mbx,'mask'); dilateCtx(mbx,6); compose(); pushExport(); }
+// grow/shrink use the Auto-grow slider magnitude (min 1px so the button always acts)
+function maskMorphPx(){ return Math.max(1,dilate); }
+function growMask(){ pushUndo(mbx,'mask'); dilateCtx(mbx,maskMorphPx()); compose(); pushExport(); }
 function shrinkMask(){ pushUndo(mbx,'mask');
   var t=document.createElement('canvas'); t.width=W;t.height=H; var tc=t.getContext('2d');
   tc.fillStyle='#fff'; tc.fillRect(0,0,W,H); tc.globalCompositeOperation='destination-out'; tc.drawImage(maskBuf,0,0);
-  dilateCtx(tc,6);  // grow the inverse = erode the mask
+  dilateCtx(tc,maskMorphPx());  // grow the inverse = erode the mask
   mbx.save(); mbx.globalCompositeOperation='source-over'; mbx.clearRect(0,0,W,H);
   mbx.fillStyle='#fff'; mbx.fillRect(0,0,W,H); mbx.globalCompositeOperation='destination-out';
   mbx.drawImage(t,0,0); mbx.restore(); compose(); pushExport(); }
@@ -386,9 +421,17 @@ function copyRegion(fromFlat){ var bb=maskBBox(); if(!bb) return false;
   var clip=document.createElement('canvas'); clip.width=bb.w;clip.height=bb.h;
   clip.getContext('2d').drawImage(src,bb.x,bb.y,bb.w,bb.h,0,0,bb.w,bb.h);
   clipboard={cv:clip,x:bb.x,y:bb.y}; return true; }
-function pasteClip(){ if(!clipboard) return; var l=newLayer('Pasted'); drawLayers.push(l); active=drawLayers.length-1;
+// insert a layer at idx and record an atomic structural undo (remove)/redo (reinsert)
+function addLayerStruct(l,idx){ if(idx==null) idx=drawLayers.length;
+  drawLayers.splice(idx,0,l); active=idx;
+  pushStruct(function(){ var i=drawLayers.indexOf(l); if(i>=0) drawLayers.splice(i,1);
+      if(active>=drawLayers.length) active=drawLayers.length-1; if(tSession===l.id) tSession=-1; },
+    function(){ drawLayers.splice(idx,0,l); active=idx; });
+  renderLayers(); }
+function pasteClip(){ if(!clipboard) return; var l=newLayer('Pasted');
   l.ctx.drawImage(clipboard.cv, clipboard.x||0, clipboard.y||0);
-  renderLayers(); selTool('xform'); ensureXform(); compose(); pushExport(); }
+  addLayerStruct(l, drawLayers.length);
+  selTool('xform'); ensureXform(); compose(); pushExport(); }
 function beginTransform(){ var l=activeLayer(); pushUndo(l.ctx,'draw');
   tSnap=document.createElement('canvas'); tSnap.width=W;tSnap.height=H; tSnap.getContext('2d').drawImage(l.cv,0,0);
   tSession=l.id; tDx=0;tDy=0;tScale=1;tRot=0;
@@ -425,7 +468,9 @@ function move(e){ if(!drawing) return; e.preventDefault(); var p=pos(e);
 function up(e){ if(!drawing) return; drawing=false; var p=pos(e);
   if(tool==='lasso'){ fillLasso(); compose(); }
   else if(tool==='rect'||tool==='ellipse'||tool==='line'){ commitShape(sx,sy,p.x,p.y); compose(); }
-  pushExport(); }
+  // flush the composite/mask synchronously so a Generate click right after a
+  // stroke never reads the previous (debounced) export
+  if(exportTimer){ clearTimeout(exportTimer); exportTimer=null; } exportNow(); }
 disp.addEventListener('mousedown',down); window.addEventListener('mousemove',move);
 window.addEventListener('mouseup',up);
 disp.addEventListener('touchstart',down,{passive:false});
@@ -456,7 +501,12 @@ document.getElementById('paste').addEventListener('click',pasteClip);
 document.getElementById('flatten').addEventListener('click',flattenDown);
 document.getElementById('scale').addEventListener('input',function(e){ ensureXform(); tScale=(+e.target.value)/100; document.getElementById('scv').textContent=e.target.value; applyTransform(); pushExport(); });
 document.getElementById('rot').addEventListener('input',function(e){ ensureXform(); tRot=+e.target.value; document.getElementById('rotv').textContent=e.target.value; applyTransform(); pushExport(); });
-function setMode(m){ mode=m; document.querySelectorAll('#modeseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.mode===m); }); }
+// Hardness has no effect on the mask (soft edges are deliberately excluded for
+// mask/eraser), so gray it out + annotate when painting the mask only.
+function updateHardnessUI(){ var h=document.getElementById('hard'),f=document.getElementById('hardfld');
+  var off=(mode==='mask'); if(h){ h.disabled=off; h.style.opacity=off?0.4:1; }
+  if(f){ f.style.opacity=off?0.5:1; f.title=off?'No effect in Mask mode (mask edges are always hard)':''; } }
+function setMode(m){ mode=m; document.querySelectorAll('#modeseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.mode===m); }); updateHardnessUI(); }
 document.querySelectorAll('#modeseg button').forEach(function(b){ b.addEventListener('click',function(){ setMode(b.dataset.mode); }); });
 function markSwatch(){ document.querySelectorAll('#pal .sw').forEach(function(s){ s.classList.toggle('on',s.dataset.c.toLowerCase()===color.toLowerCase()); }); }
 var pal=document.getElementById('pal');
@@ -509,8 +559,11 @@ function chip(cls,label,opts){ opts=opts||{};
     d.addEventListener('dragover',function(ev){ ev.preventDefault(); });
     d.addEventListener('drop',function(ev){ ev.preventDefault();
       var from=+ev.dataTransfer.getData('text/plain'), to=opts.idx;
-      if(from===to) return; var m=drawLayers.splice(from,1)[0]; drawLayers.splice(to,0,m);
-      active=to; renderLayers(); compose(); pushExport(); }); }
+      if(from===to) return; var prevA=active; var m=drawLayers.splice(from,1)[0]; drawLayers.splice(to,0,m);
+      active=to;
+      pushStruct(function(){ var i=drawLayers.indexOf(m); if(i>=0) drawLayers.splice(i,1); drawLayers.splice(from,0,m); active=prevA; },
+        function(){ var i=drawLayers.indexOf(m); if(i>=0) drawLayers.splice(i,1); drawLayers.splice(to,0,m); active=to; });
+      renderLayers(); compose(); pushExport(); }); }
   return d;
 }
 function renderLayers(){ lyrEl.innerHTML='';
@@ -520,10 +573,16 @@ function renderLayers(){ lyrEl.innerHTML='';
     lyrEl.appendChild(chip('draw'+(i===active?' active':''), l.name, {visible:l.visible, idx:i, draggable:true,
       onClick:function(){ active=i; renderLayers(); },
       onEye:function(){ l.visible=!l.visible; compose(); renderLayers(); pushExport(); },
-      onDel:function(){ pushUndo(l.ctx,'draw'); drawLayers.splice(i,1); if(active>=drawLayers.length) active=drawLayers.length-1; compose(); renderLayers(); pushExport(); }})); })(i); }
+      onDel:function(){ var delIdx=i, delLayer=l, prevA=active;
+        drawLayers.splice(delIdx,1); if(active>=drawLayers.length) active=drawLayers.length-1;
+        if(tSession===delLayer.id) tSession=-1;
+        // structural undo: reinsert the layer object (pixels preserved); redo deletes again
+        pushStruct(function(){ drawLayers.splice(delIdx,0,delLayer); active=prevA; },
+          function(){ var j=drawLayers.indexOf(delLayer); if(j>=0) drawLayers.splice(j,1); if(active>=drawLayers.length) active=drawLayers.length-1; if(tSession===delLayer.id) tSession=-1; });
+        compose(); renderLayers(); pushExport(); }})); })(i); }
   lyrEl.appendChild(chip('base','Background',{visible:true}));
   var add=document.createElement('div'); add.className='addlyr'; add.textContent='+ Layer';
-  add.addEventListener('click',function(){ drawLayers.push(newLayer()); active=drawLayers.length-1; renderLayers(); }); lyrEl.appendChild(add);
+  add.addEventListener('click',function(){ addLayerStruct(newLayer(), drawLayers.length); }); lyrEl.appendChild(add);
 }
 
 // -- export (JS -> Python hidden Textboxes) --
@@ -556,6 +615,11 @@ function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im;
   drawLayers=[]; layerSeq=0; setSize(im.naturalWidth,im.naturalHeight);
   drawLayers=[newLayer('Layer 1')]; active=0; mbx.clearRect(0,0,W,H);
   undoStack=[]; redoStack=[]; hasBg=true; document.getElementById('empty').style.display='none';
+  // clear state tied to the previous image so it can't bleed into the new one
+  cloneSrc=null; clipboard=null; lassoPts=[]; tSnap=null; tSession=-1; tDx=0;tDy=0;tScale=1;tRot=0;
+  var sc=document.getElementById('scale'),rt=document.getElementById('rot');
+  if(sc){ sc.value=100; document.getElementById('scv').textContent=100; }
+  if(rt){ rt.value=0; document.getElementById('rotv').textContent=0; }
   renderLayers(); compose(); pushExport(); }; im.src=dataUrl; }
 try{ parent.window['__is_'+MODE+'_setbg']=setBg; }catch(e){}
 
@@ -589,8 +653,12 @@ stage.addEventListener('drop',function(e){ var data=e.dataTransfer?e.dataTransfe
   var r=disp.getBoundingClientRect(); var x=(e.clientX-r.left)/r.width*W, y=(e.clientY-r.top)/r.height*H;
   addOverlayLayer(o.url,x,y); });
 
-window.addEventListener('resize',function(){ if(hasBg) setSize(W,H); });
-markSwatch(); renderLayers();
+// On window/layout resize do NOT touch the pixel buffers (assigning canvas
+// width/height — even to the same value — clears the bitmap). Only recompute
+// the fit scale; viewport scaling is pure CSS, so this preserves zoom + pixels.
+window.addEventListener('resize',function(){ if(!hasBg) return;
+  var availW=stage.parentNode.clientWidth-20; baseScale=Math.min(1,availW/W); applyView(); });
+markSwatch(); renderLayers(); updateHardnessUI();
 })();
 </script></body></html>"""
 
@@ -626,7 +694,10 @@ def bg_bridge_html(data_url: str, mode="inpaint", nonce="") -> str:
 def overlays_bridge_html(items, mode="inpaint", nonce="") -> str:
     """Push a list of {name, url(data-URL)} overlays into the canvas strip."""
     import json
-    payload = json.dumps(items or [])
+    # Escape the script terminator so a crafted overlay name (e.g. "</script>…")
+    # can't break out of the inner <script> once srcdoc is un-escaped by the iframe.
+    payload = (json.dumps(items or [])
+               .replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026'))
     inner = ("<script>/*" + str(nonce) + "*/try{parent.window['__is_" + mode
              + "_setoverlays'](" + payload + ");}catch(e){}</script>")
     return ('<iframe srcdoc="' + _html.escape(inner, quote=True)
@@ -635,4 +706,7 @@ def overlays_bridge_html(items, mode="inpaint", nonce="") -> str:
 
 def _js_string(s: str) -> str:
     import json
-    return json.dumps(s)
+    # Escape the script terminator (symmetry with overlays_bridge_html) so the
+    # JSON literal can't close the embedded <script> when un-escaped by srcdoc.
+    return (json.dumps(s)
+            .replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026'))

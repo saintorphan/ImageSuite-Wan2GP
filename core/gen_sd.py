@@ -94,6 +94,20 @@ def release_sd():
     _free_torch()
 
 
+def release_all():
+    """Free *all* plugin-held GPU consumers: the main SD txt2img pipeline, the
+    standalone inpaint/IP-Adapter pipe, and (best-effort) the bundled BiRefNet
+    segmentation model. Registered as the GPU release_vram_callback so handing the
+    lock back to Wan2GP doesn't leak any of these into video generation."""
+    release_sd()
+    release_inpaint()
+    try:
+        from .sd.segmentation import release_segmentation_model
+        release_segmentation_model()
+    except Exception:
+        logger.debug("segmentation release failed", exc_info=True)
+
+
 def available() -> bool:
     """True if the SD/SDXL backend can run — i.e. diffusers is installed and the
     bundled pipeline imports. (The pipeline ships with the plugin; the gate is the
@@ -128,13 +142,21 @@ def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cf
         seed = _random.randint(0, 2**31 - 1)
     with models.no_auto_download():  # never silently pull weights/configs
         pipe.load(checkpoint_path)
+        # Clear any LoRAs left fused on the cached pipe from a prior gen (the empty
+        # list must clear too, so this can't live inside _apply_loras), apply the
+        # requested set, and remove them again afterward so they never contaminate
+        # the next generation on the same checkpoint.
+        pipe.remove_loras()
         _apply_loras(pipe, loras)
-        images = pipe.generate_txt2img(
-            prompt=prompt, negative_prompt=negative or "",
-            width=int(width), height=int(height), steps=int(steps),
-            cfg_scale=float(cfg), seed=int(seed), sampler=sampler, scheduler=scheduler,
-            batch_size=int(batch_size), clip_skip=int(clip_skip), callback=callback,
-        )
+        try:
+            images = pipe.generate_txt2img(
+                prompt=prompt, negative_prompt=negative or "",
+                width=int(width), height=int(height), steps=int(steps),
+                cfg_scale=float(cfg), seed=int(seed), sampler=sampler, scheduler=scheduler,
+                batch_size=int(batch_size), clip_skip=int(clip_skip), callback=callback,
+            )
+        finally:
+            pipe.remove_loras()
     out = Path(out_dir) if out_dir else (paths.cache_dir() / "sd_gen")
     out.mkdir(parents=True, exist_ok=True)
     saved = []
@@ -151,7 +173,7 @@ def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cf
 def generate_img2img(checkpoint_path, image_path, prompt, negative, width, height,
                      steps, cfg, seed, denoise=0.6, sampler="DPM++ 2M", scheduler="Karras",
                      resize_mode=0, batch_size=1, clip_skip=1, out_dir=None,
-                     loras=None) -> list[str]:
+                     callback=None, loras=None) -> list[str]:
     """Reimagine an init image with an SD-family checkpoint (img2img). resize_mode
     fits the init image to width×height: 0 just-resize / 1 crop-and-resize /
     2 resize-and-fill (A1111/reForge codes)."""
@@ -161,13 +183,18 @@ def generate_img2img(checkpoint_path, image_path, prompt, negative, width, heigh
         seed = _random.randint(0, 2**31 - 1)
     with models.no_auto_download():
         pipe.load(checkpoint_path)
+        # See generate_txt2img: clear stale LoRAs, apply, and remove afterward.
+        pipe.remove_loras()
         _apply_loras(pipe, loras)
-        images = pipe.generate_img2img(
-            image=image_path, prompt=prompt, negative_prompt=negative or "",
-            denoising_strength=float(denoise), width=int(width), height=int(height),
-            steps=int(steps), cfg_scale=float(cfg), seed=int(seed), sampler=sampler,
-            scheduler=scheduler, resize_mode=int(resize_mode),
-            batch_size=int(batch_size), clip_skip=int(clip_skip))
+        try:
+            images = pipe.generate_img2img(
+                image=image_path, prompt=prompt, negative_prompt=negative or "",
+                denoising_strength=float(denoise), width=int(width), height=int(height),
+                steps=int(steps), cfg_scale=float(cfg), seed=int(seed), sampler=sampler,
+                scheduler=scheduler, resize_mode=int(resize_mode),
+                batch_size=int(batch_size), clip_skip=int(clip_skip), callback=callback)
+        finally:
+            pipe.remove_loras()
     out = Path(out_dir) if out_dir else (paths.cache_dir() / "sd_gen")
     out.mkdir(parents=True, exist_ok=True)
     saved = []
@@ -183,7 +210,7 @@ def generate_img2img(checkpoint_path, image_path, prompt, negative, width, heigh
 def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0.75,
             steps=30, cfg=6.0, seed=-1, sampler="DPM++ 2M", scheduler="Karras",
             clip_skip=1, mask_blur=4, inpainting_fill=1, full_res=False, padding=32,
-            batch_size=1, loras=None, out_dir=None, progress=None) -> list[str]:
+            batch_size=1, loras=None, out_dir=None, callback=None, progress=None) -> list[str]:
     """Prompt-driven masked inpaint for manual touch-ups (no IP-Adapter). Returns the
     saved image paths (``batch_size`` of them).
 
@@ -216,7 +243,7 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
                 steps=int(steps), cfg_scale=float(cfg), seed=int(seed), sampler=sampler,
                 scheduler=scheduler, clip_skip=int(clip_skip), mask_blur=int(mask_blur),
                 inpainting_fill=int(inpainting_fill), full_res=bool(full_res),
-                padding=int(padding), batch_size=int(batch_size))
+                padding=int(padding), batch_size=int(batch_size), callback=callback)
         finally:
             if ip is not None:
                 try:
@@ -432,6 +459,7 @@ def ip_adapter_inpaint(checkpoint_path, target_path, reference_path, mask_image,
     from PIL import Image
     if seed is None or int(seed) < 0:
         seed = _random.randint(0, 2**31 - 1)
+    release_sd()  # free the txt2img checkpoint before stacking the inpaint+IP pipe
     pipe = _get_inpaint(checkpoint_path, with_ip=True)
     pipe.set_ip_adapter_scale(float(ip_scale))
     target = Image.open(target_path).convert("RGB")
@@ -540,37 +568,46 @@ def run_adetailer(checkpoint_path, image_path, prompt, negative, sampler=None,
         return image_path
     release_sd()  # free the txt2img checkpoint
     pipe = _get_inpaint(checkpoint_path, with_ip=False)
+    if sampler:  # honour the requested sampler/scheduler on the standalone pipe
+        try:
+            from .sd.sd_samplers import create_scheduler
+            sched_config = dict(pipe.scheduler.config)
+            pipe.scheduler = create_scheduler(sampler, scheduler or "Automatic", sched_config)
+        except Exception:
+            logger.warning("failed setting ADetailer scheduler", exc_info=True)
     _remove_loras_from_diffusers(pipe, True)   # clear any stale from a prior pass
     _la = _apply_loras_to_diffusers(pipe, loras)
     result = src.copy()
-    for (x1, y1, x2, y2), full_mask in regions:
-        bw, bh = x2 - x1, y2 - y1
-        px, py = bw * pad, bh * pad
-        cx1, cy1 = max(0, int(x1 - px)), max(0, int(y1 - py))
-        cx2, cy2 = min(W, int(x2 + px)), min(H, int(y2 + py))
-        crop = result.crop((cx1, cy1, cx2, cy2))
-        cw, ch = crop.size
-        if cw < 16 or ch < 16:
-            continue
-        if full_mask is not None:  # person: use the seg mask cropped to this region
-            m = full_mask.crop((cx1, cy1, cx2, cy2))
-        else:  # face: white rect over the (unpadded) face within the crop
-            m = Image.new("L", (cw, ch), 0)
-            ImageDraw.Draw(m).rectangle(
-                (int(x1 - cx1), int(y1 - cy1), int(x2 - cx1), int(y2 - cy1)), fill=255)
-        m = m.filter(ImageFilter.GaussianBlur(radius=max(4, cw // 25)))
-        # Inpaint at ~1024 on the long side, snapped to multiples of 8.
-        scale = 1024.0 / max(cw, ch)
-        tw = max(8, (int(round(cw * scale)) // 8) * 8)
-        th = max(8, (int(round(ch * scale)) // 8) * 8)
-        with models.no_auto_download():
-            out_img = pipe(prompt=prompt or "", negative_prompt=negative or "",
-                           image=crop.resize((tw, th), Image.LANCZOS),
-                           mask_image=m.resize((tw, th), Image.LANCZOS),
-                           strength=float(denoise), num_inference_steps=int(steps),
-                           guidance_scale=float(cfg), width=tw, height=th).images[0]
-        result.paste(out_img.resize((cw, ch), Image.LANCZOS), (cx1, cy1), m)
-    _remove_loras_from_diffusers(pipe, _la)
+    try:
+        for (x1, y1, x2, y2), full_mask in regions:
+            bw, bh = x2 - x1, y2 - y1
+            px, py = bw * pad, bh * pad
+            cx1, cy1 = max(0, int(x1 - px)), max(0, int(y1 - py))
+            cx2, cy2 = min(W, int(x2 + px)), min(H, int(y2 + py))
+            crop = result.crop((cx1, cy1, cx2, cy2))
+            cw, ch = crop.size
+            if cw < 16 or ch < 16:
+                continue
+            if full_mask is not None:  # person: use the seg mask cropped to this region
+                m = full_mask.crop((cx1, cy1, cx2, cy2))
+            else:  # face: white rect over the (unpadded) face within the crop
+                m = Image.new("L", (cw, ch), 0)
+                ImageDraw.Draw(m).rectangle(
+                    (int(x1 - cx1), int(y1 - cy1), int(x2 - cx1), int(y2 - cy1)), fill=255)
+            m = m.filter(ImageFilter.GaussianBlur(radius=max(4, cw // 25)))
+            # Inpaint at ~1024 on the long side, snapped to multiples of 8.
+            scale = 1024.0 / max(cw, ch)
+            tw = max(8, (int(round(cw * scale)) // 8) * 8)
+            th = max(8, (int(round(ch * scale)) // 8) * 8)
+            with models.no_auto_download():
+                out_img = pipe(prompt=prompt or "", negative_prompt=negative or "",
+                               image=crop.resize((tw, th), Image.LANCZOS),
+                               mask_image=m.resize((tw, th), Image.LANCZOS),
+                               strength=float(denoise), num_inference_steps=int(steps),
+                               guidance_scale=float(cfg), width=tw, height=th).images[0]
+            result.paste(out_img.resize((cw, ch), Image.LANCZOS), (cx1, cy1), m)
+    finally:
+        _remove_loras_from_diffusers(pipe, _la)
     out = Path(out_dir) if out_dir else (paths.cache_dir() / "swap")
     out.mkdir(parents=True, exist_ok=True)
     f = out / f"adetail_{int(time.time())}.png"
@@ -590,7 +627,7 @@ def body_swap(checkpoint_path, base_path, source_person_path, prompt, negative,
     """Transfer the source person's skin tone / body texture onto the base's body
     (whole head excluded → face + hair preserved). No pose copy, no ControlNet —
     an IP-Adapter masked inpaint. SD-family checkpoints only. With ``adetailer``,
-    a final face-detail pass runs (using ``adet_prompt``/``adet_neg`` if given)."""
+    a final person/body-detail pass runs (using ``adet_prompt``/``adet_neg`` if given)."""
     def _say(frac, msg):
         if progress is not None:
             try:

@@ -196,6 +196,29 @@ def parse_size(label: str) -> tuple[int, int]:
     return 0, 0
 
 
+def resolution_presets(model_value: str) -> list[tuple[str, str]]:
+    """(label, 'W×H') resolution choices for the selected model's FAMILY — the
+    trained 1024-base buckets for SDXL/Pony/Illustrious/Z-Image/Qwen, the wider set
+    for Flux — tagged by orientation (1:1 / Portrait / Landscape) and ordered
+    square → portrait → landscape. The value is a 'W×H' string parse_size reads;
+    plugin.py wires the dropdown to drop those into Width/Height. Repopulated on
+    model select (mirrors common_sizes / the outpaint target-size dropdown)."""
+    tagged = []
+    for s in common_sizes(model_value):
+        w, h = parse_size(s)
+        if not (w and h):
+            continue
+        if w == h:
+            tag, rank = "⬛ 1:1", 0
+        elif h > w:
+            tag, rank = "📱 Portrait", 1
+        else:
+            tag, rank = "🖼 Landscape", 2
+        tagged.append((rank, f"{tag} · {w}×{h}", s))
+    tagged.sort(key=lambda t: t[0])  # stable → keeps common_sizes order within a tag
+    return [(label, val) for _rank, label, val in tagged]
+
+
 def categorize_lora(name: str) -> str:
     """Same name-based family bucket as checkpoints (Pony/Illustrious/SDXL)."""
     return categorize_sdxl(name)

@@ -26,6 +26,20 @@ SCHEDULERS = ["", "Karras", "Exponential", "Normal", "SGM Uniform", "Simple"]
 # Initial outpaint target sizes (SDXL set); refreshed per model family on change.
 _OUTPAINT_SIZES_INIT = ["1024×1024", "1152×896", "896×1152", "1216×832", "832×1216",
                         "1344×768", "768×1344", "1536×640", "640×1536"]
+# Initial resolution presets (SDXL buckets, grouped by orientation); refreshed per
+# model family on model select (plugin._on_model → discovery.resolution_presets).
+# (label, 'W×H' value) — must mirror discovery.resolution_presets("") output.
+_RES_PRESETS_INIT = [
+    ("⬛ 1:1 · 1024×1024", "1024×1024"),
+    ("📱 Portrait · 896×1152", "896×1152"),
+    ("📱 Portrait · 832×1216", "832×1216"),
+    ("📱 Portrait · 768×1344", "768×1344"),
+    ("📱 Portrait · 640×1536", "640×1536"),
+    ("🖼 Landscape · 1152×896", "1152×896"),
+    ("🖼 Landscape · 1216×832", "1216×832"),
+    ("🖼 Landscape · 1344×768", "1344×768"),
+    ("🖼 Landscape · 1536×640", "1536×640"),
+]
 
 MODES = ("txt2img", "img2img", "inpaint")
 
@@ -47,9 +61,21 @@ def _settings_bar(model_choices, lora_choices, mode):
             c["cfg"] = gr.Slider(1.0, 15.0, value=6.0, step=0.5, label="CFG")
             c["clip_skip"] = gr.Slider(1, 4, value=2, step=1, label="Clip skip")
             c["seed"] = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+        # Resolution: a per-model preset picker (trained buckets by orientation) +
+        # an aspect lock. Picking a preset fills Width/Height; with Lock on, dragging
+        # one slider scales the other to hold the ratio (wired in plugin._wire_page).
+        with gr.Row():
+            c["res_preset"] = gr.Dropdown(
+                label="Resolution preset (follows the selected model)",
+                choices=_RES_PRESETS_INIT, value=None, scale=3)
+            c["res_lock"] = gr.Checkbox(label="🔒 Lock ratio", value=False,
+                                        scale=1, min_width=90)
         with gr.Row():
             c["width"] = gr.Slider(256, 2048, value=832, step=64, label="Width")
             c["height"] = gr.Slider(256, 2048, value=1216, step=64, label="Height")
+        # Aspect ratio captured when Lock is engaged (or a preset is picked); the
+        # slider-sync handlers in plugin.py use it. Holds None when unlocked.
+        c["res_ratio"] = gr.State(None)
         # Batch count always sits in the row below Width/Height (with Denoise
         # beside it on img2img/inpaint) so it's in the same spot on every tab.
         with gr.Row():

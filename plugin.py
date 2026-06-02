@@ -1260,13 +1260,59 @@ class ImageSuite(WAN2GPPlugin):
                     "counter while loading. That's normal, not a freeze; later gens "
                     "reuse it and are fast." if backend == "sd" else "")
             result.append(gr.update(value=note))
+            # Resolution presets follow the model family (1:1 / portrait / landscape);
+            # cleared to no selection so the per-model defaults (above) stand until
+            # the user picks one.
+            result.append(gr.update(choices=discovery.resolution_presets(mv),
+                                    value=None))
             return result
 
         model_outputs = [c["loras"]] + [c[k] for k in setting_keys]
         if "out_size" in c:
             model_outputs.append(c["out_size"])
         model_outputs.append(c["gen_status"])
+        model_outputs.append(c["res_preset"])
         c["model"].change(_on_model, inputs=[c["model"]], outputs=model_outputs)
+
+        # --- Resolution preset + aspect lock (shared by every page) ---------
+        def _snap(v):  # clamp to the slider range and snap to its 64-px step
+            return max(256, min(2048, int(round(float(v) / 64.0)) * 64))
+
+        def _apply_res_preset(val, cur_ratio):
+            """Preset 'W×H' → Width/Height; re-baseline the lock ratio to it. (Returns
+            a plain ratio value, never gr.update(), since res_ratio is a gr.State.)"""
+            w, h = discovery.parse_size(val or "")
+            if not (w and h):
+                return gr.update(), gr.update(), cur_ratio
+            return gr.update(value=w), gr.update(value=h), w / h
+        c["res_preset"].change(
+            _apply_res_preset, inputs=[c["res_preset"], c["res_ratio"]],
+            outputs=[c["width"], c["height"], c["res_ratio"]])
+
+        def _set_lock(locked, w, h):
+            """Capture the current W:H when Lock is engaged; clear it when released."""
+            return (float(w) / float(h)) if (locked and w and h) else None
+        c["res_lock"].change(_set_lock,
+                             inputs=[c["res_lock"], c["width"], c["height"]],
+                             outputs=[c["res_ratio"]])
+
+        # While locked, dragging one slider scales the other to hold the ratio. We
+        # use .release (fires once on mouse-up, not every drag tick), and a
+        # programmatic value-set via a handler output does NOT re-fire the other
+        # slider's .release — so width↔height can't loop.
+        def _sync_h(locked, ratio, w):
+            return (gr.update(value=_snap(float(w) / ratio))
+                    if (locked and ratio) else gr.update())
+
+        def _sync_w(locked, ratio, h):
+            return (gr.update(value=_snap(float(h) * ratio))
+                    if (locked and ratio) else gr.update())
+        c["width"].release(_sync_h,
+                           inputs=[c["res_lock"], c["res_ratio"], c["width"]],
+                           outputs=[c["height"]])
+        c["height"].release(_sync_w,
+                            inputs=[c["res_lock"], c["res_ratio"], c["height"]],
+                            outputs=[c["width"]])
 
         SET = [c["model"], c["sampler"], c["scheduler"], c["steps"], c["cfg"],
                c["clip_skip"], c["seed"], c["width"], c["height"], c["count"],

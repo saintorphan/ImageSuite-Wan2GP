@@ -1293,15 +1293,22 @@ class ImageSuite(WAN2GPPlugin):
             fn, inputs=gen_inputs,
             outputs=[c["gallery"], c["picked"], c["save"]])
 
-        # NO gallery.select handler on purpose. A select event makes Gradio run
-        # check_all_files_in_cache on the payload, which REJECTS the native
-        # backend's output paths — Wan2GP's webui wrapper populates the gallery with
-        # paths outside Gradio's cache dir, so any click throws "File … is not in
-        # the cache folder and cannot be accessed". Instead, 'picked' + Save As are
-        # armed at generation time (outputs=[gallery, picked, save]) to the produced
-        # result — a cached copy via _serve — which is correct for a single image.
-        # (Click-to-pick a specific image from a batch is omitted to avoid that
-        # check; restore it later via a hidden index, not a SelectData handler.)
+        # Click a gallery result to make IT the active selection — so Send-to /
+        # Save As / the enhancement passes act on whichever image you pick, not just
+        # the first. Safe: the gallery is fed PIL images, so Gradio owns each entry
+        # as a CACHE path, and the select payload's path is therefore inside the
+        # Gradio cache — which both the stock check_all_files_in_cache and our
+        # allow-list patch (_cache_allow_dirs) accept. 'picked' is still armed to the
+        # first result at generation time, so it's correct before any click.
+        def _pick(evt: gr.SelectData):
+            v = evt.value
+            p = None
+            if isinstance(v, dict):
+                p = (v.get("image") or {}).get("path") or v.get("path")
+            elif isinstance(v, str):
+                p = v
+            return (p, gr.update(value=p)) if p else (gr.update(), gr.update())
+        c["gallery"].select(_pick, outputs=[c["picked"], c["save"]])
 
         # Qwen-abliterated prompt enhance (Wan2GP's native enhancer).
         if "enhance_pos" in c:

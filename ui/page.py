@@ -153,9 +153,9 @@ def _touchup_block(c):
 
 
 def _results_block(c, mode):
-    """The shared results column: gallery, send-to row, save. There is no gallery
-    select handler — ``picked`` is armed to the FIRST result at generation time
-    (see plugin.py); the send/save/enhance buttons act on that.
+    """The shared results column: gallery, send-to row, save. Click a gallery item
+    to make it the selection (``picked``); it defaults to the first result at
+    generation time. Send / Save As / enhancement passes all act on the selection.
     The side-by-side tabs get a taller gallery so the Save As button lands level
     with the Generate button in the left column (tune the heights to taste)."""
     gallery_h = {"txt2img": 520, "img2img": 620}.get(mode, 460)
@@ -167,7 +167,7 @@ def _results_block(c, mode):
     c["gallery"] = gr.Gallery(label="Results", columns=2, height=gallery_h,
                               elem_classes="imagesuite-gallery", object_fit="contain")
     c["picked"] = gr.State(None)  # path of the selected (clicked) result
-    gr.Markdown("**Send first result to →**")
+    gr.Markdown("**Send selected result to →**")
     with gr.Row(elem_classes="imagesuite-sendrow"):
         # Txt2Img/Img2Img hide their own-page button; MultiCanvas keeps it as
         # "Back to canvas" so the inpainted result can be re-loaded for another pass.

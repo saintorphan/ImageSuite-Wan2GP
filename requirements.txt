@@ -1,0 +1,25 @@
+# Image Suite — runtime deps.
+#
+# Wan2GP already provides gradio, torch, torchvision, Pillow and numpy, plus the
+# native (Flux / Z-Image / Qwen) image pipelines. Everything below is only needed
+# for the OPTIONAL SDXL-family backend and the enhancement suite — all are lazily
+# imported, so the plugin loads and the native path works even if they're absent.
+
+# SDXL / Pony / Illustrious generation + img2img + inpaint + outpaint + IP-Adapter
+# (Colour Reference & Body Swap). Runs in-plugin via 🤗 diffusers (see core/sd/) —
+# no external checkout required.
+diffusers
+transformers
+accelerate
+safetensors
+
+# Face swap + ADetailer (face / person detect) + WD14 interrogate tagger.
+insightface
+onnxruntime-gpu
+onnx
+opencv-python
+scikit-image
+
+# Body-swap segmentation + head mask (BiRefNet via transformers + mediapipe).
+# kornia (BiRefNet modeling code) is auto-installed on first use by core/deps.py.
+mediapipe

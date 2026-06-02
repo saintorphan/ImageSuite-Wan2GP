@@ -1,0 +1,9 @@
+{
+  "name": "Image Suite",
+  "author": "saintorphan",
+  "version": "0.1.0",
+  "description": "Three-in-one image workbench: Txt2Img, Img2Img and Draw/Inpaint sub-tabs for Flux, Z-Image and the SDXL lineup (Pony, Illustrious). Send any result to the other pages, to Img2Vid, or Save As.",
+  "date": "",
+  "wan2gp_version": "",
+  "url": "https://github.com/saintorphan/ImageSuite-Wan2GP"
+}

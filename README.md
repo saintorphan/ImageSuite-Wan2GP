@@ -49,15 +49,22 @@ A built-in enhancement suite you can run on any result: **ADetailer** face & bod
 refine, **face swap**, **body swap** (transfers skin tone & texture, head
 preserved), and a **colour / style reference** pass.
 
-### 🖱️ OrphanSuite right-click commands
-Image Suite plugs into the shared **saintorphan** right-click menu. Right-click any
-image anywhere in Wan2GP for a **saintorphan** section — *Send to Img2Vid*,
-*ImageSuite (Img2Img)*, *ImageSuite (MultiCanvas)* — and it loads straight into the
-right page.
+### 🔗 Part of OrphanSuite — shared across my plugins
+Image Suite is one of the **OrphanSuite** plugins (alongside **Reel2Reel** and
+**Replicant CharLab** — both not yet released), which share setup so you configure
+things once:
 
-It's a shared engine across the **OrphanSuite** of plugins: as **Reel2Reel** and
-**Replicant CharLab** arrive (both not yet released), they register into the *same*
-menu, so everything cross-talks.
+- **Unified config** — SDXL/Pony/Illustrious checkpoints, LoRAs and face/ADetailer
+  weights live in a single shared `.orphansuite.json`. Set a folder once (in *any*
+  OrphanSuite plugin's **Settings → OrphanSuite**) and every plugin uses it — no
+  per-plugin duplication.
+- **Link existing folder** — a button in **Settings → OrphanSuite** that
+  **symlinks** models you already keep (a1111 / Forge / anywhere on disk) into the
+  shared area, without copying or moving the originals.
+- **Shared right-click menu** — right-click any image anywhere in Wan2GP for an
+  **OrphanSuite** section (*Send to Img2Vid*, *ImageSuite (Img2Img)*,
+  *ImageSuite (MultiCanvas)*); it loads straight into the right page. As the other
+  plugins land they register into the *same* menu, so everything cross-talks.
 
 ## Install
 Use the Wan2GP **Plugin Manager → Add from GitHub URL**:

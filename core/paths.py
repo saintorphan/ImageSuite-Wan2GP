@@ -179,6 +179,23 @@ def get_shared(key, default=None):
     return default if v is None else v
 
 
+def browse_root() -> str:
+    """Root dir for any folder-browser (gr.FileExplorer). Cross-plugin shared key
+    ``fs_browse_root`` wins; else "/" locally but auto-confined to home when the app
+    is exposed via --listen/--share. (Unified with Replicant's OrphanSuite setting.)"""
+    v = get_shared("fs_browse_root", "")
+    if v:
+        return str(Path(v).expanduser())
+    try:
+        import sys
+        a = getattr(sys.modules.get("__main__"), "args", None)
+        if a is not None and (getattr(a, "listen", False) or getattr(a, "share", False)):
+            return str(Path.home())
+    except Exception:
+        pass
+    return "/"
+
+
 def set_shared(key, value) -> None:
     """Persist any JSON value to the cross-plugin .orphansuite.json (shared across
     saintorphan plugins — e.g. shared dirs and per-family gen_defaults). Re-reads

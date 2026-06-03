@@ -1145,90 +1145,15 @@ class ImageSuite(WAN2GPPlugin):
             if folder not in folders:
                 folder = ov.ROOT_LABEL
             return (gr.update(choices=folders, value=folder),
-                    gr.update(value=ov.list_images(folder)),
-                    gr.update(choices=folders))
+                    gr.update(value=ov.list_images(folder)))
 
         o["folder"].change(_refresh, inputs=[o["folder"]],
-                           outputs=[o["folder"], o["gallery"], o["move_to"]])
+                           outputs=[o["folder"], o["gallery"]])
 
-        def _create(name, folder):
-            try:
-                folder = ov.create_folder(name); msg = f"Created folder '{folder}'."
-            except Exception as e:
-                msg = f"⚠ {e}"
-            return (*_refresh(folder), gr.update(value=""), msg)
-        o["create_folder"].click(
-            _create, inputs=[o["new_folder"], o["folder"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["new_folder"], o["status"]])
-
-        def _del_folder(folder):
-            try:
-                ov.delete_folder(folder); msg = f"Deleted folder '{folder}'."
-            except Exception as e:
-                msg = f"⚠ {e}"
-            return (*_refresh(ov.ROOT_LABEL), msg)
-        o["delete_folder"].click(
-            _del_folder, inputs=[o["folder"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["status"]])
-
-        def _upload(files, folder):
-            try:
-                fps = [getattr(f, "name", f) for f in (files or [])]
-                n = ov.save_uploads(folder, fps); msg = f"Added {n} image(s)."
-            except Exception as e:
-                msg = f"⚠ {e}"
-            return (*_refresh(folder), None, msg)
-        o["upload_btn"].click(
-            _upload, inputs=[o["upload"], o["folder"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["upload"], o["status"]])
-
-        def _select(evt: gr.SelectData):
-            v = evt.value
-            path = (v.get("image", {}).get("path") or v.get("path")
-                    if isinstance(v, dict) else v if isinstance(v, str) else None)
-            name = os.path.basename(path) if path else None
-            return name, gr.update(value=path), gr.update(value=name or "")
-        o["gallery"].select(_select,
-                            outputs=[o["selected"], o["preview"], o["rename_to"]])
-
-        def _rename(folder, sel, new):
-            try:
-                if not sel:
-                    raise ValueError("Select an overlay first.")
-                sel = ov.rename_image(folder, sel, new); msg = f"Renamed to '{sel}'."
-            except Exception as e:
-                msg = f"⚠ {e}"
-            return (*_refresh(folder), sel, msg)
-        o["rename_btn"].click(
-            _rename, inputs=[o["folder"], o["selected"], o["rename_to"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["selected"], o["status"]])
-
-        def _move(folder, sel, dest):
-            try:
-                if not sel:
-                    raise ValueError("Select an overlay first.")
-                name = ov.move_image(folder, sel, dest)
-                msg = (f"Moved '{sel}' to '{dest}' (renamed '{name}')."
-                       if name and name != sel else f"Moved '{sel}' to '{dest}'.")
-            except Exception as e:
-                msg = f"⚠ {e}"
-            return (*_refresh(folder), None, msg)
-        o["move_btn"].click(
-            _move, inputs=[o["folder"], o["selected"], o["move_to"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["selected"], o["status"]])
-
-        def _delete(folder, sel):
-            try:
-                if not sel:
-                    raise ValueError("Select an overlay first.")
-                ov.delete_image(folder, sel); msg = f"Deleted '{sel}'."
-            except Exception as e:
-                msg = f"⚠ {e}"
-            return (*_refresh(folder), None, None, msg)
-        o["delete_btn"].click(
-            _delete, inputs=[o["folder"], o["selected"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["selected"],
-                     o["preview"], o["status"]])
+        # (The native folder create/delete, image rename/move/delete and upload
+        # widgets were removed — the file-browser right-click menus + drag-drop below
+        # replace them. The folder dropdown stays as the navigator; .select isn't
+        # wired since file ops carry the thumbnail index instead.)
 
         # -- file-browser bridges: the JS in overlays_panel.py drives two hidden
         #    textboxes — ov_action ({op,idx,arg,nonce}) for right-click menu ops, and
@@ -1266,16 +1191,13 @@ class ImageSuite(WAN2GPPlugin):
                         ov.move_image(folder, name, ov.ROOT_LABEL)
                         msg = f"Moved '{name}' up to {ov.ROOT_LABEL}."
                 else:
-                    return (gr.update(), gr.update(), gr.update(), gr.update(),
-                            gr.update())
+                    return (gr.update(), gr.update(), gr.update())
             except Exception as e:
-                return (gr.update(), gr.update(), gr.update(), gr.update(value=None),
-                        f"⚠ {e}")
-            return (*_refresh(folder), None, f"✅ {msg}")
+                return (gr.update(), gr.update(), f"⚠ {e}")
+            return (*_refresh(folder), f"✅ {msg}")
         o["ov_action"].input(
             _ov_action, inputs=[o["ov_action"], o["folder"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["selected"],
-                     o["status"]])
+            outputs=[o["folder"], o["gallery"], o["status"]])
 
         def _ov_upload(payload, folder):
             import base64
@@ -1315,7 +1237,7 @@ class ImageSuite(WAN2GPPlugin):
             return (*_refresh(folder), msg)
         o["ov_upload"].input(
             _ov_upload, inputs=[o["ov_upload"], o["folder"]],
-            outputs=[o["folder"], o["gallery"], o["move_to"], o["status"]])
+            outputs=[o["folder"], o["gallery"], o["status"]])
 
     # Settings persisted per tab so the image tabs come back as you left them
     # after a restart (written on Generate, restored on page load).

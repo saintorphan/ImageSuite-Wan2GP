@@ -979,16 +979,43 @@ class ImageSuite(WAN2GPPlugin):
                 served.append(os.path.abspath(str(f)))
         return served
 
-    def _gallery_result(self, files):
+    def _persist_results(self, mode, served):
+        """Copy a tab's just-served results into a per-mode persist dir (cleared each
+        time, so it never grows) + record the list in the gitignored .imagesuite.json,
+        so the gallery is restored on the next app load. Best-effort — a hiccup here
+        never breaks a generation."""
+        import os
+        import shutil
+        try:
+            d = paths.cache_dir() / "persist" / "results" / str(mode)
+            if d.exists():
+                shutil.rmtree(d)
+            d.mkdir(parents=True, exist_ok=True)
+            kept = []
+            for sp in served or []:
+                try:
+                    dst = d / os.path.basename(sp)
+                    shutil.copy2(sp, dst)
+                    kept.append(str(dst))
+                except Exception:
+                    pass
+            paths.set_results(mode, kept)
+        except Exception:
+            traceback.print_exc()
+
+    def _gallery_result(self, files, mode=None):
         """The (gallery, picked, save) tuple every generate handler returns.
 
         The gallery is fed PIL images, NOT paths: Gradio then owns the cache entry
         for each, so the select event's file-in-cache check can't trip on an
         external/relative path. picked + Save As still get a real cached file path
-        (via _serve) so send-to / download work."""
+        (via _serve) so send-to / download work. When ``mode`` is given, the results
+        are also persisted so the tab's gallery survives a restart."""
         served = self._serve(files if isinstance(files, (list, tuple)) else [files])
         if not served:
             raise gr.Error("Generation produced no images.")
+        if mode:
+            self._persist_results(mode, served)
         from PIL import Image
         gallery = []
         for p in served:
@@ -1402,6 +1429,23 @@ class ImageSuite(WAN2GPPlugin):
                     ups.append(gr.update())
             return ups
 
+        # Restore each tab's last result images (persisted on generation) so the
+        # galleries survive a restart, like the settings above.
+        def _restore_results():
+            import os
+            outs = []
+            for mode in pages:
+                kept = [p for p in paths.get_results(mode) if os.path.exists(p)]
+                if kept:
+                    try:
+                        g, picked, save = self._gallery_result(kept)
+                        outs += [g, picked, save]
+                        continue
+                    except Exception:
+                        traceback.print_exc()
+                outs += [gr.update(), gr.update(), gr.update()]
+            return outs
+
         try:
             from gradio.context import Context
             root = Context.root_block
@@ -1409,6 +1453,10 @@ class ImageSuite(WAN2GPPlugin):
                        + [comp for _, comp in res_preset_extra])
             if root is not None and comps:
                 root.load(_restore, inputs=None, outputs=outputs)
+            if root is not None:
+                res_out = [pages[m][k] for m in pages
+                           for k in ("gallery", "picked", "save")]
+                root.load(_restore_results, inputs=None, outputs=res_out)
         except Exception:
             traceback.print_exc()
 
@@ -1650,7 +1698,7 @@ class ImageSuite(WAN2GPPlugin):
                 raise gr.Error("Txt2img aborted.")
             if not files:
                 raise gr.Error("Generation produced no images.")
-            return self._gallery_result(files)
+            return self._gallery_result(files, mode)
         return _run
 
     def _make_img2img(self, mode):
@@ -1712,7 +1760,7 @@ class ImageSuite(WAN2GPPlugin):
                 raise gr.Error("img2img aborted.")
             if not files:
                 raise gr.Error("img2img produced no images.")
-            return self._gallery_result(files)
+            return self._gallery_result(files, mode)
         return _run
 
     # generate_inpaint's inpainting_fill code: 0 fill / 1 original /
@@ -1827,7 +1875,7 @@ class ImageSuite(WAN2GPPlugin):
             if not outs:
                 raise gr.Error("Inpaint aborted." if gen_sd.was_aborted()
                                else "Inpaint produced no image.")
-            return self._gallery_result(outs)
+            return self._gallery_result(outs, mode)
         return _run
 
     def _make_outpaint(self, mode):
@@ -1878,7 +1926,7 @@ class ImageSuite(WAN2GPPlugin):
             if not outs:
                 raise gr.Error("Outpaint aborted." if gen_sd.was_aborted()
                                else "Outpaint produced no image.")
-            return self._gallery_result(outs)
+            return self._gallery_result(outs, mode)
         return _run
 
     # -- right-click context menu router -----------------------------------

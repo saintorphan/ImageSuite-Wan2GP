@@ -87,6 +87,23 @@ def set_ui_state(mode: str, values: dict) -> None:
     save_config()
 
 
+def get_results(mode: str) -> list:
+    """Persisted result-image paths for a tab (so the gallery survives a restart)."""
+    r = load_config().get("results")
+    return list(r.get(str(mode), [])) if isinstance(r, dict) else []
+
+
+def set_results(mode: str, paths_list) -> None:
+    """Remember a tab's last result paths in the (gitignored) config."""
+    cfg = load_config()
+    r = cfg.get("results")
+    if not isinstance(r, dict):
+        r = {}
+    r[str(mode)] = [str(p) for p in (paths_list or [])]
+    cfg["results"] = r
+    save_config()
+
+
 def set_dirs(*, outputs=None, models=None, sdxl_models=None, sdxl_loras=None) -> None:
     """Persist directory overrides. SHARED resources (face/ADetailer weights, SDXL
     checkpoints + LoRAs) go to the cross-plugin .orphansuite.json so every plugin

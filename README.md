@@ -12,7 +12,8 @@
 
 Image Suite drops a single gold-bordered **Image Suite** tab into Wan2GP with three
 generation pages — **Txt2Img**, **Img2Img** and **MultiCanvas** — plus an
-**Overlays** library and a **⚙ Settings** tab.
+**Overlays** library and a **⚙ Settings** tab. A header bar lets you **save and load
+whole Projects** — your entire workspace — at any time.
 
 ## ✨ Highlights
 
@@ -29,10 +30,12 @@ A proper PaintShop-style canvas, not a single mask box:
 - **Layers** — stacked draw layers over your image, with a horizontal layers
   manager (add / delete / hide / reorder / flip).
 - **Mask tools** — auto-mask, magic wand, lasso, grow / shrink, invert, blur.
-- **Draw tools** — brush (with hardness), eraser, fill bucket, eyedropper, clone
-  stamp, smudge, and rectangle / ellipse / line shapes.
-- **Clipboard & transform** — copy/paste masked regions as new layers; move,
-  scale, rotate; flatten down.
+- **Draw tools** — brush (with hardness), eraser, a **restore brush** (paint
+  erased pixels back), fill bucket, eyedropper, clone stamp, smudge, and
+  rectangle / ellipse / line shapes.
+- **Clipboard & transform** — copy/paste masked regions as new layers; an
+  on-canvas **transform tool with drag handles** (move / scale / rotate) plus
+  per-layer opacity; flatten down.
 - **Overlays** — keep a library of transparent PNGs / frames / stickers and
   **drag them straight onto the canvas** as new layers.
 - **Complex inpainting** — mask mode, masked-content fill, inpaint area and
@@ -58,6 +61,14 @@ preserved), and a **color / style reference** pass.
   plus a 🔒 **lock** so dragging one dimension scales the other to keep the ratio.
 - **Interrogate** — pull a prompt back *out* of any image (WD14 booru tags, or a
   BLIP caption) to remix or refine it.
+
+### 💾 Projects — save & restore your whole workspace
+Save everything you're working on as a named **Project** from the header bar: all
+three tabs' prompts and settings, the reference images, the results you currently have
+on screen, and the **entire MultiCanvas layer stack** (base + every layer + mask). Load
+it back any time to pick up exactly where you left off. A **Flush Outputs** button in
+Settings reclaims disk from old generations that aren't part of a project — and shows
+you how much space it'll free first.
 
 ### 🔗 Part of OrphanSuite — shared across my plugins
 Image Suite is one of the **OrphanSuite** plugins (alongside **Reel2Reel** and

@@ -85,6 +85,29 @@ def delete_folder(name: str) -> None:
     shutil.rmtree(d)
 
 
+def rename_folder(name: str, new_name: str) -> str:
+    if not name or name == ROOT_LABEL:
+        raise ValueError("Pick a folder to rename (not the root).")
+    src = _safe(name)
+    if not src.is_dir():
+        raise ValueError(f"No such folder '{name}'.")
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise ValueError("Enter a new folder name.")
+    if "/" in new_name or "\\" in new_name:
+        raise ValueError("Folder names can't contain slashes.")
+    dst = _safe(new_name)
+    if dst.exists():
+        raise ValueError(f"Folder '{new_name}' already exists.")
+    src.rename(dst)
+    return new_name
+
+
+def folder_is_empty(name: str) -> bool:
+    """True if ``name`` holds no image files (used to decide delete-confirm)."""
+    return not list_images(name)
+
+
 def save_uploads(folder: str, file_paths: list[str]) -> int:
     """Copy uploaded files (Gradio temp paths) into ``folder``. Returns the count
     of images actually saved (non-images are skipped)."""

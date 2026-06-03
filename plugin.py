@@ -1230,6 +1230,93 @@ class ImageSuite(WAN2GPPlugin):
             outputs=[o["folder"], o["gallery"], o["move_to"], o["selected"],
                      o["preview"], o["status"]])
 
+        # -- file-browser bridges: the JS in overlays_panel.py drives two hidden
+        #    textboxes — ov_action ({op,idx,arg,nonce}) for right-click menu ops, and
+        #    ov_upload ({items:[{name,dataurl}],nonce}) for drag-drop / picked images.
+        #    File ops carry the thumbnail INDEX; we resolve index→name server-side. --
+        import json as _json
+
+        def _ov_action(payload, folder):
+            try:
+                d = _json.loads(payload) if payload else {}
+            except Exception:
+                d = {}
+            op, arg, idx = d.get("op"), d.get("arg"), d.get("idx")
+            try:
+                if op == "new_folder":
+                    folder = ov.create_folder(arg); msg = f"Created folder '{folder}'."
+                elif op == "rename_folder":
+                    folder = ov.rename_folder(folder, arg)
+                    msg = f"Renamed folder to '{folder}'."
+                elif op == "delete_folder":
+                    ov.delete_folder(folder); folder = ov.ROOT_LABEL
+                    msg = "Deleted folder."
+                elif op in ("rename_file", "delete_file", "moveup_file"):
+                    imgs = ov.list_images(folder)
+                    i = int(idx) if idx is not None else -1
+                    if not (0 <= i < len(imgs)):
+                        raise ValueError("That image is no longer here — try again.")
+                    name = os.path.basename(imgs[i])
+                    if op == "rename_file":
+                        name = ov.rename_image(folder, name, arg)
+                        msg = f"Renamed to '{name}'."
+                    elif op == "delete_file":
+                        ov.delete_image(folder, name); msg = f"Deleted '{name}'."
+                    else:
+                        ov.move_image(folder, name, ov.ROOT_LABEL)
+                        msg = f"Moved '{name}' up to {ov.ROOT_LABEL}."
+                else:
+                    return (gr.update(), gr.update(), gr.update(), gr.update(),
+                            gr.update())
+            except Exception as e:
+                return (gr.update(), gr.update(), gr.update(), gr.update(value=None),
+                        f"⚠ {e}")
+            return (*_refresh(folder), None, f"✅ {msg}")
+        o["ov_action"].input(
+            _ov_action, inputs=[o["ov_action"], o["folder"]],
+            outputs=[o["folder"], o["gallery"], o["move_to"], o["selected"],
+                     o["status"]])
+
+        def _ov_upload(payload, folder):
+            import base64
+            import io
+            import tempfile
+            from PIL import Image
+            try:
+                items = (_json.loads(payload) or {}).get("items", []) if payload else []
+            except Exception:
+                items = []
+            tmpd = tempfile.mkdtemp(prefix="ovup_")
+            fps = []
+            for it in (items or [])[:50]:
+                try:
+                    b64 = (it.get("dataurl") or "").split(",", 1)[-1]
+                    if len(b64) > 24 * 1024 * 1024:     # ~18 MB encoded cap per image
+                        continue
+                    raw = base64.b64decode(b64)
+                    prev = Image.MAX_IMAGE_PIXELS       # decompression-bomb guard
+                    Image.MAX_IMAGE_PIXELS = 50_000_000
+                    try:
+                        with Image.open(io.BytesIO(raw)) as im:
+                            im.load()
+                    finally:
+                        Image.MAX_IMAGE_PIXELS = prev
+                    fp = os.path.join(tmpd,
+                                      ov._safe_name(it.get("name") or "overlay.png"))
+                    with open(fp, "wb") as f:
+                        f.write(raw)
+                    fps.append(fp)
+                except Exception:
+                    continue
+            try:
+                n = ov.save_uploads(folder, fps); msg = f"✅ Added {n} image(s)."
+            except Exception as e:
+                msg = f"⚠ {e}"
+            return (*_refresh(folder), msg)
+        o["ov_upload"].input(
+            _ov_upload, inputs=[o["ov_upload"], o["folder"]],
+            outputs=[o["folder"], o["gallery"], o["move_to"], o["status"]])
+
     # Settings persisted per tab so the image tabs come back as you left them
     # after a restart (written on Generate, restored on page load).
     _PERSIST_KEYS = ["model", "sampler", "scheduler", "steps", "cfg", "clip_skip",

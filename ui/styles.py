@@ -46,6 +46,16 @@ button.imagesuite-tabbtn {
    centered line. */
 #imagesuite-root .imagesuite-modelrow { align-items: center; }
 #imagesuite-root .imagesuite-modelrow p { margin: 2px 0; }
+/* Overlays file-browser: right-click menu (appended to <body>, so NOT scoped under
+   #imagesuite-root) + a drop-target highlight on the gallery. */
+#imagesuite-ovmenu { position: fixed; z-index: 10000; display: none; min-width: 168px;
+    background: #1d1d25; border: 1px solid #444; border-radius: 8px; padding: 4px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); font-size: 13px; }
+#imagesuite-ovmenu .ovmenu-item { padding: 6px 12px; border-radius: 5px;
+    cursor: pointer; color: #ddd; white-space: nowrap; }
+#imagesuite-ovmenu .ovmenu-item:hover { background: #e83e8c; color: #fff; }
+#imagesuite-root .imagesuite-gallery.ov-dragover { outline: 2px dashed #e83e8c;
+    outline-offset: -4px; }
 /* SDXL load / working notice under Generate — accent so it's noticed */
 #imagesuite-root .imagesuite-genstatus { font-size: 13px; color: #e83e8c;
     margin: 2px 0 4px; min-height: 0; }

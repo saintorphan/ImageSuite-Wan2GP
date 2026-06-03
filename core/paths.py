@@ -281,6 +281,14 @@ def link_existing_into_shared(
     src = Path(source_dir).expanduser()
     if not src.is_dir():
         raise ValueError(f"Not a folder: {source_dir}")
+    # Confine the source to the configured browse root (which auto-collapses to the
+    # user's home when the app is exposed via --listen/--share) so a remote user can't
+    # symlink arbitrary files (e.g. another user's home, /etc) into the served dirs.
+    root = Path(browse_root()).resolve()
+    try:
+        src.resolve().relative_to(root)
+    except ValueError:
+        raise ValueError(f"Folder must be inside {root}.")
     if target == "birefnet":
         exts = None  # an HF model dir: bring config.json + *.py modeling code + weights
     dst_root = link_target_dir(target)
@@ -293,13 +301,13 @@ def link_existing_into_shared(
         if dst.exists() or dst.is_symlink():
             skipped += 1
             continue
-        target = f.resolve()  # follow existing symlinks to the real file
+        real = f.resolve()  # follow existing symlinks to the real file
         try:
-            dst.symlink_to(target)
+            dst.symlink_to(real)
             linked += 1
         except OSError:
             try:
-                shutil.copy2(target, dst)
+                shutil.copy2(real, dst)
                 copied += 1
             except Exception:
                 logger.warning("could not link/copy %s", f, exc_info=True)

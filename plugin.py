@@ -10,6 +10,8 @@ handed to the Video Generator (Img2Vid), or downloaded (Save As).
 NOTE: not an official plugin. Distribute via the plugin-manager "add from GitHub
 URL" flow; do not add to the bundled plugins.json without dbm's approval.
 """
+from __future__ import annotations
+
 import functools
 import time
 import traceback
@@ -598,7 +600,14 @@ class ImageSuite(WAN2GPPlugin):
         except Exception:
             pass
         try:
-            _add(paths.outputs_dir())
+            od = os.path.realpath(str(paths.outputs_dir()))
+            home = os.path.realpath(os.path.expanduser("~"))
+            # A user-repointed outputs_dir of '/', '~', or an ancestor of home would
+            # widen this read allow-list into an arbitrary-local-file primitive once
+            # exposed — skip those (cwd/outputs below still covers the normal case).
+            if (od not in ("/", home, os.path.dirname(home))
+                    and os.path.commonpath([od, home]) != od):
+                _add(od)
         except Exception:
             pass
         _add(os.path.join(os.getcwd(), "outputs"))  # Wan2GP's own outputs
@@ -1805,6 +1814,30 @@ class ImageSuite(WAN2GPPlugin):
                 continue
         return None
 
+    @staticmethod
+    def _resolve_safe_addr(host, port):
+        """getaddrinfo(host, port) iff EVERY resolved IP is a public/global address;
+        else None. Blocks SSRF to loopback / private / link-local / reserved /
+        multicast targets (e.g. 127.0.0.1, 169.254.169.254 cloud-metadata, 10/8)
+        once the app is exposed via --listen/--share. Best-effort: validates at
+        resolve time; full DNS-rebinding defence would need connect-time IP pinning."""
+        import ipaddress
+        import socket
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception:
+            return None
+        for info in infos:
+            try:
+                addr = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                return None
+            m = getattr(addr, "ipv4_mapped", None) or addr  # unwrap ::ffff:1.2.3.4
+            if (m.is_private or m.is_loopback or m.is_link_local or m.is_reserved
+                    or m.is_multicast or m.is_unspecified):
+                return None
+        return infos or None
+
     def _resolve_src(self, src) -> str | None:
         """A media src from the context menu → a local file path. Handles PNG
         data-URLs (canvas export), Gradio-served '…file=<path>' URLs, plain local
@@ -1853,17 +1886,41 @@ class ImageSuite(WAN2GPPlugin):
             allowed = self._allowed_local_file(src)
             if allowed:
                 return allowed
-            scheme = urllib.parse.urlparse(src).scheme.lower()
+            parsed = urllib.parse.urlparse(src)
+            scheme = parsed.scheme.lower()
             if scheme in ("http", "https"):
+                import urllib.error
+                host = parsed.hostname
+                port = parsed.port or (443 if scheme == "https" else 80)
+                # SSRF guard: only fetch PUBLIC hosts on the standard web ports, so an
+                # exposed instance can't be coerced via a client-supplied context-menu
+                # URL into hitting internal / cloud-metadata endpoints (169.254.169.254,
+                # localhost, 10/8, …). Redirects are re-validated by the handler below.
+                if port not in (80, 443) or not host or not self._resolve_safe_addr(host, port):
+                    raise gr.Error("That URL isn't allowed — only public http(s) image "
+                                   "hosts on standard ports can be fetched.")
                 out = paths.cache_dir() / "ctx"
                 out.mkdir(parents=True, exist_ok=True)
-                ext = os.path.splitext(urllib.parse.urlparse(src).path)[1] or ".png"
+                ext = os.path.splitext(parsed.path)[1] or ".png"
                 p = out / f"ctx_{int(time.time()*1000)}{ext}"
                 # Bounded fetch: connect timeout + a hard size cap so a hostile/large
                 # URL can't hang the handler or fill the disk.
                 MAX_BYTES = 64 * 1024 * 1024
+
+                class _NoSSRFRedirect(urllib.request.HTTPRedirectHandler):
+                    # A public URL must not 30x-bounce the fetch into a private target.
+                    def redirect_request(self, rq, fp, code, msg, hdrs, newurl):
+                        pr = urllib.parse.urlparse(newurl)
+                        pt = pr.port or (443 if pr.scheme.lower() == "https" else 80)
+                        if (pr.scheme.lower() not in ("http", "https") or pt not in (80, 443)
+                                or not pr.hostname
+                                or not ImageSuite._resolve_safe_addr(pr.hostname, pt)):
+                            raise urllib.error.URLError("redirect to a disallowed host")
+                        return super().redirect_request(rq, fp, code, msg, hdrs, newurl)
+
                 req = urllib.request.Request(src, headers={"User-Agent": "ImageSuite"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                opener = urllib.request.build_opener(_NoSSRFRedirect())
+                with opener.open(req, timeout=15) as resp:
                     clen = resp.headers.get("Content-Length")
                     if clen and int(clen) > MAX_BYTES:
                         raise gr.Error("That remote image is too large.")

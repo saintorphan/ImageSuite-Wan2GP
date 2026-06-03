@@ -49,6 +49,16 @@ A built-in enhancement suite you can run on any result: **ADetailer** face & bod
 refine, **face swap**, **body swap** (transfers skin tone & texture, head
 preserved), and a **colour / style reference** pass.
 
+### 🗂️ Prompt Library, presets & tagging
+- **Prompt Library** — save a full setup (prompt, negative, **every** generation
+  setting, model, LoRAs and post-process options) under a name and reload it on any
+  tab. One shared, reusable collection across Txt2Img / Img2Img / MultiCanvas.
+- **Resolution presets + aspect lock** — a per-model dropdown of that family's
+  trained buckets (1:1 / portrait / landscape) that fills Width × Height in a click,
+  plus a 🔒 **lock** so dragging one dimension scales the other to keep the ratio.
+- **Interrogate** — pull a prompt back *out* of any image (WD14 booru tags, or a
+  BLIP caption) to remix or refine it.
+
 ### 🔗 Part of OrphanSuite — shared across my plugins
 Image Suite is one of the **OrphanSuite** plugins (alongside **Reel2Reel** and
 **Replicant CharLab** — both not yet released), which share setup so you configure
@@ -96,3 +106,11 @@ Wan2GP plugins is my way of giving something back; Image Suite is the first.
 
 Huge thanks to **deepbeepmeep** and **[Wan2GP](https://github.com/deepbeepmeep/Wan2GP)**
 for the platform. 💛
+
+## License
+Image Suite is released under the **same license as Wan2GP — the WanGP Community
+License 2.0** (see [`LICENSE.txt`](LICENSE.txt)): free for personal, hobby, research
+and internal/business use, including using its outputs commercially. Bundled
+third-party code keeps its own license — see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) (notably the Apache-2.0
+Laplacian-blend port).

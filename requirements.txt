@@ -1,9 +1,16 @@
 # Image Suite — runtime deps.
 #
-# Wan2GP already provides gradio, torch, torchvision, Pillow and numpy, plus the
-# native (Flux / Z-Image / Qwen) image pipelines. Everything below is only needed
-# for the OPTIONAL SDXL-family backend and the enhancement suite — all are lazily
-# imported, so the plugin loads and the native path works even if they're absent.
+# Everything here is for the OPTIONAL SDXL-family backend + the enhancement suite;
+# all are lazily imported, so the plugin loads and the native (Flux / Z-Image / Qwen)
+# path works even if they're absent. Versions are intentionally UNPINNED so they defer
+# to whatever Wan2GP already pins — pip leaves an already-satisfied requirement alone,
+# so this won't churn the host's versions.
+#
+# Already shipped by Wan2GP (all platforms): gradio, torch, torchvision, Pillow,
+# numpy, diffusers, transformers, accelerate, opencv-python, onnxruntime-gpu. They're
+# re-listed below only so a standalone/partial install still resolves them.
+# Auto-installed on first use by core/deps.py (NOT listed here): kornia (BiRefNet
+# modeling code), controlnet_aux + ultralytics (ADetailer / pose).
 
 # SDXL / Pony / Illustrious generation + img2img + inpaint + outpaint + IP-Adapter
 # (Colour Reference & Body Swap). Runs in-plugin via 🤗 diffusers (see core/sd/) —
@@ -13,7 +20,8 @@ transformers
 accelerate
 safetensors
 
-# Face swap + ADetailer (face / person detect) + WD14 interrogate tagger.
+# Face swap + ADetailer (face / person detect) + WD14 interrogate tagger. NOTE:
+# insightface is Wan2GP-bundled on Windows only, so it's genuinely additive on Linux.
 insightface
 onnxruntime-gpu
 onnx
@@ -21,5 +29,4 @@ opencv-python
 scikit-image
 
 # Body-swap segmentation + head mask (BiRefNet via transformers + mediapipe).
-# kornia (BiRefNet modeling code) is auto-installed on first use by core/deps.py.
 mediapipe

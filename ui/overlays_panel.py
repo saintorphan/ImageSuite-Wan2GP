@@ -22,46 +22,50 @@ def build_overlays_panel():
     folders = _ov.list_folders()
     cur = folders[0] if folders else _ov.ROOT_LABEL
 
-    # -- Folders: pick/delete on one row, create on the next. Each input pairs
-    #    with its own button (input scale 3 + button scale 1) like the rest of
-    #    the app, so nothing floats. --
-    with gr.Accordion("Folders", open=True, elem_classes="imagesuite-acc"):
-        with gr.Row():
-            c["folder"] = gr.Dropdown(label="Folder", choices=folders, value=cur, scale=3)
-            c["delete_folder"] = gr.Button("🗑 Delete folder", variant="stop", scale=1)
-        with gr.Row():
-            c["new_folder"] = gr.Textbox(label="New folder", placeholder="e.g. frames",
-                                         scale=3)
-            c["create_folder"] = gr.Button("➕ Create", scale=1)
+    # -- Compact toolbar: pick a folder + create / delete folders on ONE line, so the
+    #    library gallery below becomes the centerpiece instead of being shoved down. --
+    with gr.Row():
+        c["folder"] = gr.Dropdown(label="Folder", choices=folders, value=cur, scale=3)
+        c["new_folder"] = gr.Textbox(label="New folder", placeholder="e.g. frames",
+                                     scale=2)
+        c["create_folder"] = gr.Button("➕ Create", scale=1, min_width=90)
+        c["delete_folder"] = gr.Button("🗑 Delete folder", variant="stop", scale=1,
+                                        min_width=120)
 
-    # -- Add images to the selected folder --
-    with gr.Accordion("Add images", open=True, elem_classes="imagesuite-acc"):
+    # -- The library itself: the big, prominent centerpiece. Keeps .imagesuite-gallery
+    #    (so the scroll fix applies) but NOT .imagesuite-results — its dense 6-column
+    #    thumbnails stay compact rather than getting the results' 180px min-row. --
+    c["gallery"] = gr.Gallery(
+        label="Overlays — click to select (click again to enlarge)",
+        columns=6, height=480, object_fit="contain",
+        value=_ov.list_images(cur), elem_classes="imagesuite-gallery")
+    c["selected"] = gr.State(None)  # basename of the selected overlay
+
+    # -- Actions on the selected overlay: one compact row under the gallery
+    #    (preview on the left, paired rename / move / delete on the right). --
+    with gr.Row():
+        c["preview"] = gr.Image(label="Selected", height=128,
+                                interactive=False, scale=1)
+        with gr.Column(scale=3):
+            with gr.Row():
+                c["rename_to"] = gr.Textbox(label="Rename to",
+                                            placeholder="new-name.png", scale=3)
+                c["rename_btn"] = gr.Button("✎ Rename", scale=1, min_width=90)
+            with gr.Row():
+                c["move_to"] = gr.Dropdown(label="Move to folder",
+                                           choices=folders, value=cur, scale=3)
+                c["move_btn"] = gr.Button("➡ Move", scale=1, min_width=80)
+                c["delete_btn"] = gr.Button("🗑 Delete", variant="stop", scale=1,
+                                            min_width=90)
+
+    # -- Add images: tucked into a collapsed accordion (the file drop-zone is bulky
+    #    and rarely the first thing you reach for). --
+    with gr.Accordion("➕ Add images to this folder", open=False,
+                      elem_classes="imagesuite-acc"):
         with gr.Row():
             c["upload"] = gr.File(label="Images (PNG / JPG / WEBP / GIF / BMP)",
                                   file_count="multiple", file_types=["image"], scale=3)
             c["upload_btn"] = gr.Button("⬆ Add to folder", scale=1)
-
-    # -- The library itself --
-    c["gallery"] = gr.Gallery(label="Overlays — click to select (click again to enlarge)",
-                              columns=6, height=360, object_fit="contain",
-                              value=_ov.list_images(cur), elem_classes="imagesuite-gallery")
-    c["selected"] = gr.State(None)  # basename of the selected overlay
-
-    # -- Actions on the selected overlay: preview left, paired action rows right. --
-    with gr.Accordion("Selected overlay", open=True, elem_classes="imagesuite-acc"):
-        with gr.Row():
-            c["preview"] = gr.Image(label="Preview", height=200,
-                                    interactive=False, scale=1)
-            with gr.Column(scale=2):
-                with gr.Row():
-                    c["rename_to"] = gr.Textbox(label="Rename to",
-                                                placeholder="new-name.png", scale=3)
-                    c["rename_btn"] = gr.Button("✎ Rename", scale=1)
-                with gr.Row():
-                    c["move_to"] = gr.Dropdown(label="Move to folder",
-                                               choices=folders, value=cur, scale=3)
-                    c["move_btn"] = gr.Button("➡ Move", scale=1)
-                c["delete_btn"] = gr.Button("🗑 Delete selected", variant="stop")
 
     c["status"] = gr.Markdown("", elem_classes="imagesuite-help")
     return c

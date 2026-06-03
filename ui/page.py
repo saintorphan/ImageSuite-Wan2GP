@@ -266,11 +266,20 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
         with gr.Column(scale=1):
             _prompt_library_block(c, mode)                         # above settings
             c.update(_settings_bar(model_choices, lora_choices, mode))
-            _prompt_block(c)
             if mode == "img2img":
-                c["input_image"] = gr.Image(
-                    label="Init image (double-click to enlarge)", type="filepath",
-                    height=200, elem_classes="imagesuite-initthumb")
+                # Init image sits to the RIGHT of the prompt/negative (same row),
+                # not as a full-width block below it — groups the inputs and reclaims
+                # vertical space.
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        _prompt_block(c)
+                    with gr.Column(scale=1, min_width=160):
+                        c["input_image"] = gr.Image(
+                            label="Init image (double-click to enlarge)",
+                            type="filepath", height=200,
+                            elem_classes="imagesuite-initthumb")
+            else:
+                _prompt_block(c)
             with gr.Row(elem_classes="imagesuite-genrow"):
                 c["generate"] = gr.Button(
                     {"txt2img": "Generate", "img2img": "Reimagine (img2img)"}[mode],

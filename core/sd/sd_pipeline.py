@@ -190,7 +190,10 @@ class SDImagePipeline:
     def unload(self) -> None:
         """Free the pipeline and release GPU memory."""
         if self._body_double_pipe is not None:
-            self._teardown_body_double()
+            # unloading=True: a full unload only FREES — never re-load the ~6.5GB
+            # main pipe (the default restore-on-teardown would re-instantiate it
+            # here, leaking VRAM right as we're trying to release it).
+            self._teardown_body_double(unloading=True)
         if self._controlnet_pipe is not None:
             self._teardown_controlnet()
         if self._refiner_pipe is not None:
@@ -1231,8 +1234,13 @@ class SDImagePipeline:
         id_embeds = torch.cat([neg_embeds, face_embed]).unsqueeze(0).to(dtype=torch.float16)
         return [id_embeds]
 
-    def _teardown_body_double(self) -> None:
-        """Destroy the body double pipeline and free all VRAM."""
+    def _teardown_body_double(self, unloading: bool = False) -> None:
+        """Destroy the body double pipeline and free all VRAM.
+
+        When *unloading* is True (called from :meth:`unload`), the main pipe is
+        NOT restored afterwards — a full unload must only free, never re-load the
+        ~6.5GB main pipe (doing so would leak VRAM during teardown).
+        """
         pipe = self._body_double_pipe
         if pipe is not None:
             # 1. Remove accelerate sequential-offload hooks
@@ -1282,8 +1290,10 @@ class SDImagePipeline:
 
         logger.info("Body double cleaned up, VRAM freed.")
 
-        # 5. Restore the main pipeline that was unloaded for body double
-        if getattr(self, "_bd_main_was_loaded", False):
+        # 5. Restore the main pipeline that was unloaded for body double — but
+        # never during a full unload(): re-loading the ~6.5GB main pipe here
+        # would leak the VRAM we're being called to free.
+        if not unloading and getattr(self, "_bd_main_was_loaded", False):
             ckpt = getattr(self, "_bd_main_checkpoint", None)
             vae = getattr(self, "_bd_main_vae", None) or "Automatic"
             if ckpt:

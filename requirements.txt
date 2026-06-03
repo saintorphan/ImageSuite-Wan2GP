@@ -19,6 +19,7 @@ diffusers
 transformers
 accelerate
 safetensors
+huggingface_hub  # snapshot_download for on-demand model fetch (core/interrogate.py, core/models.py)
 
 # Face swap + ADetailer (face / person detect) + WD14 interrogate tagger. NOTE:
 # insightface is Wan2GP-bundled on Windows only, so it's genuinely additive on Linux.

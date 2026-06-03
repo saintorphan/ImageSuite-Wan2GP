@@ -86,9 +86,9 @@ or clone into `Wan2GP/plugins/ImageSuite-Wan2GP`.
 The **native** (Flux / Z-Image / Qwen) path works out of the box. The
 **SDXL-family** backend and the enhancement suite (face/body swap, ADetailer,
 interrogate) need a few extra Python packages — 🤗 `diffusers`, `transformers`
-and friends. Grab them with:
+and friends. From your Wan2GP root, grab them with:
 ```bash
-pip install -r requirements.txt
+pip install -r plugins/ImageSuite-Wan2GP/requirements.txt
 ```
 Everything's lazily imported, so the plugin still loads and the native path still
 works even before you install them.

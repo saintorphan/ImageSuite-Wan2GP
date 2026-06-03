@@ -226,6 +226,12 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
     w, h = img.size
     with models.no_auto_download():
         pipe.load(checkpoint_path)
+        # Clear any LoRAs left fused from a prior gen before applying this set —
+        # same as generate_txt2img/generate_img2img. The SDXL inpaint/img2img
+        # variant pipes share the main pipe's UNet/VAE/text-encoders, so LoRA
+        # load/unload is GLOBAL across all three; clearing via the main pipe
+        # clears the inpaint pipe too.
+        pipe.remove_loras()
         # LoRAs (independent to the Touch Up tab): generate_inpaint takes no loras arg,
         # so apply them to the inpaint pipe directly, then remove afterward.
         ip = None

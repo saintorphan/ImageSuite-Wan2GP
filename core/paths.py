@@ -294,14 +294,22 @@ def link_existing_into_shared(
     dst_root = link_target_dir(target)
     dst_root.mkdir(parents=True, exist_ok=True)
     linked = copied = skipped = 0
-    for f in sorted(src.iterdir()):
-        if not f.is_file() or (exts and f.suffix.lower() not in exts):
-            continue
-        dst = dst_root / f.name
+    # exts is None for an HF model dir (birefnet): walk RECURSIVELY so a nested
+    # HF snapshot links completely, recreating each file's path relative to src.
+    # When exts is set (flat model folders), stay non-recursive as before.
+    if exts is None:
+        files = (f for f in sorted(src.rglob("*")) if f.is_file())
+    else:
+        files = (f for f in sorted(src.iterdir())
+                 if f.is_file() and f.suffix.lower() in exts)
+    for f in files:
+        rel = f.relative_to(src) if exts is None else Path(f.name)
+        dst = dst_root / rel
         if dst.exists() or dst.is_symlink():
             skipped += 1
             continue
         real = f.resolve()  # follow existing symlinks to the real file
+        dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             dst.symlink_to(real)
             linked += 1

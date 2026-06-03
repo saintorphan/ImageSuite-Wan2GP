@@ -1264,6 +1264,10 @@ class ImageSuite(WAN2GPPlugin):
         # stale (SDXL-default) outpaint size list.
         out_size_extra = [(mode, c["out_size"]) for mode, c in pages.items()
                           if "out_size" in c]
+        # res_preset choices follow the model family too (and _on_model won't fire
+        # on a programmatic model set) — refresh them per page alongside out_size.
+        res_preset_extra = [(mode, c["res_preset"]) for mode, c in pages.items()
+                            if "res_preset" in c]
 
         def _restore():
             saved = {}
@@ -1317,12 +1321,21 @@ class ImageSuite(WAN2GPPlugin):
                                          + discovery.common_sizes(mv)))
                 else:
                     ups.append(gr.update())
+            # Trailing res_preset updates (re-scoped to the restored model family).
+            for mode, _comp in res_preset_extra:
+                mv = valid_model.get(mode)
+                if mv:
+                    ups.append(gr.update(choices=discovery.resolution_presets(mv),
+                                         value=None))
+                else:
+                    ups.append(gr.update())
             return ups
 
         try:
             from gradio.context import Context
             root = Context.root_block
-            outputs = comps + [comp for _, comp in out_size_extra]
+            outputs = (comps + [comp for _, comp in out_size_extra]
+                       + [comp for _, comp in res_preset_extra])
             if root is not None and comps:
                 root.load(_restore, inputs=None, outputs=outputs)
         except Exception:
@@ -1539,7 +1552,8 @@ class ImageSuite(WAN2GPPlugin):
                     for i in range(n):
                         progress((i, n), desc=f"Generating {i + 1}/{n}")
                         files += self._gen_native(ident, pos, neg, width, height, steps,
-                                                  cfg, seed, mode="txt2img",
+                                                  cfg, (int(seed) + i if int(seed) >= 0 else seed),
+                                                  mode="txt2img",
                                                   loras=loras, mult_str=mult,
                                                   progress=progress, api=api)
                 finally:
@@ -1553,7 +1567,7 @@ class ImageSuite(WAN2GPPlugin):
                     for i in range(n):
                         if gen_sd.was_aborted():
                             break
-                        sd = int(seed) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
+                        sd = (int(seed) + i) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
                         files += gen_sd.generate_txt2img(
                             ident, pos, neg, width, height, steps, cfg, sd,
                             sampler=sampler or "DPM++ 2M", scheduler=scheduler or "",
@@ -1561,6 +1575,8 @@ class ImageSuite(WAN2GPPlugin):
                             callback=self._sd_step_cb(progress, i, nsteps, total))
                 finally:
                     self.release_gpu(state)
+            if gen_sd.was_aborted():
+                raise gr.Error("Txt2img aborted.")
             if not files:
                 raise gr.Error("Generation produced no images.")
             return self._gallery_result(files)
@@ -1593,7 +1609,8 @@ class ImageSuite(WAN2GPPlugin):
                     for i in range(n):
                         progress((i, n), desc=f"Reimagining {i + 1}/{n}")
                         files += self._gen_native(ident, pos, neg, width, height, steps,
-                                                  cfg, seed, mode="img2img",
+                                                  cfg, (int(seed) + i if int(seed) >= 0 else seed),
+                                                  mode="img2img",
                                                   denoise=denoise, guide_path=init_image,
                                                   loras=loras, mult_str=mult,
                                                   progress=progress, api=api)
@@ -1608,7 +1625,7 @@ class ImageSuite(WAN2GPPlugin):
                     for i in range(n):
                         if gen_sd.was_aborted():
                             break
-                        sd = int(seed) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
+                        sd = (int(seed) + i) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
                         progress((i, n), desc=f"Reimagining {i + 1}/{n}")
                         files += gen_sd.generate_img2img(
                             ident, init_image, pos, neg, width, height, steps, cfg, sd,
@@ -1664,9 +1681,11 @@ class ImageSuite(WAN2GPPlugin):
                     if gen_sd.was_aborted():
                         break
                     _say((i, n), f"Inpainting {i + 1}/{n}…")
-                    # _gen_native randomizes seed<0 itself, so each pass differs.
+                    # _gen_native randomizes seed<0 itself; for a fixed seed we add
+                    # the pass index so a batch yields varied images, not duplicates.
                     files += self._gen_native(
-                        ident, pos, neg, comp.width, comp.height, steps, cfg, seed,
+                        ident, pos, neg, comp.width, comp.height, steps, cfg,
+                        (int(seed) + i if int(seed) >= 0 else seed),
                         mode="inpaint", denoise=denoise, guide_path=guide_path,
                         mask_path=mask_path, loras=loras, mult_str=mult,
                         progress=progress, api=api)
@@ -1683,7 +1702,7 @@ class ImageSuite(WAN2GPPlugin):
             for i in range(n):
                 if gen_sd.was_aborted():
                     break
-                sd = int(seed) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
+                sd = (int(seed) + i) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
                 cb = (self._sd_step_cb(progress, i, nsteps, total)
                       if progress is not None else None)
                 outs = gen_sd.inpaint(
@@ -1850,7 +1869,7 @@ class ImageSuite(WAN2GPPlugin):
         if not src:
             return None
         try:
-            if src.startswith("data:"):
+            if src.startswith("data:image/") and ";base64," in src:
                 b64 = src.split(",", 1)[1]
                 if len(b64) > ImageSuite._MAX_DATAURL_BYTES:
                     raise gr.Error("That image is too large to process.")
@@ -1981,9 +2000,11 @@ class ImageSuite(WAN2GPPlugin):
 
     def _carry_settings(self, target_mode, vals):
         """Source page values (in CARRY_KEYS order) → a list of gr.update for the
-        target page's matching components. The model is applied only if the target
-        offers it (Img2Img/Inpaint list only guide-capable models), and LoRAs are
-        re-scoped to the carried model's family so their values stay valid."""
+        target page's matching components, PLUS one trailing res_preset update (the
+        target's _on_model won't fire on a programmatic model set). The model is
+        applied only if the target offers it (Img2Img/Inpaint list only guide-capable
+        models), and LoRAs/res_preset are re-scoped to the carried model's family so
+        their values stay valid."""
         d = dict(zip(self.CARRY_KEYS, vals))
         valid = {v for _, v in self._model_choices(target_mode)}
         ups = {}
@@ -2005,7 +2026,13 @@ class ImageSuite(WAN2GPPlugin):
         for k in ("sampler", "scheduler", "steps", "cfg", "clip_skip", "seed",
                   "width", "height", "count", "lora_mult", "pos", "neg"):
             ups[k] = gr.update(value=d[k])
-        return [ups[k] for k in self.CARRY_KEYS]
+        # res_preset choices follow the carried model's family; cleared to no
+        # selection so the carried width/height stand. Trailing (not in CARRY_KEYS).
+        if mv and mv in valid:
+            res_up = gr.update(choices=discovery.resolution_presets(mv), value=None)
+        else:
+            res_up = gr.update()
+        return [ups[k] for k in self.CARRY_KEYS] + [res_up]
 
     def _wire_carry(self, btn, src, dst_mode, dst, subtabs, tab_ids,
                     with_image=False, bridge=False):
@@ -2019,7 +2046,8 @@ class ImageSuite(WAN2GPPlugin):
             inputs.append(src["denoise"])
         if with_image or bridge:
             inputs.append(src["picked"])
-        outputs = [dst[k] for k in keys]
+        # Mirrors _carry_settings' trailing res_preset update (re-scoped per model).
+        outputs = [dst[k] for k in keys] + [dst["res_preset"]]
         if has_denoise:
             outputs.append(dst["denoise"])
         if with_image:

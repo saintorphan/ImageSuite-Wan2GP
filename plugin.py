@@ -1133,11 +1133,19 @@ class ImageSuite(WAN2GPPlugin):
             inputs=[self._proj_namein, self._proj_active, canvas_state]
                    + param_comps + img_comps,
             outputs=[self._proj_name, self._proj_active, pick, self._proj_status],
-            js="() => { try{ if(window.__is_inpaint_pushstate) window.__is_inpaint_pushstate(); }catch(e){}"
-               " var a=''; try{ a=(document.querySelector('#imagesuite-proj-active textarea')||{}).value||''; }catch(e){}"
-               " var name=a; if(!name){ name=prompt('Save project as:'); if(!name) throw new Error('cancelled'); }"
-               " var el=document.querySelector('#imagesuite-proj-namein textarea')||document.querySelector('#imagesuite-proj-namein input');"
-               " if(el){ el.value=name; el.dispatchEvent(new Event('input',{bubbles:true})); } }")
+            # Gradio 5.29: a js= with a backend fn REPLACES the input payload with its
+            # return value (undefined → []), so we MUST return every input explicitly.
+            # rest-spread passes the params/images through untouched; we substitute the
+            # resolved name and the FRESH canvas state (read after pushstate). Empty
+            # name on cancel → Python no-ops (no throw, which is unreliable here).
+            js="(name_in, active, cstate, ...rest) => {"
+               " var st=cstate;"
+               " try{ if(window.__is_inpaint_pushstate){ window.__is_inpaint_pushstate();"
+               " var el=document.querySelector('#imagesuite-inpaint-state textarea')"
+               "||document.querySelector('#imagesuite-inpaint-state input');"
+               " if(el) st=el.value; } }catch(e){}"
+               " var name=active||''; if(!name){ name=prompt('Save project as:')||''; }"
+               " return [name, active, st].concat(rest); }")
 
         # ---- Load ----
         def _load(sel):
@@ -1170,6 +1178,7 @@ class ImageSuite(WAN2GPPlugin):
                     g, picked, save = self._gallery_result(files, m)
                     gals += [g, picked, save]
                 else:
+                    paths.set_results(m, [])   # clear stale persist so a restart shows empty
                     gals += [gr.update(value=None), gr.update(value=None),
                              gr.update(value=None)]
             cs = data.get("canvas_state")
@@ -1202,9 +1211,9 @@ class ImageSuite(WAN2GPPlugin):
         self._proj_rename.click(
             _rename, inputs=[pick, self._proj_namein],
             outputs=[pick, self._proj_name, self._proj_active, self._proj_status],
-            js="() => { var n=prompt('Rename the selected project to:'); if(!n) throw new Error('cancelled');"
-               " var el=document.querySelector('#imagesuite-proj-namein textarea')||document.querySelector('#imagesuite-proj-namein input');"
-               " if(el){ el.value=n; el.dispatchEvent(new Event('input',{bubbles:true})); } }")
+            # explicit return (see Save); empty new-name on cancel → Python no-ops.
+            js="(sel, name_in) => { var n=prompt('Rename the selected project to:')||'';"
+               " return [sel, n]; }")
 
         # ---- Delete (JS confirm) ----
         def _delete(sel):
@@ -1220,7 +1229,9 @@ class ImageSuite(WAN2GPPlugin):
         self._proj_delete.click(
             _delete, inputs=[pick],
             outputs=[pick, self._proj_name, self._proj_active, self._proj_status],
-            js="() => { if(!confirm('Delete the selected project permanently? This cannot be undone.')) throw new Error('cancelled'); }")
+            # explicit return (see Save); cancel returns '' → Python no-ops (no throw).
+            js="(sel) => { if(!confirm('Delete the selected project permanently? "
+               "This cannot be undone.')) return ['']; return [sel]; }")
 
     # -- Prompt Library (shared across all three tabs) ----------------------
     # Every JSON-able scalar input is saved/loaded by inspecting the page's

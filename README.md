@@ -7,8 +7,8 @@
 
 > ### ⚠️ Extremely early release
 > **This is a very early build — please expect the occasional quirk.** If something
-> misbehaves, just ping **`@saintorphan`** in deepbeepmeep's **Wan2GP Discord
-> server** and I'll get to squashing it ASAP.
+> misbehaves, please [**open an issue**](https://github.com/saintorphan/ImageSuite-Wan2GP/issues)
+> and I'll get to squashing it ASAP.
 
 Image Suite drops a single gold-bordered **Image Suite** tab into Wan2GP with three
 generation pages — **Txt2Img**, **Img2Img** and **MultiCanvas** — plus an

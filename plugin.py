@@ -1523,10 +1523,16 @@ class ImageSuite(WAN2GPPlugin):
     def _inpaint_core(self, state, backend, ident, comp, mask, pos, neg, *,
                       denoise, steps, cfg, clip_skip, seed, sampler, scheduler,
                       loras, mult, feather=4, inpaint_fill="original",
-                      full_res=False, padding=32, api=None, progress=None):
-        """One inpaint pass over a prepared composite(RGB) + mask(L). Shared by the
-        canvas Generate and the Touch-Up outpaint so both get identical GPU
-        lifecycle, native/SD branching and abort handling. Returns the path."""
+                      full_res=False, padding=32, count=1, api=None, progress=None):
+        """``count`` inpaint passes over a prepared composite(RGB) + mask(L), under a
+        SINGLE GPU acquisition — one busy-check, a continuous progress bar across the
+        batch, abort honoured between images (and the in-flight partial dropped), and
+        a fresh random seed per image when ``seed`` < 0. Shared by the canvas Generate
+        (count = Batch count) and the Touch-Up outpaint (count 1). Returns a LIST of
+        result paths (empty if aborted before the first completed)."""
+        import random as _rng
+        n = max(1, int(count))
+
         def _say(f, d):
             if progress is not None:
                 try: progress(f, desc=d)
@@ -1535,45 +1541,56 @@ class ImageSuite(WAN2GPPlugin):
             if self._gpu_busy(state):
                 raise gr.Error("A generation is already running — wait for it to finish.")
             gen_sd.release_sd()  # free our SDXL so the native model has room
-            _say(0.1, "Inpainting…")
             m = mask
             if feather and int(feather) > 0:  # native has no pipeline mask_blur
                 from PIL import ImageFilter
                 m = mask.filter(ImageFilter.GaussianBlur(radius=int(feather)))
-            snap = self._snapshot_video_state(state)
+            guide_path = self._save_img(comp, "composite")  # same for every image
+            mask_path = self._save_img(m, "mask")
+            files, snap = [], self._snapshot_video_state(state)
             try:
-                files = self._gen_native(
-                    ident, pos, neg, comp.width, comp.height, steps, cfg, seed,
-                    mode="inpaint", denoise=denoise,
-                    guide_path=self._save_img(comp, "composite"),
-                    mask_path=self._save_img(m, "mask"),
-                    loras=loras, mult_str=mult, progress=progress, api=api)
+                for i in range(n):
+                    if gen_sd.was_aborted():
+                        break
+                    _say((i, n), f"Inpainting {i + 1}/{n}…")
+                    # _gen_native randomizes seed<0 itself, so each pass differs.
+                    files += self._gen_native(
+                        ident, pos, neg, comp.width, comp.height, steps, cfg, seed,
+                        mode="inpaint", denoise=denoise, guide_path=guide_path,
+                        mask_path=mask_path, loras=loras, mult_str=mult,
+                        progress=progress, api=api)
             finally:
                 self._restore_video_state(state, snap)
-            return files[0] if files else None
-        # sd
+            return files
+        # sd — one acquisition, loop count times for a real batch.
         lora_list = self._lora_list(loras, mult)
         self.acquire_gpu(state)
+        files = []
         try:
             self._sd_loading(progress)
-            nsteps = int(steps)
-            cb = (self._sd_step_cb(progress, 0, nsteps, nsteps)
-                  if progress is not None else None)
-            outs = gen_sd.inpaint(
-                ident, comp, mask, pos, neg, denoise=float(denoise),
-                steps=int(steps), cfg=float(cfg), seed=int(seed),
-                sampler=sampler or "DPM++ 2M", scheduler=scheduler or "Karras",
-                clip_skip=int(clip_skip), mask_blur=int(feather),
-                inpainting_fill=self._FILL.get(inpaint_fill, 1),
-                full_res=bool(full_res), padding=int(padding),
-                progress=progress, loras=lora_list, callback=cb)
+            nsteps, total = int(steps), n * max(1, int(steps))
+            for i in range(n):
+                if gen_sd.was_aborted():
+                    break
+                sd = int(seed) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
+                cb = (self._sd_step_cb(progress, i, nsteps, total)
+                      if progress is not None else None)
+                outs = gen_sd.inpaint(
+                    ident, comp, mask, pos, neg, denoise=float(denoise),
+                    steps=int(steps), cfg=float(cfg), seed=int(sd),
+                    sampler=sampler or "DPM++ 2M", scheduler=scheduler or "Karras",
+                    clip_skip=int(clip_skip), mask_blur=int(feather),
+                    inpainting_fill=self._FILL.get(inpaint_fill, 1),
+                    full_res=bool(full_res), padding=int(padding),
+                    progress=progress, loras=lora_list, callback=cb)
+                # Abort fired mid-image → drop this partial, keep the completed ones.
+                if gen_sd.was_aborted():
+                    break
+                if outs:
+                    files += outs
         finally:
             self.release_gpu(state)
-        # Mid-image abort interrupted the diffusers loop → discard the partial; the
-        # callers already surface "Inpaint/Outpaint aborted." when was_aborted().
-        if gen_sd.was_aborted():
-            return None
-        return outs[0] if outs else None
+        return files
 
     def _make_inpaint(self, mode):
         api = self._api  # closed over so the click is webui-wrapped
@@ -1599,17 +1616,17 @@ class ImageSuite(WAN2GPPlugin):
             if mask_mode == "Inpaint not masked":
                 from PIL import ImageOps
                 mask = ImageOps.invert(mask)
-            out = self._inpaint_core(
+            outs = self._inpaint_core(
                 state, backend, ident, comp, mask, pos, neg, denoise=denoise,
                 steps=steps, cfg=cfg, clip_skip=clip_skip, seed=seed,
                 sampler=sampler, scheduler=scheduler, loras=loras, mult=mult,
                 feather=feather, inpaint_fill=inpaint_fill,
-                full_res=(inpaint_area == "Only masked"),
+                full_res=(inpaint_area == "Only masked"), count=count,
                 padding=padding, api=api, progress=progress)
-            if not out:
+            if not outs:
                 raise gr.Error("Inpaint aborted." if gen_sd.was_aborted()
                                else "Inpaint produced no image.")
-            return self._gallery_result(out)
+            return self._gallery_result(outs)
         return _run
 
     def _make_outpaint(self, mode):
@@ -1651,16 +1668,16 @@ class ImageSuite(WAN2GPPlugin):
             mask = Image.new("L", ext.size, 255)
             mask.paste(Image.new("L", comp.size, 0), (l, t))
             gen_sd.clear_abort()
-            out = self._inpaint_core(
+            outs = self._inpaint_core(  # outpaint is always a single pass (count 1)
                 state, backend, ident, ext, mask, pos, neg, denoise=1.0,
                 steps=steps, cfg=cfg, clip_skip=clip_skip, seed=seed,
                 sampler=sampler, scheduler=scheduler, loras=loras, mult=mult,
                 feather=max(8, int(feather)), inpaint_fill="fill",
                 full_res=False, padding=0, api=api, progress=progress)
-            if not out:
+            if not outs:
                 raise gr.Error("Outpaint aborted." if gen_sd.was_aborted()
                                else "Outpaint produced no image.")
-            return self._gallery_result(out)
+            return self._gallery_result(outs)
         return _run
 
     # -- right-click context menu router -----------------------------------

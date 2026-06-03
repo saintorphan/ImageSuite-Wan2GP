@@ -412,6 +412,7 @@ function flipLayer(horiz){ if(!hasBg) return; var l=activeLayer(); pushUndo(l.ct
   l.ctx.scale(horiz?-1:1,horiz?1:-1); l.ctx.drawImage(tmp,0,0); l.ctx.restore(); compose(); pushExport(); }
 // -- clipboard + transform --
 var clipboard=null,tSnap=null,tSession=-1,tDx=0,tDy=0,tScale=1,tRot=0;
+var tBox=null,txMode='move',txStart=null;   // on-canvas transform handles state
 function maskBBox(){ var d=mbx.getImageData(0,0,W,H).data,minx=W,miny=H,maxx=-1,maxy=-1;
   for(var y=0;y<H;y++)for(var x=0;x<W;x++){ if(d[(y*W+x)*4]>127){ if(x<minx)minx=x;if(x>maxx)maxx=x;if(y<miny)miny=y;if(y>maxy)maxy=y; } }
   return maxx<0?null:{x:minx,y:miny,w:maxx-minx+1,h:maxy-miny+1}; }
@@ -436,22 +437,74 @@ function pasteClip(){ if(!clipboard) return; var l=newLayer('Pasted');
   selTool('xform'); ensureXform(); compose(); pushExport(); }
 function beginTransform(){ var l=activeLayer(); pushUndo(l.ctx,'draw');
   tSnap=document.createElement('canvas'); tSnap.width=W;tSnap.height=H; tSnap.getContext('2d').drawImage(l.cv,0,0);
-  tSession=l.id; tDx=0;tDy=0;tScale=1;tRot=0;
+  tBox=contentBBox(tSnap); tSession=l.id; tDx=0;tDy=0;tScale=1;tRot=0;
   var s=document.getElementById('scale'),r=document.getElementById('rot');
   if(s){s.value=100;document.getElementById('scv').textContent=100;}
   if(r){r.value=0;document.getElementById('rotv').textContent=0;} }
-function ensureXform(){ if(!tSnap||activeLayer().id!==tSession) beginTransform(); }
+function ensureXform(){ if(!tSnap||activeLayer().id!==tSession) beginTransform(); drawHandles(); }
 function applyTransform(){ if(!tSnap) return; var l=drawLayers.filter(function(x){return x.id===tSession;})[0]; if(!l) return;
   l.ctx.clearRect(0,0,W,H); l.ctx.save(); l.ctx.translate(W/2+tDx,H/2+tDy);
-  l.ctx.rotate(tRot*Math.PI/180); l.ctx.scale(tScale,tScale); l.ctx.drawImage(tSnap,-W/2,-H/2); l.ctx.restore(); compose(); }
+  l.ctx.rotate(tRot*Math.PI/180); l.ctx.scale(tScale,tScale); l.ctx.drawImage(tSnap,-W/2,-H/2); l.ctx.restore(); compose(); drawHandles(); }
+// --- on-canvas transform handles (drawn on the cursor overlay; drive the SAME
+//     tScale/tRot/tDx/tDy the sliders use, so sliders + drag-move stay a fallback) ---
+function hdim(px){ var ds=(baseScale*viewScale)||1; return px/ds; }   // screen px -> canvas units
+function contentBBox(snap){ try{
+    var d=snap.getContext('2d').getImageData(0,0,W,H).data, minx=W,miny=H,maxx=-1,maxy=-1;
+    for(var y=0;y<H;y++){ var r=y*W; for(var x=0;x<W;x++){ if(d[(r+x)*4+3]>8){
+      if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y; } } }
+    if(maxx<0) return {x:0,y:0,w:W,h:H};
+    return {x:minx,y:miny,w:maxx-minx+1,h:maxy-miny+1};
+  }catch(e){ return {x:0,y:0,w:W,h:H}; } }
+function txPoint(lx,ly){ var rad=tRot*Math.PI/180,cs=Math.cos(rad),sn=Math.sin(rad);
+  var ox=(lx-W/2)*tScale, oy=(ly-H/2)*tScale;
+  return { x:(W/2+tDx)+(ox*cs-oy*sn), y:(H/2+tDy)+(ox*sn+oy*cs) }; }
+function handlePts(){ if(!tBox) return null;
+  var x0=tBox.x,y0=tBox.y,x1=tBox.x+tBox.w,y1=tBox.y+tBox.h, mx=(x0+x1)/2,my=(y0+y1)/2;
+  var corners=[txPoint(x0,y0),txPoint(x1,y0),txPoint(x1,y1),txPoint(x0,y1)];
+  var sides=[txPoint(mx,y0),txPoint(x1,my),txPoint(mx,y1),txPoint(x0,my)];
+  var top=txPoint(mx,y0), ctr=txPoint(mx,my);
+  var vx=top.x-ctr.x,vy=top.y-ctr.y,vl=Math.hypot(vx,vy)||1, off=hdim(26);
+  return {corners:corners, scale:corners.concat(sides), top:top,
+          pin:{x:top.x+vx/vl*off, y:top.y+vy/vl*off}}; }
+function drawHandles(){ if(!cur) return; cur.clearRect(0,0,W,H);
+  if(tool!=='xform'||!tSnap||!hasBg) return; var h=handlePts(); if(!h) return;
+  var s=hdim(5), lw=hdim(1.5), knob=hdim(6.5);
+  cur.save(); cur.lineWidth=lw; cur.strokeStyle='rgba(232,62,140,.95)';
+  cur.beginPath(); cur.moveTo(h.corners[0].x,h.corners[0].y);
+  for(var i=1;i<4;i++) cur.lineTo(h.corners[i].x,h.corners[i].y); cur.closePath(); cur.stroke();
+  cur.beginPath(); cur.moveTo(h.top.x,h.top.y); cur.lineTo(h.pin.x,h.pin.y); cur.stroke();
+  cur.fillStyle='#e83e8c'; cur.beginPath(); cur.arc(h.pin.x,h.pin.y,knob,0,Math.PI*2); cur.fill();
+  cur.fillStyle='#fff';
+  h.scale.forEach(function(p){ cur.beginPath(); cur.rect(p.x-s,p.y-s,s*2,s*2); cur.fill(); cur.stroke(); });
+  cur.restore(); }
+function hitHandle(p){ if(!tBox) return null; var h=handlePts(); if(!h) return null; var r=hdim(11);
+  if(Math.hypot(p.x-h.pin.x,p.y-h.pin.y)<r) return 'rotate';
+  for(var i=0;i<h.scale.length;i++){ var q=h.scale[i];
+    if(Math.abs(p.x-q.x)<r && Math.abs(p.y-q.y)<r) return 'scale'; }
+  return null; }
+function startXform(p){ var cx=W/2+tDx, cy=H/2+tDy; txMode=hitHandle(p)||'move';
+  txStart={scale:tScale, rot:tRot, cx:cx, cy:cy,
+           dist:(Math.hypot(p.x-cx,p.y-cy)||1), ang:Math.atan2(p.y-cy,p.x-cx)};
+  drawHandles(); }
+function moveXform(p){
+  if(txMode==='scale'){ var d=Math.hypot(p.x-txStart.cx,p.y-txStart.cy);
+    tScale=Math.max(0.1,Math.min(3, txStart.scale*(d/txStart.dist)));
+    var ss=document.getElementById('scale'); if(ss){ ss.value=Math.round(tScale*100);
+      document.getElementById('scv').textContent=ss.value; } }
+  else if(txMode==='rotate'){ var a=Math.atan2(p.y-txStart.cy,p.x-txStart.cx);
+    var deg=txStart.rot+(a-txStart.ang)*180/Math.PI; while(deg>180)deg-=360; while(deg<-180)deg+=360; tRot=deg;
+    var rs=document.getElementById('rot'); if(rs){ rs.value=Math.round(tRot);
+      document.getElementById('rotv').textContent=rs.value; } }
+  else { tDx+=p.x-lastX; tDy+=p.y-lastY; lastX=p.x; lastY=p.y; }
+  applyTransform(); }
 function flattenDown(){ if(active<=0) return; var top=drawLayers[active],below=drawLayers[active-1];
   pushUndo(below.ctx,'draw'); below.ctx.drawImage(top.cv,0,0); drawLayers.splice(active,1); active=active-1;
-  tSession=-1; renderLayers(); compose(); pushExport(); }
+  tSession=-1; tSnap=null; tBox=null; renderLayers(); compose(); pushExport(); }
 
 function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=p.x; sy=lastY=p.y;
   if(tool==='eye'){ pickColor(p.x,p.y); return; }
   if(tool==='wand'){ pushUndo(mbx,'mask'); magicWand(p.x,p.y); compose(); pushExport(); return; }
-  if(tool==='xform'){ ensureXform(); drawing=true; return; }
+  if(tool==='xform'){ ensureXform(); drawing=true; startXform(p); return; }
   if(tool==='lasso'){ pushUndo(mbx,'mask'); lassoPts=[{x:p.x,y:p.y}]; drawing=true; return; }
   if(tool==='clone'){ if(e.altKey||e.shiftKey){ cloneSrc={x:p.x,y:p.y}; drawCursor(p.x,p.y); return; }
     if(!cloneSrc) return; cloneOff={dx:cloneSrc.x-p.x,dy:cloneSrc.y-p.y};
@@ -461,7 +514,7 @@ function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=
   if(tool==='fill'){ floodFill(p.x,p.y); drawing=false; compose(); pushExport(); return; }
   if(tool==='brush'||tool==='eraser'){ stroke(p.x,p.y,p.x,p.y); compose(); } }
 function move(e){ if(!drawing) return; e.preventDefault(); var p=pos(e);
-  if(tool==='xform'){ tDx+=p.x-lastX; tDy+=p.y-lastY; lastX=p.x;lastY=p.y; applyTransform(); }
+  if(tool==='xform'){ moveXform(p); }
   else if(tool==='lasso'){ lassoPts.push({x:p.x,y:p.y}); compose(); drawLasso(); }
   else if(tool==='clone'){ cloneStamp(p.x,p.y); lastX=p.x;lastY=p.y; compose(); }
   else if(tool==='smudge'){ smudgeStep(lastX,lastY,p.x,p.y); lastX=p.x;lastY=p.y; compose(); }
@@ -477,7 +530,7 @@ disp.addEventListener('mousedown',down); window.addEventListener('mousemove',mov
 window.addEventListener('mouseup',up);
 disp.addEventListener('touchstart',down,{passive:false});
 disp.addEventListener('touchmove',move,{passive:false}); window.addEventListener('touchend',up);
-function drawCursor(x,y){ cur.clearRect(0,0,W,H);
+function drawCursor(x,y){ if(tool==='xform'){ drawHandles(); return; } cur.clearRect(0,0,W,H);
   if(!hasBg||(tool!=='brush'&&tool!=='eraser'&&tool!=='clone'&&tool!=='smudge')) return;
   cur.save(); cur.lineWidth=Math.max(1,W/stage.clientWidth);
   cur.strokeStyle='rgba(0,0,0,.6)'; cur.beginPath(); cur.arc(x,y,size/2+1,0,Math.PI*2); cur.stroke();
@@ -493,8 +546,9 @@ window.addEventListener('mousemove',function(e){ if(panning){ wrap.scrollLeft=pL
 window.addEventListener('mouseup',function(){ panning=false; });
 
 // -- toolbar wiring --
-function selTool(t){ tool=t; document.querySelectorAll('#tools button').forEach(function(b){ b.classList.toggle('on',b.dataset.tool===t); }); }
-document.querySelectorAll('#tools button').forEach(function(b){ b.addEventListener('click',function(){ selTool(b.dataset.tool); if(b.dataset.tool==='xform') ensureXform(); }); });
+function selTool(t){ tool=t; document.querySelectorAll('#tools button').forEach(function(b){ b.classList.toggle('on',b.dataset.tool===t); });
+  if(t!=='xform' && cur) cur.clearRect(0,0,W,H); }
+document.querySelectorAll('#tools button').forEach(function(b){ b.addEventListener('click',function(){ selTool(b.dataset.tool); if(b.dataset.tool==='xform'){ ensureXform(); drawHandles(); } }); });
 document.getElementById('copylayer').addEventListener('click',function(){ copyRegion(false); });
 document.getElementById('copyflat').addEventListener('click',function(){ copyRegion(true); });
 document.getElementById('mcopy').addEventListener('click',function(){ copyRegion(true); });
@@ -621,7 +675,7 @@ function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im;
   drawLayers=[newLayer('Layer 1')]; active=0; mbx.clearRect(0,0,W,H);
   undoStack=[]; redoStack=[]; hasBg=true; document.getElementById('empty').style.display='none';
   // clear state tied to the previous image so it can't bleed into the new one
-  cloneSrc=null; clipboard=null; lassoPts=[]; tSnap=null; tSession=-1; tDx=0;tDy=0;tScale=1;tRot=0;
+  cloneSrc=null; clipboard=null; lassoPts=[]; tSnap=null; tBox=null; tSession=-1; tDx=0;tDy=0;tScale=1;tRot=0;
   var sc=document.getElementById('scale'),rt=document.getElementById('rot');
   if(sc){ sc.value=100; document.getElementById('scv').textContent=100; }
   if(rt){ rt.value=0; document.getElementById('rotv').textContent=0; }

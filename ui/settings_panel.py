@@ -44,16 +44,18 @@ def build_settings_panel(native_dl_choices=None):
                 "CharLab, Reel2Reel) via `.orphansuite.json` — set a folder here and "
                 "every plugin follows. Point them anywhere you already keep models so "
                 "nothing's duplicated.")
-            c["sdxl_models_dir"] = gr.Textbox(
-                label="SDXL / Pony / Illustrious checkpoints (shared)",
-                value=str(paths.sdxl_models_dir()))
-            c["sdxl_loras_dir"] = gr.Textbox(label="SDXL-family LoRAs (shared)",
-                                             value=str(paths.sdxl_loras_dir()))
-            c["models_dir"] = gr.Textbox(
-                label="Face / ADetailer / face-swap weights (shared)",
-                value=str(paths.models_dir()))
-            c["outputs_dir"] = gr.Textbox(label="Outputs (this plugin only)",
-                                          value=str(paths.outputs_dir()))
+            with gr.Row():
+                c["sdxl_models_dir"] = gr.Textbox(
+                    label="SDXL / Pony / Illustrious checkpoints (shared)",
+                    value=str(paths.sdxl_models_dir()))
+                c["sdxl_loras_dir"] = gr.Textbox(label="SDXL-family LoRAs (shared)",
+                                                 value=str(paths.sdxl_loras_dir()))
+            with gr.Row():
+                c["models_dir"] = gr.Textbox(
+                    label="Face / ADetailer / face-swap weights (shared)",
+                    value=str(paths.models_dir()))
+                c["outputs_dir"] = gr.Textbox(label="Outputs (this plugin only)",
+                                              value=str(paths.outputs_dir()))
             with gr.Row():
                 c["save_dirs"] = gr.Button("Save folders", variant="primary")
                 c["rescan"] = gr.Button("Rescan models & LoRAs")
@@ -127,33 +129,38 @@ def build_settings_panel(native_dl_choices=None):
                 c["native_download"] = gr.Button("Download", scale=1)
             c["native_log"] = gr.Markdown("")
 
-            gr.Markdown("### Optional face / ADetailer models\n"
-                        "Only needed for the optional face-detail pass.")
-            c["models_status"] = gr.Markdown(_status_md())
+            gr.Markdown(
+                "### Face / body / ADetailer helper weights\n"
+                "Only needed for the optional swap + detail passes. **Scanned on "
+                "your machine** — nothing runs until you press **Scan**. Each row "
+                "shows whether a weight is **on disk**, **found elsewhere** (→ Link "
+                "it in) or **not downloaded** (→ Download).")
             with gr.Row():
-                c["model_key"] = gr.Dropdown(
-                    label="Model", choices=_downloadable_choices(), scale=3)
-                c["download"] = gr.Button("Download", scale=1)
-            c["download_log"] = gr.Markdown("")
+                c["scan_btn"] = gr.Button("🔍 Scan for models", variant="primary",
+                                          scale=1)
+                c["scan_search"] = gr.Textbox(
+                    label="Also search this folder (optional)",
+                    placeholder="/your/a1111/models — find weights you already have",
+                    scale=3)
+            c["scan_found"] = gr.State({})   # key -> path found elsewhere on disk
+            c["scan_status"] = gr.Markdown(
+                "_Press **Scan for models** to check what's on disk._",
+                elem_classes="imagesuite-help")
+            # One row per registry weight, built once; the Scan handler fills each
+            # status + enables/greys its Download / Link buttons (see plugin.py).
+            c["model_row_keys"] = [m.key for m in models.REGISTRY]
+            for m in models.REGISTRY:
+                with gr.Row(elem_classes="imagesuite-modelrow"):
+                    c[f"m_{m.key}_status"] = gr.Markdown(
+                        f"**{m.name}** — _not scanned_")
+                    c[f"m_{m.key}_dl"] = gr.Button(
+                        "⬇ Download", size="sm", interactive=False,
+                        scale=0, min_width=120)
+                    c[f"m_{m.key}_link"] = gr.Button(
+                        "🔗 Link", size="sm", interactive=False,
+                        scale=0, min_width=90)
     return c
 
 
 def vram_is_low(value) -> bool:
     return value == _VRAM_LOW
-
-
-def _downloadable_choices():
-    return [(m["name"], m["key"]) for m in models.status() if m["downloadable"]]
-
-
-def status_md():
-    return _status_md()
-
-
-def _status_md() -> str:
-    rows = ["| Model | Status | Path |", "|---|---|---|"]
-    for m in models.status():
-        mark = "✅ present" if m["present"] else ("⬇️ available" if m["downloadable"]
-                                                  else "—")
-        rows.append(f"| {m['name']} | {mark} | `{m['path']}` |")
-    return "\n".join(rows)

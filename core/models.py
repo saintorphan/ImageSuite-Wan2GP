@@ -273,3 +273,118 @@ def _download_zip(spec, progress) -> str:
         z.extractall(dst_dir)
     tmp.unlink(missing_ok=True)
     return f"[Success] {spec.name} → {dst_dir}"
+
+
+# --- on-demand scan (button-triggered) + link-from-disk ---------------------
+# NOTHING here runs at startup. The Settings panel calls scan() only when the user
+# presses "Scan for models", because finding a weight that's "on disk but not linked"
+# means walking the (optional) search folder — which can be slow on a big/network
+# drive. status()/is_present() above stay cheap (file-exists + HF-cache check).
+
+def _alt_roots(search_dir):
+    p = Path(search_dir).expanduser() if search_dir else None
+    return [p] if (p and p.is_dir()) else []
+
+
+def _walk_find(root, *, filename=None, dirname=None, cap=50000):
+    """First file named ``filename`` (or first non-empty dir named ``dirname``) under
+    ``root`` — capped traversal so a huge/network drive can't hang the scan."""
+    seen = 0
+    for dp, dirnames, filenames in os.walk(root):
+        if dirname is not None and os.path.basename(dp) == dirname:
+            try:
+                with os.scandir(dp) as it:
+                    if any(it):
+                        return dp
+            except OSError:
+                pass
+        if filename is not None and filename in filenames:
+            return os.path.join(dp, filename)
+        seen += len(filenames) + len(dirnames)
+        if seen > cap:
+            break
+    return None
+
+
+def _hf_cached(repo):
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(repo, local_files_only=True)
+    except Exception:
+        return None
+
+
+def _find_elsewhere(spec: ModelSpec, roots):
+    """Where this model exists on disk but is NOT in the dir our loader uses, so we
+    can offer to symlink it in. Known spots (HF cache) + the user's search folder."""
+    if spec.url and not spec.extract and spec.subpath:           # a single file
+        name = Path(spec.subpath).name
+        for r in roots:
+            hit = _walk_find(r, filename=name)
+            if hit:
+                return hit
+    elif spec.extract:                                           # a dir (buffalo_l)
+        name = Path(spec.extract_to).name
+        for r in roots:
+            hit = _walk_find(r, dirname=name)
+            if hit:
+                return hit
+    elif spec.repo and spec.local_dir():                         # BiRefNet: HF cache
+        cached = _hf_cached(spec.repo)
+        if cached:
+            return cached
+        for r in roots:
+            hit = _walk_find(r, dirname=Path(spec.local_dir()).name)
+            if hit:
+                return hit
+    return None
+
+
+def scan(search_dir: str | None = None) -> list[dict]:
+    """Per-model state for the Settings panel — RUN ON DEMAND (button), never at
+    startup. state: 'linked' = in the dir our loader uses; 'elsewhere' = found on
+    disk (HF cache / your search folder) but not linked → offer a symlink; 'missing'
+    = not found → offer Download. ``found_at`` is where an 'elsewhere' model lives."""
+    roots = _alt_roots(search_dir)
+    out = []
+    for m in REGISTRY:
+        present = m.is_present()
+        found_at = None if present else _find_elsewhere(m, roots)
+        out.append({
+            "key": m.key, "name": m.name, "required": m.required,
+            "downloadable": m.downloadable,
+            "state": "linked" if present else ("elsewhere" if found_at else "missing"),
+            "found_at": found_at, "path": m.display_path(),
+        })
+    return out
+
+
+def link_found(key: str, found_at: str | None = None, progress=None) -> str:
+    """Symlink (copy fallback) a model found elsewhere on disk into the dir our loader
+    uses. For an HF-repo model (BiRefNet) this materializes the cached snapshot into
+    the local dir via the normal repo download (offline-fast when already cached)."""
+    spec = by_key(key)
+    if spec is None:
+        return f"[Error] Unknown model '{key}'."
+    if spec.is_present():
+        return f"[OK] {spec.name} is already in place."
+    try:
+        if spec.repo and spec.local_dir():
+            return _download_repo(spec, progress)   # snapshot from cache → local dir
+        if not found_at or not Path(found_at).exists():
+            return f"[Error] {spec.name}: nothing found on disk to link."
+        dst = Path(spec.extract_to) if spec.extract else (paths.models_dir() / spec.subpath)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() or dst.is_symlink():
+            return f"[OK] {spec.name} is already in place."
+        src = Path(found_at).resolve()
+        try:
+            dst.symlink_to(src)
+            return f"[Success] Linked {spec.name} → {dst}"
+        except OSError:
+            import shutil
+            (shutil.copytree if src.is_dir() else shutil.copy2)(src, dst)
+            return f"[Success] Copied {spec.name} → {dst}"
+    except Exception as e:
+        logger.warning("link_found failed for %s", key, exc_info=True)
+        return f"[Error] Could not link {spec.name}: {e}"

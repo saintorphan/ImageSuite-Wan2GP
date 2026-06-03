@@ -42,6 +42,10 @@ button.imagesuite-tabbtn {
     grid-template-rows: none !important;
 }
 #imagesuite-root .imagesuite-help { font-size: 12px; opacity: 0.8; }
+/* Helper-weights manager rows: keep the status text + Download/Link buttons on one
+   centered line. */
+#imagesuite-root .imagesuite-modelrow { align-items: center; }
+#imagesuite-root .imagesuite-modelrow p { margin: 2px 0; }
 /* SDXL load / working notice under Generate — accent so it's noticed */
 #imagesuite-root .imagesuite-genstatus { font-size: 13px; color: #e83e8c;
     margin: 2px 0 4px; min-height: 0; }

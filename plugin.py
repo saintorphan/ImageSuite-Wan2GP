@@ -2145,16 +2145,17 @@ class ImageSuite(WAN2GPPlugin):
             try:
                 paths.set_dirs(outputs=outputs or None, sdxl_models=sdxl_models or None,
                                sdxl_loras=sdxl_loras or None, models=models_d or None)
-                status = "✅ Directories saved & created."
+                status = ("✅ Directories saved & created. "
+                          "(Re-run Scan to refresh the helper-weights status.)")
             except Exception as e:
                 status = f"⚠️ Could not save directories: {e}"
-            return [status] + _fresh_choices() + [settings_panel.status_md()]
+            return [status] + _fresh_choices()
 
         s["save_dirs"].click(
             _save_dirs,
             inputs=[s["outputs_dir"], s["sdxl_models_dir"], s["sdxl_loras_dir"],
                     s["models_dir"]],
-            outputs=[s["dirs_status"]] + model_dds + lora_dds + [s["models_status"]])
+            outputs=[s["dirs_status"]] + model_dds + lora_dds)
 
         s["rescan"].click(
             lambda: ["🔄 Rescanned."] + _fresh_choices()
@@ -2181,14 +2182,71 @@ class ImageSuite(WAN2GPPlugin):
             outputs=([s["dirs_status"]] + model_dds + lora_dds
                      + [s["sdxl_models_dir"], s["sdxl_loras_dir"], s["models_dir"]]))
 
-        def _download(key, progress=gr.Progress()):
-            if not key:
-                raise gr.Error("Pick a model to download first.")
-            msg = models.download(key, progress=progress)
-            return msg, settings_panel.status_md()
+        # -- Helper-weights manager: button-triggered scan + per-row Download / Link.
+        row_keys = s["model_row_keys"]
 
-        s["download"].click(_download, inputs=[s["model_key"]],
-                            outputs=[s["download_log"], s["models_status"]])
+        def _row_update(r):
+            st = r["state"]
+            if st == "linked":
+                txt, dl_on, ln_on = "✅ on disk", False, False
+            elif st == "elsewhere":
+                txt, dl_on, ln_on = "📁 on disk — not linked", bool(r["downloadable"]), True
+            else:
+                txt, dl_on, ln_on = "⬇ not downloaded", bool(r["downloadable"]), False
+            return [gr.update(value=f"**{r['name']}** — {txt}  \n`{r['path']}`"),
+                    gr.update(interactive=dl_on), gr.update(interactive=ln_on)]
+
+        def _row_comps():
+            comps = []
+            for k in row_keys:
+                comps += [s[f"m_{k}_status"], s[f"m_{k}_dl"], s[f"m_{k}_link"]]
+            return comps
+
+        def _scan(search_dir, progress=gr.Progress()):
+            progress(0.2, desc="Scanning for models…")
+            results = models.scan(search_dir or None)
+            progress(1.0, desc="done")
+            found = {r["key"]: r["found_at"] for r in results}
+            n_disk = sum(r["state"] == "linked" for r in results)
+            n_link = sum(r["state"] == "elsewhere" for r in results)
+            n_dl = sum(r["state"] == "missing" for r in results)
+            msg = (f"✅ Scan complete — {n_disk} on disk, {n_link} linkable, "
+                   f"{n_dl} to download.")
+            ups = []
+            for r in results:
+                ups += _row_update(r)
+            return [found, msg] + ups
+        s["scan_btn"].click(_scan, inputs=[s["scan_search"]],
+                            outputs=[s["scan_found"], s["scan_status"]] + _row_comps())
+
+        def _post(key, msg):
+            """Row state after a Download/Link: present → linked + buttons off; on
+            failure leave the buttons as they were and just surface the message."""
+            spec = models.by_key(key)
+            if spec is not None and spec.is_present():
+                return [msg,
+                        gr.update(value=f"**{spec.name}** — ✅ on disk  \n"
+                                        f"`{spec.display_path()}`"),
+                        gr.update(interactive=False), gr.update(interactive=False)]
+            return [msg, gr.update(), gr.update(), gr.update()]
+
+        def _mk_dl(key):
+            def _dl(progress=gr.Progress()):
+                return _post(key, models.download(key, progress=progress))
+            return _dl
+
+        def _mk_link(key):
+            def _ln(found, progress=gr.Progress()):
+                fa = (found or {}).get(key)
+                return _post(key, models.link_found(key, fa, progress=progress))
+            return _ln
+
+        for k in row_keys:
+            row_out = [s["scan_status"], s[f"m_{k}_status"],
+                       s[f"m_{k}_dl"], s[f"m_{k}_link"]]
+            s[f"m_{k}_dl"].click(_mk_dl(k), outputs=row_out)
+            s[f"m_{k}_link"].click(_mk_link(k), inputs=[s["scan_found"]],
+                                   outputs=row_out)
 
         # Default Generation Values editor → shared .orphansuite.json gen_defaults.
         _GD = [s["gd_steps"], s["gd_cfg"], s["gd_sampler"], s["gd_scheduler"],

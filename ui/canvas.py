@@ -646,6 +646,7 @@ function addOverlayLayer(url,cx,cy){ if(!hasBg){ setBg(url); return; }
     var x=(cx==null?W/2:cx)-dw/2, y=(cy==null?H/2:cy)-dh/2;
     l.ctx.drawImage(im,x,y,dw,dh); selTool('xform'); ensureXform();
     renderLayers(); compose(); pushExport(); }; im.src=url; }
+try{ parent.window['__is_'+MODE+'_addlayer']=function(u){ addOverlayLayer(u); }; }catch(e){}
 stage.addEventListener('dragover',function(e){ if(e.dataTransfer && (''+e.dataTransfer.types).indexOf('text/plain')>=0){ e.preventDefault(); e.dataTransfer.dropEffect='copy'; document.body.classList.add('dragover'); } });
 stage.addEventListener('dragleave',function(){ document.body.classList.remove('dragover'); });
 stage.addEventListener('drop',function(e){ var data=e.dataTransfer?e.dataTransfer.getData('text/plain'):''; document.body.classList.remove('dragover');
@@ -681,12 +682,22 @@ def build_canvas(mode="inpaint"):
     c["mask"] = gr.Textbox(visible=False, elem_id=f"imagesuite-{mode}-mask")
     c["bg_bridge"] = gr.HTML(visible=False)
     c["ov_bridge"] = gr.HTML(visible=False)  # pushes overlay thumbnails into the strip
+    c["addlayer_bridge"] = gr.HTML(visible=False)  # adds one overlay as a new layer
     return c
 
 
 def bg_bridge_html(data_url: str, mode="inpaint", nonce="") -> str:
     inner = ("<script>/*" + str(nonce) + "*/try{parent.window['__is_" + mode
              + "_setbg'](" + _js_string(data_url) + ");}catch(e){}</script>")
+    return ('<iframe srcdoc="' + _html.escape(inner, quote=True)
+            + '" style="display:none;width:0;height:0;border:none"></iframe>')
+
+
+def addlayer_bridge_html(data_url: str, mode="inpaint", nonce="") -> str:
+    """Add one overlay (data-URL) to the canvas as a new, centered layer (or as the
+    background if the canvas is empty) — see addOverlayLayer in the iframe JS."""
+    inner = ("<script>/*" + str(nonce) + "*/try{parent.window['__is_" + mode
+             + "_addlayer'](" + _js_string(data_url) + ");}catch(e){}</script>")
     return ('<iframe srcdoc="' + _html.escape(inner, quote=True)
             + '" style="display:none;width:0;height:0;border:none"></iframe>')
 

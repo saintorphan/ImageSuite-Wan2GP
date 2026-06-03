@@ -1251,6 +1251,56 @@ class ImageSuite(WAN2GPPlugin):
                         ("tb_delete", "delete")):
             o[_b].click(None, js="() => window.ovTool && window.ovTool('" + _op + "')")
 
+        # -- Preview + Send-to: clicking a thumbnail fills the preview pane and arms
+        #    the selection; the buttons push it into the editor (same targets as the
+        #    cross-plugin Send menu + the new add-layer canvas bridge), then jump to
+        #    that tab.
+        def _ov_select(evt: gr.SelectData):
+            v = evt.value
+            path = ((v.get("image", {}).get("path") or v.get("path"))
+                    if isinstance(v, dict) else v if isinstance(v, str) else None)
+            return path, gr.update(value=path)
+        o["gallery"].select(_ov_select, outputs=[o["selected"], o["preview"]])
+
+        pages, subtabs, tab_ids = ui["pages"], ui["subtabs"], ui["tab_ids"]
+        send_out = [pages["img2img"]["input_image"], pages["inpaint"]["bg_bridge"],
+                    pages["inpaint"]["addlayer_bridge"], subtabs, self.main_tabs]
+
+        def _need(sel):
+            if not sel:
+                gr.Warning("Click an overlay to select it first.")
+            return bool(sel)
+
+        def _send_i2i(sel):
+            if not _need(sel):
+                return [gr.update()] * 5
+            return [gr.update(value=sel), gr.update(), gr.update(),
+                    gr.update(selected=tab_ids["img2img"]),
+                    gr.update(selected=PLUGIN_ID)]
+        o["send_i2i"].click(_send_i2i, inputs=[o["selected"]], outputs=send_out)
+
+        def _send_mc_canvas(sel):
+            if not _need(sel):
+                return [gr.update()] * 5
+            html = canvas.bg_bridge_html(self._file_to_dataurl(sel), "inpaint",
+                                         nonce=time.time())
+            return [gr.update(), gr.update(value=html), gr.update(),
+                    gr.update(selected=tab_ids["inpaint"]),
+                    gr.update(selected=PLUGIN_ID)]
+        o["send_mc_canvas"].click(_send_mc_canvas, inputs=[o["selected"]],
+                                  outputs=send_out)
+
+        def _send_mc_layer(sel):
+            if not _need(sel):
+                return [gr.update()] * 5
+            html = canvas.addlayer_bridge_html(self._file_to_dataurl(sel), "inpaint",
+                                               nonce=time.time())
+            return [gr.update(), gr.update(), gr.update(value=html),
+                    gr.update(selected=tab_ids["inpaint"]),
+                    gr.update(selected=PLUGIN_ID)]
+        o["send_mc_layer"].click(_send_mc_layer, inputs=[o["selected"]],
+                                 outputs=send_out)
+
     # Settings persisted per tab so the image tabs come back as you left them
     # after a restart (written on Generate, restored on page load).
     _PERSIST_KEYS = ["model", "sampler", "scheduler", "steps", "cfg", "clip_skip",

@@ -167,19 +167,28 @@ def build_overlays_panel():
         c["tb_move"] = gr.Button("➡ Move", size="sm")
         c["tb_delete"] = gr.Button("🗑 Delete", variant="stop", size="sm")
 
-    # Folder selector = navigation (the grid shows images, not folders, so we still
-    # need a way to switch folders). Everything else is right-click / drag-drop — no
-    # redundant buttons: right-click the selector for New / Upload / Rename / Delete
-    # folder; right-click the grid for image actions or upload; drag images in.
-    c["folder"] = gr.Dropdown(label="Folder  ·  right-click for folder actions",
-                              choices=folders, value=cur,
-                              elem_id="imagesuite-ov-folder")
-    c["gallery"] = gr.Gallery(
-        label="Overlays — click to enlarge · right-click for actions · drag images in",
-        columns=6, height=520, object_fit="contain",
-        value=_ov.list_images(cur), elem_id="imagesuite-ov-gallery",
-        elem_classes="imagesuite-gallery")
-    c["status"] = gr.Markdown("", elem_classes="imagesuite-help")
+    # Browser on the left (folder selector = navigation + the image grid); preview
+    # pane on the right (the selected overlay + buttons to push it into the editor).
+    with gr.Row():
+        with gr.Column(scale=3):
+            c["folder"] = gr.Dropdown(
+                label="Folder  ·  right-click for folder actions",
+                choices=folders, value=cur, elem_id="imagesuite-ov-folder")
+            c["gallery"] = gr.Gallery(
+                label="Overlays — click to select · right-click for actions · drag in",
+                columns=6, height=520, object_fit="contain",
+                value=_ov.list_images(cur), elem_id="imagesuite-ov-gallery",
+                elem_classes="imagesuite-gallery")
+            c["status"] = gr.Markdown("", elem_classes="imagesuite-help")
+        with gr.Column(scale=1):
+            c["preview"] = gr.Image(label="Preview (double-click to enlarge)",
+                                    interactive=False, height=240,
+                                    elem_classes="imagesuite-initthumb")
+            c["selected"] = gr.State(None)   # path of the clicked overlay
+            gr.Markdown("**Send selected overlay to →**")
+            c["send_mc_layer"] = gr.Button("🖼 MultiCanvas Layer", size="sm")
+            c["send_mc_canvas"] = gr.Button("🎨 MultiCanvas Canvas", size="sm")
+            c["send_i2i"] = gr.Button("🪄 Img2Img Init", size="sm")
 
     # Hidden bridges driven by the file-browser JS (wired in plugin._wire_overlays).
     c["ov_action"] = gr.Textbox(visible=False, elem_id="imagesuite-ov-action")

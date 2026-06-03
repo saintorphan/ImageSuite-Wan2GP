@@ -719,6 +719,25 @@ class ImageSuite(WAN2GPPlugin):
 
         with gr.Column(elem_id="imagesuite-root"):
             gr.HTML(logo.banner_html())
+            # Project bar — centered name + far-right CRUD (wired in _wire_projects).
+            _active = paths.get_active_project()
+            with gr.Row(elem_id="imagesuite-projbar"):
+                self._proj_name = gr.Markdown(self._projname_md(_active),
+                                              elem_id="imagesuite-projname")
+                self._proj_pick = gr.Dropdown(
+                    choices=projects.list_projects(), value=(_active or None),
+                    show_label=False, container=False, scale=0, min_width=180,
+                    elem_id="imagesuite-projpick")
+                self._proj_save = gr.Button("💾 Save", scale=0, size="sm", variant="primary")
+                self._proj_load = gr.Button("📂 Load", scale=0, size="sm")
+                self._proj_rename = gr.Button("✏ Rename", scale=0, size="sm")
+                self._proj_delete = gr.Button("🗑 Delete", scale=0, size="sm", variant="stop")
+            # Hidden relays: active project name (read by Save's JS) + the name the
+            # Save/Rename JS prompts write back for the Python handler to consume.
+            self._proj_active = gr.Textbox(_active, visible=False,
+                                           elem_id="imagesuite-proj-active")
+            self._proj_namein = gr.Textbox(visible=False, elem_id="imagesuite-proj-namein")
+            self._proj_status = gr.Markdown("", elem_classes="imagesuite-help")
             # Shared app-wide right-click menu (idempotent engine + our items) and
             # the hidden relay it writes into.
             gr.HTML(contextmenu.imagesuite_ctx_html(), elem_classes="imagesuite-hidden")
@@ -1052,6 +1071,156 @@ class ImageSuite(WAN2GPPlugin):
         self._wire_ctx(ui)
         self._wire_overlays(ui)
         self._wire_persist(ui)
+        self._wire_projects(ui)
+
+    @staticmethod
+    def _projname_md(name) -> str:
+        return f"📁 **{name}**" if name else "Unsaved Project"
+
+    def _wire_projects(self, ui):
+        """Header CRUD. A project bundles, for the whole workspace: every JSON-able
+        param per tab (same capture as the Prompt Library), every filepath image
+        (img2img init + face/body/colour refs), each tab's currently-displayed
+        results, and the full MultiCanvas layer stack (base + layers + mask)."""
+        pages = ui["pages"]
+
+        # Fixed-order component sets (parallel idx lists let us re-key the *vals).
+        param_comps, param_idx = [], []
+        for m, c in pages.items():
+            for k, comp in self._pl_items(c):
+                param_comps.append(comp); param_idx.append((m, k))
+        img_comps, img_idx = [], []
+        for m, c in pages.items():
+            for k, comp in c.items():
+                if isinstance(comp, gr.Image):
+                    img_comps.append(comp); img_idx.append((m, k))
+        gal_out = []
+        for m in pages:
+            gal_out += [pages[m]["gallery"], pages[m]["picked"], pages[m]["save"]]
+        inp = pages.get("inpaint", {})
+        canvas_state = inp.get("state")          # filled by __is_inpaint_pushstate
+        canvas_bridge = inp.get("state_bridge")  # rebuilds the canvas on load
+
+        pick = self._proj_pick
+
+        # ---- Save: JS flushes the canvas state + resolves the name, then Python
+        #      writes everything. Update-in-place when a project is open. ----
+        def _save(name_in, active_in, cstate, *vals):
+            name = (name_in or active_in or "").strip()
+            if not name:
+                return gr.update(), gr.update(), gr.update(), "Enter a project name."
+            pvals, ivals = vals[:len(param_comps)], vals[len(param_comps):]
+            tabs = {}
+            for (m, k), v in zip(param_idx, pvals):
+                tabs.setdefault(m, {})[k] = v
+            refs = {}
+            for (m, k), v in zip(img_idx, ivals):
+                if v:
+                    refs.setdefault(m, {})[k] = v
+            results = {m: paths.get_results(m) for m in pages}
+            try:
+                saved = projects.save_project(name, tabs=tabs, results=results,
+                                              refs=refs, canvas_state=(cstate or None))
+            except Exception as e:
+                traceback.print_exc()
+                return gr.update(), gr.update(), gr.update(), f"⚠️ Save failed: {e}"
+            paths.set_active_project(saved)
+            return (self._projname_md(saved), saved,
+                    gr.update(choices=projects.list_projects(), value=saved),
+                    f"💾 Saved “{saved}”.")
+        self._proj_save.click(
+            _save,
+            inputs=[self._proj_namein, self._proj_active, canvas_state]
+                   + param_comps + img_comps,
+            outputs=[self._proj_name, self._proj_active, pick, self._proj_status],
+            js="() => { try{ if(window.__is_inpaint_pushstate) window.__is_inpaint_pushstate(); }catch(e){}"
+               " var a=''; try{ a=(document.querySelector('#imagesuite-proj-active textarea')||{}).value||''; }catch(e){}"
+               " var name=a; if(!name){ name=prompt('Save project as:'); if(!name) throw new Error('cancelled'); }"
+               " var el=document.querySelector('#imagesuite-proj-namein textarea')||document.querySelector('#imagesuite-proj-namein input');"
+               " if(el){ el.value=name; el.dispatchEvent(new Event('input',{bubbles:true})); } }")
+
+        # ---- Load ----
+        def _load(sel):
+            data = projects.load_project(sel) if sel else None
+            if not data:
+                return ([gr.update() for _ in param_comps]
+                        + [gr.update() for _ in img_comps]
+                        + [gr.update() for _ in gal_out]
+                        + [gr.update(), gr.update(), gr.update(),
+                           "Pick a project to load."])
+            tabs, refs = data["tabs"], data["refs"]
+            op = []
+            for (m, k) in param_idx:
+                ent = tabs.get(m, {})
+                if k == "loras" and "loras" in ent:
+                    op.append(gr.update(choices=self._lora_choices_for(ent.get("model")),
+                                        value=ent.get("loras") or []))
+                elif k in ent:
+                    op.append(gr.update(value=ent[k]))
+                else:
+                    op.append(gr.update())
+            oi = []
+            for (m, k) in img_idx:
+                path = (refs.get(m) or {}).get(k)
+                oi.append(gr.update(value=path) if path else gr.update(value=None))
+            gals = []
+            for m in pages:
+                files = data["results"].get(m) or []
+                if files:
+                    g, picked, save = self._gallery_result(files, m)
+                    gals += [g, picked, save]
+                else:
+                    gals += [gr.update(value=None), gr.update(value=None),
+                             gr.update(value=None)]
+            cs = data.get("canvas_state")
+            cb = (canvas.state_bridge_html(cs, "inpaint", nonce=time.time())
+                  if (cs and canvas_bridge is not None) else gr.update())
+            paths.set_active_project(data["name"])
+            return (op + oi + gals
+                    + [cb, self._projname_md(data["name"]), data["name"],
+                       f"📂 Loaded “{data['name']}”."])
+        self._proj_load.click(
+            _load, inputs=[pick],
+            outputs=(param_comps + img_comps + gal_out
+                     + [canvas_bridge, self._proj_name, self._proj_active,
+                        self._proj_status]))
+
+        # ---- Rename (JS prompts; reuses the namein relay) ----
+        def _rename(sel, new):
+            new = (new or "").strip()
+            if not sel or not new:
+                return gr.update(), gr.update(), gr.update(), "Pick a project and a new name."
+            res = projects.rename_project(sel, new)
+            if not res:
+                return (gr.update(), gr.update(), gr.update(),
+                        f"⚠️ Couldn't rename — “{projects.sanitize(new)}” may already exist.")
+            active = paths.get_active_project()
+            if active == projects.sanitize(sel):
+                paths.set_active_project(res); active = res
+            return (gr.update(choices=projects.list_projects(), value=res),
+                    self._projname_md(active), active, f"✏ Renamed to “{res}”.")
+        self._proj_rename.click(
+            _rename, inputs=[pick, self._proj_namein],
+            outputs=[pick, self._proj_name, self._proj_active, self._proj_status],
+            js="() => { var n=prompt('Rename the selected project to:'); if(!n) throw new Error('cancelled');"
+               " var el=document.querySelector('#imagesuite-proj-namein textarea')||document.querySelector('#imagesuite-proj-namein input');"
+               " if(el){ el.value=n; el.dispatchEvent(new Event('input',{bubbles:true})); } }")
+
+        # ---- Delete (JS confirm) ----
+        def _delete(sel):
+            if not sel:
+                return gr.update(), gr.update(), gr.update(), "Pick a project to delete."
+            ok = projects.delete_project(sel)
+            active = paths.get_active_project()
+            if ok and active == projects.sanitize(sel):
+                paths.set_active_project(""); active = ""
+            return (gr.update(choices=projects.list_projects(), value=None),
+                    self._projname_md(active), active,
+                    f"🗑 Deleted “{sel}”." if ok else f"⚠️ Couldn't delete “{sel}”.")
+        self._proj_delete.click(
+            _delete, inputs=[pick],
+            outputs=[pick, self._proj_name, self._proj_active, self._proj_status],
+            js="() => { if(!confirm('Delete the selected project permanently? This cannot be undone.')) throw new Error('cancelled'); }")
 
     # -- Prompt Library (shared across all three tabs) ----------------------
     # Every JSON-able scalar input is saved/loaded by inspecting the page's

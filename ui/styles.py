@@ -94,6 +94,14 @@ button.imagesuite-tabbtn {
     padding-bottom: 6px; white-space: nowrap; flex: 0 0 auto;
 }
 #imagesuite-banner #imagesuite-gh:hover { text-decoration: underline; }
+/* Project bar (under the banner): centered project name + far-right CRUD. */
+#imagesuite-projbar { display: flex; align-items: center; gap: 6px;
+    margin: -6px 2px 12px 2px; }
+#imagesuite-projbar #imagesuite-projname { text-align: center; min-width: 0; }
+#imagesuite-projbar #imagesuite-projname p { margin: 0; font-weight: 600;
+    font-style: italic; color: #d4af37; }
+#imagesuite-projbar #imagesuite-projname .imagesuite-unsaved p { color: #8a8a93; }
+#imagesuite-projbar button { min-width: 0; }
 """
 
 # Page-level JS injected once (Gradio strips <script>, so we use the <img onerror>

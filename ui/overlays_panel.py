@@ -83,6 +83,23 @@ _OV_JS = r"""
       r.readAsDataURL(f);
     });
   }
+  // Top-toolbar entry point (Gradio buttons call this via js=). Acts on the image
+  // currently selected in the GRID (.thumbnail-lg.selected); upload/new-folder don't
+  // need a selection.
+  function selectedIndex(){
+    var g=gal(); if(!g) return -1;
+    var sel=g.querySelector(".thumbnail-lg.selected"); if(!sel) return -1;
+    return Array.prototype.indexOf.call(g.querySelectorAll(".thumbnail-lg"), sel);
+  }
+  window.ovTool=function(op){
+    if(op==="upload"){ pickUpload(); return; }
+    if(op==="newfolder"){ newFolder(); return; }
+    var i=selectedIndex();
+    if(i<0){ alert("Click an image in the grid to select it first."); return; }
+    if(op==="rename") renameFile(i);
+    else if(op==="delete") deleteFile(i);
+    else if(op==="move"){ var d=prompt("Move to which folder? (existing folder name, blank = root)"); if(d!==null) act({op:"move_file", idx:i, arg:d}); }
+  };
   document.addEventListener("contextmenu", function(e){
     var g=gal(), fol=document.getElementById(FOL);
     var inFol = fol && fol.contains(e.target), inGal = g && g.contains(e.target);
@@ -138,6 +155,17 @@ def build_overlays_panel():
 
     folders = _ov.list_folders()
     cur = folders[0] if folders else _ov.ROOT_LABEL
+
+    # Top toolbar — plain buttons as a discoverable alternative to right-click.
+    # Upload / New folder act on the current folder; Rename / Move / Delete act on the
+    # image currently selected (clicked) in the grid. Each runs the same JS flow as the
+    # right-click menu via window.ovTool (wired in plugin._wire_overlays).
+    with gr.Row(elem_classes="imagesuite-ovtoolbar"):
+        c["tb_upload"] = gr.Button("⬆ Upload", size="sm")
+        c["tb_newfolder"] = gr.Button("📁 New folder", size="sm")
+        c["tb_rename"] = gr.Button("✎ Rename", size="sm")
+        c["tb_move"] = gr.Button("➡ Move", size="sm")
+        c["tb_delete"] = gr.Button("🗑 Delete", variant="stop", size="sm")
 
     # Folder selector = navigation (the grid shows images, not folders, so we still
     # need a way to switch folders). Everything else is right-click / drag-drop — no

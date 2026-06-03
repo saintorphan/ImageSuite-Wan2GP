@@ -1176,7 +1176,7 @@ class ImageSuite(WAN2GPPlugin):
                 elif op == "delete_folder":
                     ov.delete_folder(folder); folder = ov.ROOT_LABEL
                     msg = "Deleted folder."
-                elif op in ("rename_file", "delete_file", "moveup_file"):
+                elif op in ("rename_file", "delete_file", "moveup_file", "move_file"):
                     imgs = ov.list_images(folder)
                     i = int(idx) if idx is not None else -1
                     if not (0 <= i < len(imgs)):
@@ -1187,9 +1187,13 @@ class ImageSuite(WAN2GPPlugin):
                         msg = f"Renamed to '{name}'."
                     elif op == "delete_file":
                         ov.delete_image(folder, name); msg = f"Deleted '{name}'."
-                    else:
+                    elif op == "moveup_file":
                         ov.move_image(folder, name, ov.ROOT_LABEL)
                         msg = f"Moved '{name}' up to {ov.ROOT_LABEL}."
+                    else:  # move_file → a named folder (blank → root)
+                        dest = (arg or "").strip() or ov.ROOT_LABEL
+                        ov.move_image(folder, name, dest)
+                        msg = f"Moved '{name}' to '{dest}'."
                 else:
                     return (gr.update(), gr.update(), gr.update())
             except Exception as e:
@@ -1238,6 +1242,14 @@ class ImageSuite(WAN2GPPlugin):
         o["ov_upload"].input(
             _ov_upload, inputs=[o["ov_upload"], o["folder"]],
             outputs=[o["folder"], o["gallery"], o["status"]])
+
+        # Top toolbar → the same JS flows as the right-click menu, acting on the
+        # currently-selected thumbnail. window.ovTool (overlays_panel.py) does the
+        # prompt/confirm then drives the bridges above; these are js-only (no server fn).
+        for _b, _op in (("tb_upload", "upload"), ("tb_newfolder", "newfolder"),
+                        ("tb_rename", "rename"), ("tb_move", "move"),
+                        ("tb_delete", "delete")):
+            o[_b].click(None, js="() => window.ovTool && window.ovTool('" + _op + "')")
 
     # Settings persisted per tab so the image tabs come back as you left them
     # after a restart (written on Generate, restored on page load).

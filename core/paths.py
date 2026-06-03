@@ -104,6 +104,32 @@ def set_results(mode: str, paths_list) -> None:
     save_config()
 
 
+# --- projects ---------------------------------------------------------------
+
+def projects_dir() -> Path:
+    """Root of saved Projects (full-workspace snapshots). Under the lab root,
+    so it's gitignored like the rest of image_suite/."""
+    return _dir("projects_dir", "projects")
+
+
+def get_active_project() -> str:
+    """Name of the currently-open project, '' when unsaved."""
+    return str(load_config().get("active_project") or "")
+
+
+def set_active_project(name) -> None:
+    load_config()["active_project"] = str(name or "")
+    save_config()
+
+
+def gen_output_dirs() -> list:
+    """The raw generation output dirs ('Flush Outputs' reclaims these): txt2img +
+    img2img both write to sd_gen, MultiCanvas/inpaint to inpaint. Projects keep their
+    own copies and the on-screen galleries restore from .cache/persist/results, both
+    of which live elsewhere — so clearing these never loses a project or the current view."""
+    return [cache_dir() / "sd_gen", cache_dir() / "inpaint"]
+
+
 def set_dirs(*, outputs=None, models=None, sdxl_models=None, sdxl_loras=None) -> None:
     """Persist directory overrides. SHARED resources (face/ADetailer weights, SDXL
     checkpoints + LoRAs) go to the cross-plugin .orphansuite.json so every plugin

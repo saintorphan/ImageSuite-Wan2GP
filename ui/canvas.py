@@ -707,6 +707,41 @@ function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im;
   renderLayers(); compose(); pushExport(); }; im.src=dataUrl; }
 try{ parent.window['__is_'+MODE+'_setbg']=setBg; }catch(e){}
 
+// -- full MultiCanvas state for Projects: serialize ALL layers + base + mask
+//    (Save Project) and rebuild them (Load Project). Distinct from the flattened
+//    composite export above — this round-trips the editable layer stack. --
+function serializeCanvasState(){ if(!hasBg) return '';
+  var base=null; try{ if(baseImg){ var bc=document.createElement('canvas'); bc.width=W;bc.height=H;
+    bc.getContext('2d').drawImage(baseImg,0,0,W,H); base=bc.toDataURL('image/png'); } }catch(e){}
+  var layers=drawLayers.map(function(l){ return {name:l.name, visible:l.visible!==false,
+    opacity:(l.opacity==null?1:l.opacity), data:l.cv.toDataURL('image/png')}; });
+  var mask=null; try{ mask=maskBuf.toDataURL('image/png'); }catch(e){}
+  return JSON.stringify({v:1,w:W,h:H,base:base,layers:layers,mask:mask,active:active,autoMask:autoMask,dilate:dilate}); }
+function pushState(){ try{ setHidden('imagesuite-'+MODE+'-state', hasBg?serializeCanvasState():''); }catch(e){} }
+try{ parent.window['__is_'+MODE+'_pushstate']=pushState; }catch(e){}
+function resetToolUI(){ var sc=document.getElementById('scale'),rt=document.getElementById('rot'),lo=document.getElementById('lopac');
+  if(sc){ sc.value=100; document.getElementById('scv').textContent=100; }
+  if(rt){ rt.value=0; document.getElementById('rotv').textContent=0; }
+  if(lo){ lo.value=100; document.getElementById('lopv').textContent=100; } }
+function loadCanvasState(json){ var st; try{ st=JSON.parse(json); }catch(e){ return; } if(!st||!st.w||!st.h) return;
+  var finish=function(){ setSize(st.w,st.h); drawLayers=[]; layerSeq=0;
+    var arr=st.layers||[], pending=arr.length, done=0;
+    var build=function(){ active=Math.min(Math.max(0,st.active||0),Math.max(0,drawLayers.length-1));
+      mbx.clearRect(0,0,W,H);
+      var fin2=function(){ autoMask=!!st.autoMask; dilate=(st.dilate==null?dilate:st.dilate);
+        hasBg=true; document.getElementById('empty').style.display='none';
+        undoStack=[]; redoStack=[]; cloneSrc=null; clipboard=null; tSnap=null; tBox=null; tSession=-1; tDx=0;tDy=0;tScale=1;tRot=0;
+        resetToolUI(); renderLayers(); compose(); pushExport(); };
+      if(st.mask){ var mi=new Image(); mi.onload=function(){ mbx.drawImage(mi,0,0); fin2(); }; mi.onerror=fin2; mi.src=st.mask; } else fin2(); };
+    if(!arr.length){ drawLayers=[newLayer('Layer 1')]; build(); return; }
+    arr.forEach(function(spec,i){ var l=newLayer(spec.name||('Layer '+(i+1)));
+      l.visible=spec.visible!==false; l.opacity=(spec.opacity==null?1:spec.opacity); drawLayers.push(l);
+      var im=new Image(); im.onload=function(){ l.ctx.drawImage(im,0,0); if(++done===pending) build(); };
+      im.onerror=function(){ if(++done===pending) build(); }; im.src=spec.data; }); };
+  if(st.base){ var bi=new Image(); bi.onload=function(){ baseImg=bi; finish(); }; bi.onerror=function(){ baseImg=null; finish(); }; bi.src=st.base; }
+  else { baseImg=null; finish(); } }
+try{ parent.window['__is_'+MODE+'_loadstate']=function(j){ loadCanvasState(j); }; }catch(e){}
+
 // -- overlays strip: drag a thumbnail onto the canvas → a new layer below mask --
 var overlays=[];  // [{name, url}]
 var ovstrip=document.getElementById('ovstrip');
@@ -768,6 +803,10 @@ def build_canvas(mode="inpaint"):
     c["bg_bridge"] = gr.HTML(visible=False)
     c["ov_bridge"] = gr.HTML(visible=False)  # pushes overlay thumbnails into the strip
     c["addlayer_bridge"] = gr.HTML(visible=False)  # adds one overlay as a new layer
+    # Project save/load: 'state' carries the full layer-stack JSON (filled by
+    # __is_<mode>_pushstate before a Save read); 'state_bridge' rebuilds it on Load.
+    c["state"] = gr.Textbox(visible=False, elem_id=f"imagesuite-{mode}-state")
+    c["state_bridge"] = gr.HTML(visible=False)
     return c
 
 
@@ -783,6 +822,15 @@ def addlayer_bridge_html(data_url: str, mode="inpaint", nonce="") -> str:
     background if the canvas is empty) — see addOverlayLayer in the iframe JS."""
     inner = ("<script>/*" + str(nonce) + "*/try{parent.window['__is_" + mode
              + "_addlayer'](" + _js_string(data_url) + ");}catch(e){}</script>")
+    return ('<iframe srcdoc="' + _html.escape(inner, quote=True)
+            + '" style="display:none;width:0;height:0;border:none"></iframe>')
+
+
+def state_bridge_html(state_json: str, mode="inpaint", nonce="") -> str:
+    """Rebuild the whole MultiCanvas (base + every layer + mask) from a serialized
+    state JSON — see loadCanvasState in the iframe JS. Used by Load Project."""
+    inner = ("<script>/*" + str(nonce) + "*/try{parent.window['__is_" + mode
+             + "_loadstate'](" + _js_string(state_json or "") + ");}catch(e){}</script>")
     return ('<iframe srcdoc="' + _html.escape(inner, quote=True)
             + '" style="display:none;width:0;height:0;border:none"></iframe>')
 

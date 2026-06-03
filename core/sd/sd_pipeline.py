@@ -1845,8 +1845,8 @@ class SDImagePipeline:
             )
 
         # Re-enable memory optimisations — pipeline construction can reset them
-        self._img2img_pipe.enable_vae_tiling()
-        self._img2img_pipe.enable_vae_slicing()
+        self._img2img_pipe.vae.enable_tiling()
+        self._img2img_pipe.vae.enable_slicing()
         try:
             self._img2img_pipe.enable_xformers_memory_efficient_attention()
         except Exception:
@@ -1885,8 +1885,8 @@ class SDImagePipeline:
             )
 
         # Re-enable memory optimisations — pipeline construction can reset them
-        self._inpaint_pipe.enable_vae_tiling()
-        self._inpaint_pipe.enable_vae_slicing()
+        self._inpaint_pipe.vae.enable_tiling()
+        self._inpaint_pipe.vae.enable_slicing()
         try:
             self._inpaint_pipe.enable_xformers_memory_efficient_attention()
         except Exception:

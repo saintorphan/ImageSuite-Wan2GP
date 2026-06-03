@@ -1854,12 +1854,17 @@ class ImageSuite(WAN2GPPlugin):
             gen_sd.clear_abort()
             comp = self._decode_dataurl(composite_url)
             mask = self._decode_dataurl(mask_url)
+            # Missing canvas/mask is normal user-input validation, not an error —
+            # show a popup (gr.Warning) and no-op rather than raising (which the webui
+            # worker re-raises into a console traceback).
             if comp is None:
-                raise gr.Error("Load an image into the canvas first (upload one or "
-                               "use a 'Send to MultiCanvas' button).")
+                gr.Warning("Load an image into the canvas first (upload one or use a "
+                           "'Send to MultiCanvas' button).")
+                return gr.update(), gr.update(), gr.update()
             if mask is None or not self._mask_nonempty(mask):
-                raise gr.Error("Mark a mask region first — use Mask mode (paint the "
-                               "area to change) or turn on Auto-mask.")
+                gr.Warning("Mark a mask region first — use Mask mode (paint the area "
+                           "to change) or turn on Auto-mask.")
+                return gr.update(), gr.update(), gr.update()
             comp = comp.convert("RGB")
             mask = mask.convert("L")
             if mask_mode == "Inpaint not masked":

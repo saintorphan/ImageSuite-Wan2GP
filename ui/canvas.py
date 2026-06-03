@@ -187,6 +187,8 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
         <input type="range" id="scale" min="10" max="300" value="100">
         <div class="fld"><span>Rotate</span><span id="rotv">0</span>&#176;</div>
         <input type="range" id="rot" min="-180" max="180" value="0">
+        <div class="fld"><span>Layer opacity</span><span id="lopv">100</span>%</div>
+        <input type="range" id="lopac" min="0" max="100" value="100" title="Opacity of the active layer">
       </div>
     </div>
   </div>
@@ -225,7 +227,7 @@ var baseScale=1,viewScale=1;
 function newLayer(name){
   var cv=document.createElement('canvas'); cv.width=W; cv.height=H;
   return {id:++layerSeq, name:name||('Layer '+(drawLayers.length+1)), cv:cv,
-          ctx:cv.getContext('2d'), visible:true};
+          ctx:cv.getContext('2d'), visible:true, opacity:1};
 }
 function activeLayer(){
   if(!drawLayers.length){ drawLayers.push(newLayer('Layer 1')); active=0; renderLayers(); }
@@ -277,7 +279,7 @@ function restore(stack,other){ if(!stack.length) return; var s=stack.pop();
 function compose(){
   dx.clearRect(0,0,W,H);
   if(baseImg) dx.drawImage(baseImg,0,0,W,H);
-  drawLayers.forEach(function(l){ if(l.visible) dx.drawImage(l.cv,0,0); });
+  drawLayers.forEach(function(l){ if(l.visible){ dx.save(); dx.globalAlpha=(l.opacity==null?1:l.opacity); dx.drawImage(l.cv,0,0); dx.restore(); } });
   if(showMask){ dx.save(); dx.globalAlpha=0.5;
     var t=document.createElement('canvas'); t.width=W;t.height=H; var tc=t.getContext('2d');
     tc.drawImage(maskBuf,0,0); tc.globalCompositeOperation='source-in';
@@ -501,6 +503,8 @@ document.getElementById('paste').addEventListener('click',pasteClip);
 document.getElementById('flatten').addEventListener('click',flattenDown);
 document.getElementById('scale').addEventListener('input',function(e){ ensureXform(); tScale=(+e.target.value)/100; document.getElementById('scv').textContent=e.target.value; applyTransform(); pushExport(); });
 document.getElementById('rot').addEventListener('input',function(e){ ensureXform(); tRot=+e.target.value; document.getElementById('rotv').textContent=e.target.value; applyTransform(); pushExport(); });
+document.getElementById('lopac').addEventListener('input',function(e){ var l=activeLayer(); l.opacity=(+e.target.value)/100; document.getElementById('lopv').textContent=e.target.value; compose(); pushExport(); });
+function syncLayerOpacity(){ var l=drawLayers[active]; if(!l) return; var v=Math.round((l.opacity==null?1:l.opacity)*100); var s=document.getElementById('lopac'); if(s){ s.value=v; document.getElementById('lopv').textContent=v; } }
 // Hardness has no effect on the mask (soft edges are deliberately excluded for
 // mask/eraser), so gray it out + annotate when painting the mask only.
 function updateHardnessUI(){ var h=document.getElementById('hard'),f=document.getElementById('hardfld');
@@ -571,7 +575,7 @@ function renderLayers(){ lyrEl.innerHTML='';
   // draw layers top→bottom in the panel = reverse of stacking
   for(var i=drawLayers.length-1;i>=0;i--){ (function(i){ var l=drawLayers[i];
     lyrEl.appendChild(chip('draw'+(i===active?' active':''), l.name, {visible:l.visible, idx:i, draggable:true,
-      onClick:function(){ active=i; renderLayers(); },
+      onClick:function(){ active=i; syncLayerOpacity(); renderLayers(); },
       onEye:function(){ l.visible=!l.visible; compose(); renderLayers(); pushExport(); },
       onDel:function(){ var delIdx=i, delLayer=l, prevA=active;
         drawLayers.splice(delIdx,1); if(active>=drawLayers.length) active=drawLayers.length-1;
@@ -597,7 +601,8 @@ function buildMask(){ var t=document.createElement('canvas'); t.width=W;t.height
   for(var i=0;i<d.length;i+=4){ var on=d[i]>127||d[i+1]>127||d[i+2]>127; d[i]=d[i+1]=d[i+2]=on?255:0; d[i+3]=255; }
   tc.putImageData(im,0,0); return t.toDataURL('image/png'); }
 function buildComposite(){ var t=document.createElement('canvas'); t.width=W;t.height=H; var tc=t.getContext('2d');
-  if(baseImg) tc.drawImage(baseImg,0,0,W,H); drawLayers.forEach(function(l){ if(l.visible) tc.drawImage(l.cv,0,0); });
+  if(baseImg) tc.drawImage(baseImg,0,0,W,H);
+  drawLayers.forEach(function(l){ if(l.visible){ tc.save(); tc.globalAlpha=(l.opacity==null?1:l.opacity); tc.drawImage(l.cv,0,0); tc.restore(); } });
   return t.toDataURL('image/png'); }
 function setHidden(id,val){ try{ var pd=parent.document;
   var e=pd.querySelector('#'+id+' textarea')||pd.querySelector('#'+id+' input'); if(!e) return;
@@ -620,6 +625,7 @@ function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im;
   var sc=document.getElementById('scale'),rt=document.getElementById('rot');
   if(sc){ sc.value=100; document.getElementById('scv').textContent=100; }
   if(rt){ rt.value=0; document.getElementById('rotv').textContent=0; }
+  var lo=document.getElementById('lopac'); if(lo){ lo.value=100; document.getElementById('lopv').textContent=100; }
   renderLayers(); compose(); pushExport(); }; im.src=dataUrl; }
 try{ parent.window['__is_'+MODE+'_setbg']=setBg; }catch(e){}
 
@@ -644,6 +650,7 @@ function addOverlayLayer(url,cx,cy){ if(!hasBg){ setBg(url); return; }
   var im=new Image(); im.onload=function(){ var l=newLayer('Overlay'); drawLayers.push(l); active=drawLayers.length-1;
     var ow=im.naturalWidth,oh=im.naturalHeight, fit=Math.min(1,(W*0.9)/ow,(H*0.9)/oh), dw=ow*fit,dh=oh*fit;
     var x=(cx==null?W/2:cx)-dw/2, y=(cy==null?H/2:cy)-dh/2;
+    x=Math.max(0,Math.min(W-dw,x)); y=Math.max(0,Math.min(H-dh,y));  // keep fully on-canvas
     l.ctx.drawImage(im,x,y,dw,dh); selTool('xform'); ensureXform();
     renderLayers(); compose(); pushExport(); }; im.src=url; }
 try{ parent.window['__is_'+MODE+'_addlayer']=function(u){ addOverlayLayer(u); }; }catch(e){}

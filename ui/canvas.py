@@ -450,7 +450,7 @@ function applyTransform(){ if(!tSnap) return; var l=drawLayers.filter(function(x
 function hdim(px){ var ds=(baseScale*viewScale)||1; return px/ds; }   // screen px -> canvas units
 function contentBBox(snap){ try{
     var d=snap.getContext('2d').getImageData(0,0,W,H).data, minx=W,miny=H,maxx=-1,maxy=-1;
-    for(var y=0;y<H;y++){ var r=y*W; for(var x=0;x<W;x++){ if(d[(r+x)*4+3]>8){
+    for(var y=0;y<H;y++){ var r=y*W; for(var x=0;x<W;x++){ if(d[(r+x)*4+3]>16){
       if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y; } } }
     if(maxx<0) return {x:0,y:0,w:W,h:H};
     return {x:minx,y:miny,w:maxx-minx+1,h:maxy-miny+1};
@@ -486,7 +486,7 @@ function startXform(p){ var cx=W/2+tDx, cy=H/2+tDy; txMode=hitHandle(p)||'move';
   txStart={scale:tScale, rot:tRot, cx:cx, cy:cy,
            dist:(Math.hypot(p.x-cx,p.y-cy)||1), ang:Math.atan2(p.y-cy,p.x-cx)};
   drawHandles(); }
-function moveXform(p){
+function moveXform(p){ if(!txStart) return;
   if(txMode==='scale'){ var d=Math.hypot(p.x-txStart.cx,p.y-txStart.cy);
     tScale=Math.max(0.1,Math.min(3, txStart.scale*(d/txStart.dist)));
     var ss=document.getElementById('scale'); if(ss){ ss.value=Math.round(tScale*100);
@@ -530,7 +530,7 @@ disp.addEventListener('mousedown',down); window.addEventListener('mousemove',mov
 window.addEventListener('mouseup',up);
 disp.addEventListener('touchstart',down,{passive:false});
 disp.addEventListener('touchmove',move,{passive:false}); window.addEventListener('touchend',up);
-function drawCursor(x,y){ if(tool==='xform'){ drawHandles(); return; } cur.clearRect(0,0,W,H);
+function drawCursor(x,y){ if(tool==='xform'){ if(!drawing) drawHandles(); return; } cur.clearRect(0,0,W,H);
   if(!hasBg||(tool!=='brush'&&tool!=='eraser'&&tool!=='clone'&&tool!=='smudge')) return;
   cur.save(); cur.lineWidth=Math.max(1,W/stage.clientWidth);
   cur.strokeStyle='rgba(0,0,0,.6)'; cur.beginPath(); cur.arc(x,y,size/2+1,0,Math.PI*2); cur.stroke();
@@ -548,7 +548,7 @@ window.addEventListener('mouseup',function(){ panning=false; });
 // -- toolbar wiring --
 function selTool(t){ tool=t; document.querySelectorAll('#tools button').forEach(function(b){ b.classList.toggle('on',b.dataset.tool===t); });
   if(t!=='xform' && cur) cur.clearRect(0,0,W,H); }
-document.querySelectorAll('#tools button').forEach(function(b){ b.addEventListener('click',function(){ selTool(b.dataset.tool); if(b.dataset.tool==='xform'){ ensureXform(); drawHandles(); } }); });
+document.querySelectorAll('#tools button').forEach(function(b){ b.addEventListener('click',function(){ selTool(b.dataset.tool); if(b.dataset.tool==='xform') ensureXform(); }); });
 document.getElementById('copylayer').addEventListener('click',function(){ copyRegion(false); });
 document.getElementById('copyflat').addEventListener('click',function(){ copyRegion(true); });
 document.getElementById('mcopy').addEventListener('click',function(){ copyRegion(true); });

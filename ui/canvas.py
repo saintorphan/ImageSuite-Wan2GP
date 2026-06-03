@@ -517,9 +517,9 @@ function flattenDown(){ if(active<=0) return; var top=drawLayers[active],below=d
   tSession=-1; tSnap=null; tBox=null; renderLayers(); compose(); pushExport(); }
 
 function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=p.x; sy=lastY=p.y;
-  var _al=activeLayer();
-  if(tool==='eraser'&&mode!=='mask') ensureSrc(_al);   // snapshot so the restore brush can bring erased pixels back
-  else if(mode!=='mask'&&(tool==='brush'||tool==='fill'||tool==='clone'||tool==='smudge'||tool==='rect'||tool==='ellipse'||tool==='line')) _al.src=null;  // new positive content on the layer → re-base
+  // erase/restore source bookkeeping (only touch the active layer for tools that need it)
+  if(tool==='eraser'&&mode!=='mask') ensureSrc(activeLayer());   // snapshot so the restore brush can bring erased pixels back
+  else if(mode!=='mask'&&(tool==='brush'||tool==='fill'||tool==='clone'||tool==='smudge'||tool==='rect'||tool==='ellipse'||tool==='line')) activeLayer().src=null;  // new positive content on the layer → re-base
   if(tool==='eye'){ pickColor(p.x,p.y); return; }
   if(tool==='wand'){ pushUndo(mbx,'mask'); magicWand(p.x,p.y); compose(); pushExport(); return; }
   if(tool==='xform'){ ensureXform(); drawing=true; startXform(p); return; }
@@ -528,7 +528,7 @@ function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=
     if(!cloneSrc) return; cloneOff={dx:cloneSrc.x-p.x,dy:cloneSrc.y-p.y};
     snapshot(); drawing=true; cloneStamp(p.x,p.y); compose(); return; }
   if(tool==='smudge'){ snapshot(); drawing=true; return; }
-  if(tool==='restore'){ var rl=activeLayer(); pushUndo(rl.ctx,'draw'); drawing=true; restoreStamp(p.x,p.y,p.x,p.y); compose(); return; }
+  if(tool==='restore'){ var rl=activeLayer(); if(rl&&rl.src){ pushUndo(rl.ctx,'draw'); drawing=true; restoreStamp(p.x,p.y,p.x,p.y); compose(); } return; }  // nothing erased → nothing to restore (no phantom undo)
   snapshot(); drawing=true;
   if(tool==='fill'){ floodFill(p.x,p.y); drawing=false; compose(); pushExport(); return; }
   if(tool==='brush'||tool==='eraser'){ stroke(p.x,p.y,p.x,p.y); compose(); } }
@@ -585,7 +585,7 @@ function updateHardnessUI(){ var h=document.getElementById('hard'),f=document.ge
   var off=(mode==='mask'); if(h){ h.disabled=off; h.style.opacity=off?0.4:1; }
   if(f){ f.style.opacity=off?0.5:1; f.title=off?'No effect in Mask mode (mask edges are always hard)':''; } }
 function setMode(m){ mode=m; document.querySelectorAll('#modeseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.mode===m); });
-  if(m==='mask' && tool==='xform') selTool('brush');   // can't transform the mask — leave the xform tool
+  if(m==='mask' && (tool==='xform'||tool==='restore')) selTool('brush');   // can't transform/restore the mask — leave those layer-only tools
   updateHardnessUI(); renderLayers(); }
 document.querySelectorAll('#modeseg button').forEach(function(b){ b.addEventListener('click',function(){ setMode(b.dataset.mode); }); });
 function markSwatch(){ document.querySelectorAll('#pal .sw').forEach(function(s){ s.classList.toggle('on',s.dataset.c.toLowerCase()===color.toLowerCase()); }); }

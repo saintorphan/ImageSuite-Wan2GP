@@ -205,11 +205,12 @@ def _touchup_block(c):
 
 
 def _results_block(c, mode):
-    """The shared results column: gallery, send-to row, save. Click a gallery item
-    to make it the selection (``picked``); it defaults to the first result at
+    """The shared results column: gallery, then (Txt2Img/Img2Img) the Generate/Abort
+    row + status directly under it, then the send-to row + Save As. Click a gallery
+    item to make it the selection (``picked``); it defaults to the first result at
     generation time. Send / Save As / enhancement passes all act on the selection.
-    The side-by-side tabs get a taller gallery so the Save As button lands level
-    with the Generate button in the left column (tune the heights to taste)."""
+    MultiCanvas builds its own 'Inpaint' button beside the canvas, so this block
+    skips the Generate row for it."""
     gallery_h = {"txt2img": 520, "img2img": 620}.get(mode, 460)
     # NOTE: no preview=True. It auto-opens/selects the first item the moment the
     # gallery is populated, which fires a select round-trip on every generation —
@@ -220,6 +221,13 @@ def _results_block(c, mode):
                               elem_classes=["imagesuite-gallery", "imagesuite-results"],
                               object_fit="contain")
     c["picked"] = gr.State(None)  # path of the selected (clicked) result
+    if mode != "inpaint":   # Generate/Abort + status sit directly under the gallery
+        with gr.Row(elem_classes="imagesuite-genrow"):
+            c["generate"] = gr.Button(
+                {"txt2img": "Generate", "img2img": "Reimagine (img2img)"}[mode],
+                variant="primary", scale=4)
+            c["abort"] = gr.Button("⛔ Abort", variant="stop", scale=1)
+        c["gen_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
     gr.Markdown("**Send selected result to →**")
     with gr.Row(elem_classes="imagesuite-sendrow"):
         # Txt2Img/Img2Img hide their own-page button; MultiCanvas keeps it as
@@ -280,15 +288,11 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
                             elem_classes="imagesuite-initthumb")
             else:
                 _prompt_block(c)
-            with gr.Row(elem_classes="imagesuite-genrow"):
-                c["generate"] = gr.Button(
-                    {"txt2img": "Generate", "img2img": "Reimagine (img2img)"}[mode],
-                    variant="primary", scale=4)
-                c["abort"] = gr.Button("⛔ Abort", variant="stop", scale=1)
-            c["gen_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
-            c.update(_enhance.build_enhance_sections(mode, sdxl_choices, lora_choices))  # under the settings
+            # Generate/Abort moved to the right column, directly under the results
+            # gallery (see _results_block). The left column is inputs only now.
+            c.update(_enhance.build_enhance_sections(mode, sdxl_choices, lora_choices))
 
-        # -- right: results --
+        # -- right: results + Generate/Abort --
         with gr.Column(scale=1):
             _results_block(c, mode)
     return c

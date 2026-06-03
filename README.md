@@ -47,7 +47,7 @@ can also bounce a result between the three pages, or **Save As**.)
 ### 🧑‍🎨 Face & body swap + post-processing
 A built-in enhancement suite you can run on any result: **ADetailer** face & body
 refine, **face swap**, **body swap** (transfers skin tone & texture, head
-preserved), and a **colour / style reference** pass.
+preserved), and a **color / style reference** pass.
 
 ### 🗂️ Prompt Library, presets & tagging
 - **Prompt Library** — save a full setup (prompt, negative, **every** generation
@@ -93,8 +93,15 @@ pip install -r plugins/ImageSuite-Wan2GP/requirements.txt
 Everything's lazily imported, so the plugin still loads and the native path still
 works even before you install them.
 
-Output folders, model directories, the low-VRAM model filter and on-demand model
-downloads all live in the **⚙ Settings** tab.
+### Getting models
+The **SDXL family** (SDXL / Pony / Illustrious) isn't bundled — point Image Suite at
+checkpoints + LoRAs you already have in **Settings → OrphanSuite**, or use the
+**Link existing folder** button to symlink an existing a1111 / Forge / drive folder
+in without copying. Native **Flux / Z-Image / Qwen** weights download like any other
+Wan2GP model. The helper weights for **face / body swap, ADetailer and BiRefNet**
+segmentation are fetched **on demand** from the models panel in **⚙ Settings** —
+nothing downloads until you ask. Output folders, model directories and the low-VRAM
+model filter live there too.
 
 ## Where this came from
 These features started life in my own AI frontend, **SupremeDiffusion** — but

@@ -1029,13 +1029,16 @@ class ImageSuite(WAN2GPPlugin):
 
     @staticmethod
     def _file_to_dataurl(path) -> str:
-        """Local image path → PNG data-URL, for pushing into the canvas frame."""
+        """Local image path → PNG data-URL, for pushing into the canvas frame / overlay
+        strip. Keep RGBA so a transparent overlay stays transparent — convert('RGB')
+        would drop the alpha and (since clear pixels are usually stored white) paint a
+        solid white background. Opaque images just get a full-alpha channel (harmless)."""
         import base64
         from PIL import Image
         with Image.open(path) as im:
             import io
             buf = io.BytesIO()
-            im.convert("RGB").save(buf, format="PNG")
+            im.convert("RGBA").save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
     # -- wiring -------------------------------------------------------------
@@ -1429,23 +1432,9 @@ class ImageSuite(WAN2GPPlugin):
                     ups.append(gr.update())
             return ups
 
-        # Restore each tab's last result images (persisted on generation) so the
-        # galleries survive a restart, like the settings above.
-        def _restore_results():
-            import os
-            outs = []
-            for mode in pages:
-                kept = [p for p in paths.get_results(mode) if os.path.exists(p)]
-                if kept:
-                    try:
-                        g, picked, save = self._gallery_result(kept)
-                        outs += [g, picked, save]
-                        continue
-                    except Exception:
-                        traceback.print_exc()
-                outs += [gr.update(), gr.update(), gr.update()]
-            return outs
-
+        # (Result galleries are restored at BUILD time as each gallery's initial value
+        # — see page._persisted_results / _results_block — which is more reliable than a
+        # load event. Only the settings restore needs root.load.)
         try:
             from gradio.context import Context
             root = Context.root_block
@@ -1453,10 +1442,6 @@ class ImageSuite(WAN2GPPlugin):
                        + [comp for _, comp in res_preset_extra])
             if root is not None and comps:
                 root.load(_restore, inputs=None, outputs=outputs)
-            if root is not None:
-                res_out = [pages[m][k] for m in pages
-                           for k in ("gallery", "picked", "save")]
-                root.load(_restore_results, inputs=None, outputs=res_out)
         except Exception:
             traceback.print_exc()
 

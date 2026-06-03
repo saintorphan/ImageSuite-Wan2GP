@@ -204,6 +204,27 @@ def _touchup_block(c):
             c["out_abort"] = gr.Button("⛔", variant="stop", scale=1)
 
 
+def _persisted_results(mode):
+    """A tab's persisted result images (as PIL) + the first path, so the gallery comes
+    back populated after a restart by being the gallery's INITIAL value (no load-event
+    needed). Best-effort: returns (None, None) on any problem so a build never breaks."""
+    try:
+        import os
+        from PIL import Image
+        from ..core import paths as _paths
+        kept = [p for p in _paths.get_results(mode) if os.path.exists(p)]
+        imgs = []
+        for p in kept:
+            try:
+                with Image.open(p) as im:
+                    imgs.append(im.copy())
+            except Exception:
+                pass
+        return (imgs or None), (kept[0] if kept else None)
+    except Exception:
+        return None, None
+
+
 def _results_block(c, mode):
     """The shared results column: gallery, then (Txt2Img/Img2Img) the Generate/Abort
     row + status directly under it, then the send-to row + Save As. Click a gallery
@@ -212,15 +233,19 @@ def _results_block(c, mode):
     MultiCanvas builds its own 'Inpaint' button beside the canvas, so this block
     skips the Generate row for it."""
     gallery_h = {"txt2img": 520, "img2img": 620}.get(mode, 460)
+    # Restore the tab's last results as the gallery's INITIAL value (survives a restart
+    # without depending on a load event — see _persisted_results).
+    _init_imgs, _init_path = _persisted_results(mode)
     # NOTE: no preview=True. It auto-opens/selects the first item the moment the
     # gallery is populated, which fires a select round-trip on every generation —
     # and Gradio then runs check_all_files_in_cache on the native backend's output
     # path (outside the cache dir) → "File … is not in the cache folder". The
     # working sibling plugin (CharLab) uses a plain grid for the same reason.
     c["gallery"] = gr.Gallery(label="Results", columns=2, height=gallery_h,
+                              value=_init_imgs,
                               elem_classes=["imagesuite-gallery", "imagesuite-results"],
                               object_fit="contain")
-    c["picked"] = gr.State(None)  # path of the selected (clicked) result
+    c["picked"] = gr.State(_init_path)  # path of the selected (clicked) result
     if mode != "inpaint":   # Generate/Abort + status sit directly under the gallery
         with gr.Row(elem_classes="imagesuite-genrow"):
             c["generate"] = gr.Button(
@@ -237,7 +262,8 @@ def _results_block(c, mode):
         c["to_inp"] = gr.Button("↻ Back to canvas" if mode == "inpaint"
                                 else "MultiCanvas")
         c["to_i2v"] = gr.Button("Img2Vid")
-    c["save"] = gr.DownloadButton("Save As…", elem_classes="imagesuite-savebtn")
+    c["save"] = gr.DownloadButton("Save As…", value=_init_path,
+                                  elem_classes="imagesuite-savebtn")
 
 
 def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):

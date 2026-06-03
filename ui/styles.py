@@ -13,6 +13,34 @@ button.imagesuite-tabbtn {
     box-shadow: 0 0 7px rgba(212,175,55,0.55) !important;
 }
 #imagesuite-root .imagesuite-gallery { min-height: 320px; }
+/* Galleries: scroll vertically to show EVERY image while staying a grid.
+   Gradio gives the gallery .block a fixed inline height + overflow:hidden, and its
+   .grid-wrap already has overflow-y:scroll — but the percentage-height chain is
+   broken: the intermediate .gallery-container div ships with NO css (height:auto),
+   so .grid-wrap's height:100% has no basis, collapses to content height, and the
+   fixed .block clips the overflow with no scrollbar. Repairing .gallery-container's
+   height lets the block's height propagate so .grid-wrap fills it and scrolls.
+   !important beats Gradio's .svelte-* scoped rules (which use none) + the inline
+   grid style. (Verified against Gradio 5.29 gallery DOM: .block > .gallery-container
+   > .grid-wrap > .grid-container; label is an absolute overlay, not in flow.) */
+#imagesuite-root .imagesuite-gallery .gallery-container {
+    height: 100% !important; min-height: 0 !important;
+}
+#imagesuite-root .imagesuite-gallery .grid-wrap {
+    height: 100% !important; max-height: 100% !important; min-height: 0 !important;
+    overflow-y: auto !important; overflow-x: hidden !important;
+}
+#imagesuite-root .imagesuite-gallery .grid-container {
+    height: auto !important; min-height: 0 !important;
+}
+/* Results galleries only (txt2img / img2img / MultiCanvas): keep result thumbnails
+   legible — pin a usable min row height so overflow ADDS rows (and the wrapper
+   scrolls) instead of the default minmax(100px,1fr) cramming them. The shared
+   overlays picker (.imagesuite-gallery, 6 columns) keeps its denser default rows. */
+#imagesuite-root .imagesuite-results .grid-container {
+    grid-auto-rows: minmax(180px, auto) !important;
+    grid-template-rows: none !important;
+}
 #imagesuite-root .imagesuite-help { font-size: 12px; opacity: 0.8; }
 /* SDXL load / working notice under Generate — accent so it's noticed */
 #imagesuite-root .imagesuite-genstatus { font-size: 13px; color: #e83e8c;

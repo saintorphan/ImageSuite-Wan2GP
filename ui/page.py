@@ -191,7 +191,8 @@ def _results_block(c, mode):
     # path (outside the cache dir) → "File … is not in the cache folder". The
     # working sibling plugin (CharLab) uses a plain grid for the same reason.
     c["gallery"] = gr.Gallery(label="Results", columns=2, height=gallery_h,
-                              elem_classes="imagesuite-gallery", object_fit="contain")
+                              elem_classes=["imagesuite-gallery", "imagesuite-results"],
+                              object_fit="contain")
     c["picked"] = gr.State(None)  # path of the selected (clicked) result
     gr.Markdown("**Send selected result to →**")
     with gr.Row(elem_classes="imagesuite-sendrow"):

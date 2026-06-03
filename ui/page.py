@@ -225,26 +225,30 @@ def _persisted_results(mode):
         return None, None
 
 
-def _results_block(c, mode):
-    """The shared results column: gallery, then (Txt2Img/Img2Img) the Generate/Abort
-    row + status directly under it, then the send-to row + Save As. Click a gallery
-    item to make it the selection (``picked``); it defaults to the first result at
-    generation time. Send / Save As / enhancement passes all act on the selection.
-    MultiCanvas builds its own 'Inpaint' button beside the canvas, so this block
-    skips the Generate row for it."""
+def _results_gallery(c, mode):
+    """Just the results gallery. Split out so MultiCanvas can place it in its LEFT
+    column (between Overlays and Enhancement) while the send/save row stays on the
+    right. NOTE: no preview=True — it auto-selects the first item on populate, firing a
+    select round-trip every generation and tripping Gradio's cache check on the native
+    backend's out-of-cache output path. Restore the tab's last results as the INITIAL
+    value (survives a restart without a load event — see _persisted_results)."""
     gallery_h = {"txt2img": 520, "img2img": 620}.get(mode, 460)
-    # Restore the tab's last results as the gallery's INITIAL value (survives a restart
-    # without depending on a load event — see _persisted_results).
-    _init_imgs, _init_path = _persisted_results(mode)
-    # NOTE: no preview=True. It auto-opens/selects the first item the moment the
-    # gallery is populated, which fires a select round-trip on every generation —
-    # and Gradio then runs check_all_files_in_cache on the native backend's output
-    # path (outside the cache dir) → "File … is not in the cache folder". The
-    # working sibling plugin (CharLab) uses a plain grid for the same reason.
+    _init_imgs, _ = _persisted_results(mode)
     c["gallery"] = gr.Gallery(label="Results", columns=2, height=gallery_h,
                               value=_init_imgs,
                               elem_classes=["imagesuite-gallery", "imagesuite-results"],
                               object_fit="contain")
+
+
+def _results_block(c, mode, include_gallery=True):
+    """The shared results column: the gallery (unless already placed elsewhere —
+    MultiCanvas puts it in the left column), then (Txt2Img/Img2Img) the Generate/Abort
+    row + status, then the send-to row + Save As. Click a gallery item to make it the
+    selection (``picked``). MultiCanvas builds its own 'Inpaint' button beside the
+    canvas, so this block skips the Generate row for it."""
+    _, _init_path = _persisted_results(mode)
+    if include_gallery:
+        _results_gallery(c, mode)
     c["picked"] = gr.State(_init_path)  # path of the selected (clicked) result
     if mode != "inpaint":   # Generate/Abort + status sit directly under the gallery
         with gr.Row(elem_classes="imagesuite-genrow"):
@@ -282,6 +286,7 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
                     "model follows your paint.", elem_classes="imagesuite-help")
                 c.update(_canvas.build_canvas("inpaint"))
                 _overlays_strip_block(c)                           # folder picker
+                _results_block(c, mode)                            # results between overlays & enhance
                 _touchup_block(c)                                  # under the canvas
                 c.update(_enhance.build_enhance_sections(mode, sdxl_choices, lora_choices))  # under the canvas
             with gr.Column(scale=2):
@@ -292,7 +297,6 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
                     c["generate"] = gr.Button("Inpaint", variant="primary", scale=4)
                     c["abort"] = gr.Button("⛔ Abort", variant="stop", scale=1)
                 c["gen_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
-                _results_block(c, mode)
         return c
 
     with gr.Row():

@@ -719,25 +719,43 @@ class ImageSuite(WAN2GPPlugin):
 
         with gr.Column(elem_id="imagesuite-root"):
             gr.HTML(logo.banner_html())
-            # Project bar — centered name + far-right CRUD (wired in _wire_projects).
+            # Project bar — centered name + Save / Projects buttons. The list lives in
+            # POPUPS (modeled on Replicant: gr.Group(visible=False) toggled by clicks),
+            # NOT a dropdown on the main screen. Wired in _wire_projects.
             _active = paths.get_active_project()
             with gr.Row(elem_id="imagesuite-projbar"):
                 self._proj_name = gr.Markdown(self._projname_md(_active),
                                               elem_id="imagesuite-projname")
-                self._proj_pick = gr.Dropdown(
-                    choices=projects.list_projects(), value=(_active or None),
-                    show_label=False, container=False, scale=0, min_width=180,
-                    elem_id="imagesuite-projpick")
                 self._proj_save = gr.Button("💾 Save", scale=0, size="sm", variant="primary")
-                self._proj_load = gr.Button("📂 Load", scale=0, size="sm")
-                self._proj_rename = gr.Button("✏ Rename", scale=0, size="sm")
-                self._proj_delete = gr.Button("🗑 Delete", scale=0, size="sm", variant="stop")
-            # Hidden relays: active project name (read by Save's JS) + the name the
-            # Save/Rename JS prompts write back for the Python handler to consume.
+                self._proj_open = gr.Button("📂 Projects…", scale=0, size="sm")
             self._proj_active = gr.Textbox(_active, visible=False,
                                            elem_id="imagesuite-proj-active")
-            self._proj_namein = gr.Textbox(visible=False, elem_id="imagesuite-proj-namein")
             self._proj_status = gr.Markdown("", elem_classes="imagesuite-help")
+            # Save-as popup (used for a new/unnamed project).
+            with gr.Group(visible=False, elem_classes="imagesuite-modal") as self._proj_savepop:
+                gr.Markdown("### 💾 Save project as")
+                self._proj_saveas = gr.Textbox(label="Project name",
+                                               elem_id="imagesuite-proj-saveas")
+                with gr.Row():
+                    self._proj_saveas_ok = gr.Button("Save", variant="primary")
+                    self._proj_saveas_cancel = gr.Button("Cancel")
+            # Projects popup — the list + Load / Rename / Delete live here (off-screen).
+            with gr.Group(visible=False, elem_classes="imagesuite-modal") as self._proj_managepop:
+                gr.Markdown("### 📂 Projects")
+                self._proj_pick = gr.Dropdown(label="Project", elem_id="imagesuite-projpick")
+                with gr.Row():
+                    self._proj_load = gr.Button("📂 Load", variant="primary")
+                    self._proj_rename = gr.Button("✏ Rename")
+                    self._proj_delete = gr.Button("🗑 Delete", variant="stop")
+                    self._proj_manage_close = gr.Button("Close")
+                with gr.Row(visible=False) as self._proj_rename_row:
+                    self._proj_rename_to = gr.Textbox(label="New name", scale=3)
+                    self._proj_rename_ok = gr.Button("Confirm", scale=1)
+                with gr.Row(visible=False) as self._proj_del_row:
+                    self._proj_del_ok = gr.Button("🗑 Yes, delete permanently",
+                                                  variant="stop")
+                    self._proj_del_no = gr.Button("Cancel")
+                self._proj_manage_status = gr.Markdown("", elem_classes="imagesuite-help")
             # Shared app-wide right-click menu (idempotent engine + our items) and
             # the hidden relay it writes into.
             gr.HTML(contextmenu.imagesuite_ctx_html(), elem_classes="imagesuite-hidden")
@@ -1078,13 +1096,14 @@ class ImageSuite(WAN2GPPlugin):
         return f"📁 **{name}**" if name else "Unsaved Project"
 
     def _wire_projects(self, ui):
-        """Header CRUD. A project bundles, for the whole workspace: every JSON-able
-        param per tab (same capture as the Prompt Library), every filepath image
-        (img2img init + face/body/colour refs), each tab's currently-displayed
-        results, and the full MultiCanvas layer stack (base + layers + mask)."""
+        """Header CRUD via popups (Replicant-style gr.Group toggles — no on-screen
+        dropdown). A project bundles, for the whole workspace: every JSON-able param per
+        tab (same capture as the Prompt Library), every filepath image (img2img init +
+        face/body/colour refs), each tab's currently-displayed results, and the full
+        MultiCanvas layer stack. Only the Save commit needs a js= (to flush the live
+        canvas + return inputs explicitly, per the Gradio-5.29 payload behaviour);
+        Load/Rename/Delete read the in-popup dropdown as normal inputs, immune to it."""
         pages = ui["pages"]
-
-        # Fixed-order component sets (parallel idx lists let us re-key the *vals).
         param_comps, param_idx = [], []
         for m, c in pages.items():
             for k, comp in self._pl_items(c):
@@ -1100,15 +1119,34 @@ class ImageSuite(WAN2GPPlugin):
         inp = pages.get("inpaint", {})
         canvas_state = inp.get("state")          # filled by __is_inpaint_pushstate
         canvas_bridge = inp.get("state_bridge")  # rebuilds the canvas on load
-
         pick = self._proj_pick
 
-        # ---- Save: JS flushes the canvas state + resolves the name, then Python
-        #      writes everything. Update-in-place when a project is open. ----
-        def _save(name_in, active_in, cstate, *vals):
-            name = (name_in or active_in or "").strip()
+        def _names():
+            return projects.list_projects()
+
+        # ---- open / close popups ----
+        # Save → name popup (prefilled with the open project's name so it re-saves).
+        self._proj_save.click(
+            lambda a: (gr.update(visible=True), gr.update(value=a or "")),
+            inputs=[self._proj_active],
+            outputs=[self._proj_savepop, self._proj_saveas])
+        self._proj_saveas_cancel.click(lambda: gr.update(visible=False),
+                                       outputs=[self._proj_savepop])
+        # Projects → manage popup (refresh the list; reset the sub-rows + status).
+        self._proj_open.click(
+            lambda: (gr.update(visible=True), gr.update(choices=_names()),
+                     gr.update(visible=False), gr.update(visible=False), ""),
+            outputs=[self._proj_managepop, pick, self._proj_rename_row,
+                     self._proj_del_row, self._proj_manage_status])
+        self._proj_manage_close.click(lambda: gr.update(visible=False),
+                                      outputs=[self._proj_managepop])
+
+        # ---- Save commit (the only js= handler: flush canvas + explicit return) ----
+        def _save(name, cstate, *vals):
+            name = (name or "").strip()
             if not name:
-                return gr.update(), gr.update(), gr.update(), "Enter a project name."
+                return (gr.update(), gr.update(), gr.update(visible=True),
+                        "Enter a project name.")
             pvals, ivals = vals[:len(param_comps)], vals[len(param_comps):]
             tabs = {}
             for (m, k), v in zip(param_idx, pvals):
@@ -1123,31 +1161,27 @@ class ImageSuite(WAN2GPPlugin):
                                               refs=refs, canvas_state=(cstate or None))
             except Exception as e:
                 traceback.print_exc()
-                return gr.update(), gr.update(), gr.update(), f"⚠️ Save failed: {e}"
+                return (gr.update(), gr.update(), gr.update(visible=True),
+                        f"⚠️ Save failed: {e}")
             paths.set_active_project(saved)
-            return (self._projname_md(saved), saved,
-                    gr.update(choices=projects.list_projects(), value=saved),
+            return (self._projname_md(saved), saved, gr.update(visible=False),
                     f"💾 Saved “{saved}”.")
-        self._proj_save.click(
-            _save,
-            inputs=[self._proj_namein, self._proj_active, canvas_state]
-                   + param_comps + img_comps,
-            outputs=[self._proj_name, self._proj_active, pick, self._proj_status],
+        self._proj_saveas_ok.click(
+            _save, inputs=[self._proj_saveas, canvas_state] + param_comps + img_comps,
+            outputs=[self._proj_name, self._proj_active, self._proj_savepop,
+                     self._proj_status],
             # Gradio 5.29: a js= with a backend fn REPLACES the input payload with its
-            # return value (undefined → []), so we MUST return every input explicitly.
-            # rest-spread passes the params/images through untouched; we substitute the
-            # resolved name and the FRESH canvas state (read after pushstate). Empty
-            # name on cancel → Python no-ops (no throw, which is unreliable here).
-            js="(name_in, active, cstate, ...rest) => {"
+            # return value, so we return every input explicitly (rest-spread passes the
+            # params/images through; we substitute the FRESH canvas state after pushstate).
+            js="(name, cstate, ...rest) => {"
                " var st=cstate;"
                " try{ if(window.__is_inpaint_pushstate){ window.__is_inpaint_pushstate();"
                " var el=document.querySelector('#imagesuite-inpaint-state textarea')"
                "||document.querySelector('#imagesuite-inpaint-state input');"
                " if(el) st=el.value; } }catch(e){}"
-               " var name=active||''; if(!name){ name=prompt('Save project as:')||''; }"
-               " return [name, active, st].concat(rest); }")
+               " return [name, st].concat(rest); }")
 
-        # ---- Load ----
+        # ---- Load (reads the in-popup dropdown as a NORMAL input — no js=) ----
         def _load(sel):
             data = projects.load_project(sel) if sel else None
             if not data:
@@ -1155,7 +1189,7 @@ class ImageSuite(WAN2GPPlugin):
                         + [gr.update() for _ in img_comps]
                         + [gr.update() for _ in gal_out]
                         + [gr.update(), gr.update(), gr.update(),
-                           "Pick a project to load."])
+                           "Pick a project to load.", gr.update()])
             tabs, refs = data["tabs"], data["refs"]
             op = []
             for (m, k) in param_idx:
@@ -1187,51 +1221,57 @@ class ImageSuite(WAN2GPPlugin):
             paths.set_active_project(data["name"])
             return (op + oi + gals
                     + [cb, self._projname_md(data["name"]), data["name"],
-                       f"📂 Loaded “{data['name']}”."])
+                       f"📂 Loaded “{data['name']}”.", gr.update(visible=False)])
         self._proj_load.click(
             _load, inputs=[pick],
             outputs=(param_comps + img_comps + gal_out
                      + [canvas_bridge, self._proj_name, self._proj_active,
-                        self._proj_status]))
+                        self._proj_status, self._proj_managepop]))
 
-        # ---- Rename (JS prompts; reuses the namein relay) ----
+        # ---- Rename (reveal a name row inside the popup, then confirm — no js=) ----
+        self._proj_rename.click(lambda: gr.update(visible=True),
+                                outputs=[self._proj_rename_row])
         def _rename(sel, new):
             new = (new or "").strip()
             if not sel or not new:
-                return gr.update(), gr.update(), gr.update(), "Pick a project and a new name."
+                return (gr.update(), gr.update(), gr.update(), gr.update(),
+                        "Pick a project and enter a new name.")
             res = projects.rename_project(sel, new)
             if not res:
-                return (gr.update(), gr.update(), gr.update(),
-                        f"⚠️ Couldn't rename — “{projects.sanitize(new)}” may already exist.")
-            active = paths.get_active_project()
-            if active == projects.sanitize(sel):
-                paths.set_active_project(res); active = res
-            return (gr.update(choices=projects.list_projects(), value=res),
-                    self._projname_md(active), active, f"✏ Renamed to “{res}”.")
-        self._proj_rename.click(
-            _rename, inputs=[pick, self._proj_namein],
-            outputs=[pick, self._proj_name, self._proj_active, self._proj_status],
-            # explicit return (see Save); empty new-name on cancel → Python no-ops.
-            js="(sel, name_in) => { var n=prompt('Rename the selected project to:')||'';"
-               " return [sel, n]; }")
+                return (gr.update(), gr.update(), gr.update(), gr.update(),
+                        f"⚠️ “{projects.sanitize(new)}” already exists.")
+            name_up, active_up = gr.update(), gr.update()
+            if paths.get_active_project() == projects.sanitize(sel):
+                paths.set_active_project(res)
+                name_up, active_up = self._projname_md(res), res
+            return (gr.update(choices=_names(), value=res), gr.update(visible=False),
+                    name_up, active_up, f"✏ Renamed to “{res}”.")
+        self._proj_rename_ok.click(
+            _rename, inputs=[pick, self._proj_rename_to],
+            outputs=[pick, self._proj_rename_row, self._proj_name,
+                     self._proj_active, self._proj_manage_status])
 
-        # ---- Delete (JS confirm) ----
+        # ---- Delete (reveal a confirm row, then delete — no js=) ----
+        self._proj_delete.click(lambda: gr.update(visible=True),
+                                outputs=[self._proj_del_row])
+        self._proj_del_no.click(lambda: gr.update(visible=False),
+                                outputs=[self._proj_del_row])
         def _delete(sel):
             if not sel:
-                return gr.update(), gr.update(), gr.update(), "Pick a project to delete."
+                return (gr.update(), gr.update(), gr.update(), gr.update(),
+                        "Pick a project to delete.")
             ok = projects.delete_project(sel)
-            active = paths.get_active_project()
-            if ok and active == projects.sanitize(sel):
-                paths.set_active_project(""); active = ""
-            return (gr.update(choices=projects.list_projects(), value=None),
-                    self._projname_md(active), active,
-                    f"🗑 Deleted “{sel}”." if ok else f"⚠️ Couldn't delete “{sel}”.")
-        self._proj_delete.click(
+            name_up, active_up = gr.update(), gr.update()
+            if ok and paths.get_active_project() == projects.sanitize(sel):
+                paths.set_active_project("")
+                name_up, active_up = self._projname_md(""), ""
+            return (gr.update(choices=_names(), value=None), gr.update(visible=False),
+                    name_up, active_up,
+                    f"🗑 Deleted “{sel}”." if ok else "⚠️ Couldn't delete.")
+        self._proj_del_ok.click(
             _delete, inputs=[pick],
-            outputs=[pick, self._proj_name, self._proj_active, self._proj_status],
-            # explicit return (see Save); cancel returns '' → Python no-ops (no throw).
-            js="(sel) => { if(!confirm('Delete the selected project permanently? "
-               "This cannot be undone.')) return ['']; return [sel]; }")
+            outputs=[pick, self._proj_del_row, self._proj_name,
+                     self._proj_active, self._proj_manage_status])
 
     # -- Prompt Library (shared across all three tabs) ----------------------
     # Every JSON-able scalar input is saved/loaded by inspecting the page's

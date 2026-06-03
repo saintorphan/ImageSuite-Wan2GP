@@ -102,6 +102,13 @@ button.imagesuite-tabbtn {
     font-style: italic; color: #d4af37; }
 #imagesuite-projbar #imagesuite-projname .imagesuite-unsaved p { color: #8a8a93; }
 #imagesuite-projbar button { min-width: 0; }
+/* Project popups (Save-as / manage) — centered floating panels (Replicant-style
+   gr.Group toggles), not a main-screen dropdown. */
+.imagesuite-modal { position: fixed; left: 50%; top: 14%; transform: translateX(-50%);
+    z-index: 10001; width: min(480px, 92vw); background: #1b1b22;
+    border: 1px solid #3a3a47; border-radius: 12px; padding: 12px 16px 14px;
+    box-shadow: 0 18px 60px rgba(0,0,0,.65); }
+.imagesuite-modal h3, .imagesuite-modal h2 { margin: 2px 0 8px; }
 """
 
 # Page-level JS injected once (Gradio strips <script>, so we use the <img onerror>

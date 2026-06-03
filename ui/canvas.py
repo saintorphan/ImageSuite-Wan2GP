@@ -70,7 +70,7 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
   white-space:nowrap;cursor:grab}
 #layers .lyr.active{border-color:#e83e8c;box-shadow:0 0 0 1px #e83e8c}
 #layers .lyr.base{cursor:default;opacity:.85}
-#layers .lyr.mask{cursor:default;border-color:#ff3344}
+#layers .lyr.mask{cursor:pointer;border-color:#ff3344}
 #layers .lyr .eye{cursor:pointer;opacity:.9}
 #layers .lyr .eye.off{opacity:.3}
 #layers .lyr .del{cursor:pointer;color:#ff6b6b;font-weight:700}
@@ -149,6 +149,7 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
         <div class="row3" id="tools">
           <button data-tool="brush" class="on" title="Brush (B)">&#128396;</button>
           <button data-tool="eraser" title="Eraser (E)">&#9003;</button>
+          <button data-tool="restore" title="Restore brush — paint back erased parts of the active layer (R)">&#8634;</button>
           <button data-tool="fill" title="Fill bucket (G)">&#129529;</button>
           <button data-tool="eye" title="Eyedropper — pick a colour (I)">&#128167;</button>
           <button data-tool="wand" title="Magic wand — flood-select a colour into the mask (W)">&#129668;</button>
@@ -213,6 +214,7 @@ var bg=document.getElementById('bg'),maskv=document.getElementById('maskv'),
 var bgx=bg.getContext('2d'),mx=maskv.getContext('2d'),
     dx=disp.getContext('2d'),cur=cursor.getContext('2d');
 var maskBuf=document.createElement('canvas'),mbx=maskBuf.getContext('2d');
+var restoreBuf=document.createElement('canvas'),rbx=restoreBuf.getContext('2d');  // scratch for the restore brush
 // stacking of draw layers between base (bottom) and mask (top)
 var drawLayers=[],active=0,layerSeq=0;
 
@@ -227,7 +229,7 @@ var baseScale=1,viewScale=1;
 function newLayer(name){
   var cv=document.createElement('canvas'); cv.width=W; cv.height=H;
   return {id:++layerSeq, name:name||('Layer '+(drawLayers.length+1)), cv:cv,
-          ctx:cv.getContext('2d'), visible:true, opacity:1};
+          ctx:cv.getContext('2d'), visible:true, opacity:1, src:null};
 }
 function activeLayer(){
   if(!drawLayers.length){ drawLayers.push(newLayer('Layer 1')); active=0; renderLayers(); }
@@ -243,7 +245,7 @@ function paintTargets(){
 
 function setSize(w,h){
   W=w; H=h;
-  [bg,maskv,disp,cursor,maskBuf].forEach(function(c){c.width=w;c.height=h;});
+  [bg,maskv,disp,cursor,maskBuf,restoreBuf].forEach(function(c){c.width=w;c.height=h;});
   drawLayers.forEach(function(l){ l.cv.width=w; l.cv.height=h; });
   fitView();
 }
@@ -315,6 +317,19 @@ function strokeOn(ctx,isMask,x0,y0,x1,y1){
   ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke(); ctx.restore();
 }
 function stroke(x0,y0,x1,y1){ paintTargets().forEach(function(t){ strokeOn(t.ctx,t.isMask,x0,y0,x1,y1); }); }
+// --- non-destructive erase/restore. Each layer keeps a pristine 'src' snapshot,
+//     captured lazily just before the first erase stroke (and invalidated whenever
+//     the layer gets new positive content — paint/transform/flip/flatten/clear — so
+//     it re-bases). The eraser cuts holes in the layer; the restore brush paints the
+//     matching src pixels back where you brush. ---
+function snapSrc(l){ if(!l) return; if(!l.src) l.src=document.createElement('canvas');
+  l.src.width=W; l.src.height=H; var c=l.src.getContext('2d'); c.clearRect(0,0,W,H); c.drawImage(l.cv,0,0); }
+function ensureSrc(l){ if(l && !l.src) snapSrc(l); }
+function restoreStamp(x0,y0,x1,y1){ var l=activeLayer(); if(!l||!l.src) return;
+  rbx.clearRect(0,0,W,H); rbx.save(); rbx.lineCap='round'; rbx.lineJoin='round';
+  rbx.lineWidth=size; rbx.strokeStyle='#fff'; rbx.beginPath(); rbx.moveTo(x0,y0); rbx.lineTo(x1,y1); rbx.stroke(); rbx.restore();
+  rbx.globalCompositeOperation='source-in'; rbx.drawImage(l.src,0,0); rbx.globalCompositeOperation='source-over';
+  l.ctx.drawImage(restoreBuf,0,0); }
 function shapeOn(ctx,isMask,x0,y0,x1,y1,preview){
   ctx.save();
   if(isMask && !preview){ ctx.strokeStyle=ctx.fillStyle='#ffffff'; }
@@ -406,7 +421,7 @@ function shrinkMask(){ pushUndo(mbx,'mask');
   mbx.fillStyle='#fff'; mbx.fillRect(0,0,W,H); mbx.globalCompositeOperation='destination-out';
   mbx.drawImage(t,0,0); mbx.restore(); compose(); pushExport(); }
 // -- flip the active layer --
-function flipLayer(horiz){ if(!hasBg) return; var l=activeLayer(); pushUndo(l.ctx,'draw');
+function flipLayer(horiz){ if(!hasBg) return; var l=activeLayer(); pushUndo(l.ctx,'draw'); l.src=null;
   var tmp=document.createElement('canvas'); tmp.width=W;tmp.height=H; tmp.getContext('2d').drawImage(l.cv,0,0);
   l.ctx.save(); l.ctx.clearRect(0,0,W,H); l.ctx.translate(horiz?W:0,horiz?0:H);
   l.ctx.scale(horiz?-1:1,horiz?1:-1); l.ctx.drawImage(tmp,0,0); l.ctx.restore(); compose(); pushExport(); }
@@ -437,7 +452,7 @@ function pasteClip(){ if(!clipboard) return; var l=newLayer('Pasted');
   selTool('xform'); ensureXform(); compose(); pushExport(); }
 function beginTransform(){ var l=activeLayer(); pushUndo(l.ctx,'draw');
   tSnap=document.createElement('canvas'); tSnap.width=W;tSnap.height=H; tSnap.getContext('2d').drawImage(l.cv,0,0);
-  tBox=contentBBox(tSnap); tSession=l.id; tDx=0;tDy=0;tScale=1;tRot=0;
+  tBox=contentBBox(tSnap); l.src=null; tSession=l.id; tDx=0;tDy=0;tScale=1;tRot=0;
   var s=document.getElementById('scale'),r=document.getElementById('rot');
   if(s){s.value=100;document.getElementById('scv').textContent=100;}
   if(r){r.value=0;document.getElementById('rotv').textContent=0;} }
@@ -498,10 +513,13 @@ function moveXform(p){ if(!txStart) return;
   else { tDx+=p.x-lastX; tDy+=p.y-lastY; lastX=p.x; lastY=p.y; }
   applyTransform(); }
 function flattenDown(){ if(active<=0) return; var top=drawLayers[active],below=drawLayers[active-1];
-  pushUndo(below.ctx,'draw'); below.ctx.drawImage(top.cv,0,0); drawLayers.splice(active,1); active=active-1;
+  pushUndo(below.ctx,'draw'); below.ctx.drawImage(top.cv,0,0); below.src=null; drawLayers.splice(active,1); active=active-1;
   tSession=-1; tSnap=null; tBox=null; renderLayers(); compose(); pushExport(); }
 
 function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=p.x; sy=lastY=p.y;
+  var _al=activeLayer();
+  if(tool==='eraser'&&mode!=='mask') ensureSrc(_al);   // snapshot so the restore brush can bring erased pixels back
+  else if(mode!=='mask'&&(tool==='brush'||tool==='fill'||tool==='clone'||tool==='smudge'||tool==='rect'||tool==='ellipse'||tool==='line')) _al.src=null;  // new positive content on the layer → re-base
   if(tool==='eye'){ pickColor(p.x,p.y); return; }
   if(tool==='wand'){ pushUndo(mbx,'mask'); magicWand(p.x,p.y); compose(); pushExport(); return; }
   if(tool==='xform'){ ensureXform(); drawing=true; startXform(p); return; }
@@ -510,6 +528,7 @@ function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=
     if(!cloneSrc) return; cloneOff={dx:cloneSrc.x-p.x,dy:cloneSrc.y-p.y};
     snapshot(); drawing=true; cloneStamp(p.x,p.y); compose(); return; }
   if(tool==='smudge'){ snapshot(); drawing=true; return; }
+  if(tool==='restore'){ var rl=activeLayer(); pushUndo(rl.ctx,'draw'); drawing=true; restoreStamp(p.x,p.y,p.x,p.y); compose(); return; }
   snapshot(); drawing=true;
   if(tool==='fill'){ floodFill(p.x,p.y); drawing=false; compose(); pushExport(); return; }
   if(tool==='brush'||tool==='eraser'){ stroke(p.x,p.y,p.x,p.y); compose(); } }
@@ -519,6 +538,7 @@ function move(e){ if(!drawing) return; e.preventDefault(); var p=pos(e);
   else if(tool==='clone'){ cloneStamp(p.x,p.y); lastX=p.x;lastY=p.y; compose(); }
   else if(tool==='smudge'){ smudgeStep(lastX,lastY,p.x,p.y); lastX=p.x;lastY=p.y; compose(); }
   else if(tool==='brush'||tool==='eraser'){ stroke(lastX,lastY,p.x,p.y); lastX=p.x;lastY=p.y; compose(); }
+  else if(tool==='restore'){ restoreStamp(lastX,lastY,p.x,p.y); lastX=p.x;lastY=p.y; compose(); }
   else if(tool==='rect'||tool==='ellipse'||tool==='line'){ compose(); shapeOn(dx,false,sx,sy,p.x,p.y,true); } }
 function up(e){ if(!drawing) return; drawing=false; var p=pos(e);
   if(tool==='lasso'){ fillLasso(); compose(); }
@@ -531,7 +551,7 @@ window.addEventListener('mouseup',up);
 disp.addEventListener('touchstart',down,{passive:false});
 disp.addEventListener('touchmove',move,{passive:false}); window.addEventListener('touchend',up);
 function drawCursor(x,y){ if(tool==='xform'){ if(!drawing) drawHandles(); return; } cur.clearRect(0,0,W,H);
-  if(!hasBg||(tool!=='brush'&&tool!=='eraser'&&tool!=='clone'&&tool!=='smudge')) return;
+  if(!hasBg||(tool!=='brush'&&tool!=='eraser'&&tool!=='clone'&&tool!=='smudge'&&tool!=='restore')) return;
   cur.save(); cur.lineWidth=Math.max(1,W/stage.clientWidth);
   cur.strokeStyle='rgba(0,0,0,.6)'; cur.beginPath(); cur.arc(x,y,size/2+1,0,Math.PI*2); cur.stroke();
   cur.strokeStyle='rgba(255,255,255,.9)'; cur.beginPath(); cur.arc(x,y,size/2,0,Math.PI*2); cur.stroke(); cur.restore(); }
@@ -564,7 +584,9 @@ function syncLayerOpacity(){ var l=drawLayers[active]; if(!l) return; var v=Math
 function updateHardnessUI(){ var h=document.getElementById('hard'),f=document.getElementById('hardfld');
   var off=(mode==='mask'); if(h){ h.disabled=off; h.style.opacity=off?0.4:1; }
   if(f){ f.style.opacity=off?0.5:1; f.title=off?'No effect in Mask mode (mask edges are always hard)':''; } }
-function setMode(m){ mode=m; document.querySelectorAll('#modeseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.mode===m); }); updateHardnessUI(); }
+function setMode(m){ mode=m; document.querySelectorAll('#modeseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.mode===m); });
+  if(m==='mask' && tool==='xform') selTool('brush');   // can't transform the mask — leave the xform tool
+  updateHardnessUI(); renderLayers(); }
 document.querySelectorAll('#modeseg button').forEach(function(b){ b.addEventListener('click',function(){ setMode(b.dataset.mode); }); });
 function markSwatch(){ document.querySelectorAll('#pal .sw').forEach(function(s){ s.classList.toggle('on',s.dataset.c.toLowerCase()===color.toLowerCase()); }); }
 var pal=document.getElementById('pal');
@@ -583,7 +605,7 @@ document.getElementById('dil').addEventListener('input',function(e){ dilate=+e.t
 document.getElementById('showmask').addEventListener('click',function(){ showMask=!showMask; this.classList.toggle('on',showMask); compose(); });
 document.getElementById('undo').addEventListener('click',function(){ restore(undoStack,redoStack); pushExport(); });
 document.getElementById('redo').addEventListener('click',function(){ restore(redoStack,undoStack); pushExport(); });
-document.getElementById('clrpaint').addEventListener('click',function(){ var l=activeLayer(); pushUndo(l.ctx,'draw'); l.ctx.clearRect(0,0,W,H); compose(); pushExport(); });
+document.getElementById('clrpaint').addEventListener('click',function(){ var l=activeLayer(); pushUndo(l.ctx,'draw'); l.ctx.clearRect(0,0,W,H); l.src=null; compose(); pushExport(); });
 document.getElementById('clrmask').addEventListener('click',function(){ pushUndo(mbx,'mask'); mbx.clearRect(0,0,W,H); compose(); pushExport(); });
 document.getElementById('invmask').addEventListener('click',function(){ if(!hasBg) return; pushUndo(mbx,'mask');
   var t=document.createElement('canvas'); t.width=W;t.height=H; var tc=t.getContext('2d');
@@ -599,7 +621,7 @@ window.addEventListener('keydown',function(e){
   if(e.ctrlKey&&(e.key==='y'||(e.shiftKey&&e.key==='Z'))){restore(redoStack,undoStack);pushExport();return;}
   if(e.ctrlKey&&(e.key==='c'||e.key==='C')){ e.preventDefault(); copyRegion(true); return; }
   if(e.ctrlKey&&(e.key==='v'||e.key==='V')){ e.preventDefault(); pasteClip(); return; }
-  var k={b:'brush',e:'eraser',g:'fill',i:'eye',w:'wand',l:'lasso',k:'clone',s:'smudge'}[e.key]; if(k) selTool(k); });
+  var k={b:'brush',e:'eraser',r:'restore',g:'fill',i:'eye',w:'wand',l:'lasso',k:'clone',s:'smudge'}[e.key]; if(k) selTool(k); });
 
 // -- layers manager (horizontal): mask (top) · draw layers · background (bottom) --
 var lyrEl=document.getElementById('layers');
@@ -625,11 +647,13 @@ function chip(cls,label,opts){ opts=opts||{};
   return d;
 }
 function renderLayers(){ lyrEl.innerHTML='';
-  lyrEl.appendChild(chip('mask','Mask',{visible:showMask,onEye:function(){ showMask=!showMask; document.getElementById('showmask').classList.toggle('on',showMask); compose(); renderLayers(); }}));
+  lyrEl.appendChild(chip('mask'+(mode==='mask'?' active':''),'Mask',{visible:showMask,
+    onClick:function(){ setMode('mask'); },
+    onEye:function(){ showMask=!showMask; document.getElementById('showmask').classList.toggle('on',showMask); compose(); renderLayers(); }}));
   // draw layers top→bottom in the panel = reverse of stacking
   for(var i=drawLayers.length-1;i>=0;i--){ (function(i){ var l=drawLayers[i];
     lyrEl.appendChild(chip('draw'+(i===active?' active':''), l.name, {visible:l.visible, idx:i, draggable:true,
-      onClick:function(){ active=i; syncLayerOpacity(); renderLayers(); },
+      onClick:function(){ active=i; syncLayerOpacity(); if(mode==='mask'){ setMode('draw'); } else { renderLayers(); } },
       onEye:function(){ l.visible=!l.visible; compose(); renderLayers(); pushExport(); },
       onDel:function(){ var delIdx=i, delLayer=l, prevA=active;
         drawLayers.splice(delIdx,1); if(active>=drawLayers.length) active=drawLayers.length-1;

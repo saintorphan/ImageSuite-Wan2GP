@@ -19,6 +19,7 @@ import gradio as gr
 from . import canvas as _canvas
 from . import enhance as _enhance
 from ..core import overlays as _ovcore
+from ..core import prompt_library as _plib
 
 SAMPLERS = ["DPM++ 2M", "DPM++ 2M SDE", "DPM++ 3M SDE", "Euler a", "Euler",
             "Heun", "DDIM", "UniPC", "LCM", "default"]
@@ -119,6 +120,31 @@ def _settings_bar(model_choices, lora_choices, mode):
                 c["padding"] = gr.Slider(0, 256, value=32, step=8,
                                          label="Only masked padding (px)")
     return c
+
+
+def _prompt_library_block(c, mode):
+    """Collapsible 'Prompt Library' (above the generation settings, collapsed by
+    default) — save / update / load / delete a full setup: prompt, negative, every
+    generation setting, model, LoRAs and post-process settings, to ONE shared,
+    reusable list across all three tabs. These components are created here; plugin.py
+    wires the CRUD against the whole page (and keeps every tab's list in sync)."""
+    with gr.Accordion("📚 Prompt Library", open=False, elem_classes="imagesuite-acc"):
+        gr.Markdown(
+            "Save the current prompt + **all** settings (model, LoRAs, generation "
+            "and post-process) and reload them on any tab. Reference images aren't "
+            "stored. **Save as** a new name, **Update** the selected one, **Load** it "
+            "into the form, or **Delete** it.", elem_classes="imagesuite-help")
+        with gr.Row():
+            c["pl_name"] = gr.Textbox(label="Name", placeholder="e.g. moody portrait",
+                                      scale=2)
+            c["pl_saved"] = gr.Dropdown(label="Saved prompts", choices=_plib.names(),
+                                        value=None, scale=2)
+        with gr.Row():
+            c["pl_save"] = gr.Button("💾 Save as", size="sm")
+            c["pl_update"] = gr.Button("⟳ Update", size="sm")
+            c["pl_load"] = gr.Button("📥 Load", variant="primary", size="sm")
+            c["pl_delete"] = gr.Button("🗑 Delete", variant="stop", size="sm")
+        c["pl_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
 
 
 def _prompt_block(c):
@@ -225,6 +251,7 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
                 _touchup_block(c)                                  # under the canvas
                 c.update(_enhance.build_enhance_sections(mode, sdxl_choices, lora_choices))  # under the canvas
             with gr.Column(scale=2):
+                _prompt_library_block(c, mode)                     # above settings
                 c.update(_settings_bar(model_choices, lora_choices, mode))
                 _prompt_block(c)
                 with gr.Row(elem_classes="imagesuite-genrow"):
@@ -237,6 +264,7 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
     with gr.Row():
         # -- left: inputs --
         with gr.Column(scale=1):
+            _prompt_library_block(c, mode)                         # above settings
             c.update(_settings_bar(model_choices, lora_choices, mode))
             _prompt_block(c)
             if mode == "img2img":

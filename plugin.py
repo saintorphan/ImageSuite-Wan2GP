@@ -1007,11 +1007,108 @@ class ImageSuite(WAN2GPPlugin):
         pages = ui["pages"]
         for mode, c in pages.items():
             self._wire_page(mode, c)
+        self._wire_prompt_library(pages)
         self._wire_sends(ui)
         self._wire_settings(ui)
         self._wire_ctx(ui)
         self._wire_overlays(ui)
         self._wire_persist(ui)
+
+    # -- Prompt Library (shared across all three tabs) ----------------------
+    # Every JSON-able scalar input is saved/loaded by inspecting the page's
+    # components by type — so it captures ALL generation settings, model, LoRAs and
+    # post-process settings without a hand-maintained list. Images/buttons/galleries/
+    # State/Markdown are excluded by type; these keys are excluded explicitly: the
+    # library's own controls, the transient resolution helpers, and the outpaint knobs
+    # (a separate operation, not part of a saved "prompt").
+    _PL_SAVABLE = (gr.Textbox, gr.Dropdown, gr.Slider, gr.Number, gr.Checkbox, gr.Radio)
+    _PL_EXCLUDE = {"pl_name", "pl_saved", "res_preset", "res_lock", "ov_folder",
+                   "out_size", "out_top", "out_bottom", "out_left", "out_right",
+                   "out_feather"}
+
+    def _pl_items(self, c):
+        """Ordered (key, component) pairs this page saves/loads."""
+        return [(k, comp) for k, comp in c.items()
+                if isinstance(comp, self._PL_SAVABLE) and k not in self._PL_EXCLUDE]
+
+    def _lora_choices_for(self, model_value):
+        """LoRA dropdown choices for a model (mirrors _on_model) so Load can refresh
+        the list to the saved model's family WITHOUT firing model.change (which would
+        reset the freshly-loaded settings)."""
+        backend, ident = discovery.parse_model_value(model_value or "")
+        if backend == "sd":
+            return discovery.lora_choices(family=discovery.model_family(model_value))
+        if backend == "native":
+            return self._native_loras(ident)
+        return []
+
+    def _wire_prompt_library(self, pages):
+        """Wire Save-as / Update / Load / Delete for the shared library. Save/Update/
+        Delete refresh EVERY tab's dropdown (one shared collection); Load applies the
+        saved fields to the current tab only. Setting the model via a handler output
+        does not fire model.change, so loaded settings are not clobbered by the
+        model's defaults; the LoRA list's choices are refreshed explicitly."""
+        from .core import prompt_library as plib
+        all_saved = [c["pl_saved"] for c in pages.values() if "pl_saved" in c]
+        if not all_saved:
+            return
+
+        def _refresh(names, cur, value):
+            # choices on every tab's dropdown; value only on the active tab's.
+            return [(gr.update(choices=names, value=value) if s is cur
+                     else gr.update(choices=names)) for s in all_saved]
+
+        for mode, c in pages.items():
+            if "pl_save" not in c:
+                continue
+            items = self._pl_items(c)
+            keys = [k for k, _ in items]
+            comps = [comp for _, comp in items]
+            cur = c["pl_saved"]
+
+            def _save(name, *vals, _keys=keys, _cur=cur):
+                name = (name or "").strip()
+                if not name:
+                    return [gr.update() for _ in all_saved] + ["Enter a name first."]
+                names = plib.save(name, dict(zip(_keys, vals)))
+                return _refresh(names, _cur, name) + [f"Saved “{name}”."]
+            c["pl_save"].click(_save, inputs=[c["pl_name"]] + comps,
+                               outputs=all_saved + [c["pl_status"]])
+
+            def _update(sel, *vals, _keys=keys, _cur=cur):
+                if not sel:
+                    return [gr.update() for _ in all_saved] + ["Pick a saved entry to update."]
+                names = plib.save(sel, dict(zip(_keys, vals)))
+                return _refresh(names, _cur, sel) + [f"Updated “{sel}”."]
+            c["pl_update"].click(_update, inputs=[c["pl_saved"]] + comps,
+                                 outputs=all_saved + [c["pl_status"]])
+
+            def _delete(sel, _cur=cur):
+                if not sel:
+                    return [gr.update() for _ in all_saved] + ["Pick a saved entry to delete."]
+                names = plib.delete(sel)
+                return _refresh(names, _cur, None) + [f"Deleted “{sel}”."]
+            c["pl_delete"].click(_delete, inputs=[c["pl_saved"]],
+                                 outputs=all_saved + [c["pl_status"]])
+
+            def _load(sel, _keys=keys):
+                entry = plib.get(sel) if sel else None
+                if not entry:
+                    return ([gr.update() for _ in _keys]
+                            + [gr.update(), "Pick a saved entry to load."])
+                outs = []
+                for k in _keys:
+                    if k == "loras" and "loras" in entry:  # refresh to saved family
+                        outs.append(gr.update(
+                            choices=self._lora_choices_for(entry.get("model")),
+                            value=entry.get("loras") or []))
+                    elif k in entry:
+                        outs.append(gr.update(value=entry[k]))
+                    else:  # field not in this entry (saved from another tab) → leave
+                        outs.append(gr.update())
+                return outs + [gr.update(value=sel), f"Loaded “{sel}”."]
+            c["pl_load"].click(_load, inputs=[c["pl_saved"]],
+                               outputs=comps + [c["pl_name"], c["pl_status"]])
 
     def _push_overlays(self, folder, mode):
         """Load a folder's overlay images (as data-URLs) into the canvas strip."""
@@ -1272,7 +1369,12 @@ class ImageSuite(WAN2GPPlugin):
             model_outputs.append(c["out_size"])
         model_outputs.append(c["gen_status"])
         model_outputs.append(c["res_preset"])
-        c["model"].change(_on_model, inputs=[c["model"]], outputs=model_outputs)
+        # .input (user-only), NOT .change: a model set programmatically by the Prompt
+        # Library Load (or persist-restore) must NOT trigger _on_model, which would
+        # reset every setting to the model's defaults and clobber the loaded values.
+        # (Gradio: handle_change dispatches "change" on backend updates too, but
+        # "input" only on user interaction — verified in the dropdown source.)
+        c["model"].input(_on_model, inputs=[c["model"]], outputs=model_outputs)
 
         # --- Resolution preset + aspect lock (shared by every page) ---------
         def _snap(v):  # clamp to the slider range and snap to its 64-px step

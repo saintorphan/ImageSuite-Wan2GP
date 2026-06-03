@@ -245,6 +245,14 @@ def human_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+def flush_label(count: int, total_bytes: int) -> str:
+    """The line shown beside the Flush Outputs button."""
+    if not count:
+        return "✅ No orphaned generations — the output cache is clean."
+    return (f"**≈ {human_size(total_bytes)}** in **{count}** orphaned generation"
+            + ("s" if count != 1 else "") + " (not in any project, not on screen).")
+
+
 def _jsonable(d: dict) -> dict:
     """Drop non-JSON-serialisable values (mirrors prompt_library's filter)."""
     out = {}

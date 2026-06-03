@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import gradio as gr
 
-from ..core import models, paths, presets
+from ..core import models, paths, presets, projects
 from .page import SAMPLERS, SCHEDULERS
 
 
@@ -80,6 +80,23 @@ def build_settings_panel(native_dl_choices=None):
                     scale=2)
                 c["link_btn"] = gr.Button("🔗 Link", scale=1)
             c["dirs_status"] = gr.Markdown("")
+
+        # -- Storage: reclaim disk from dead (orphaned) generations --
+        with gr.Accordion("Storage — flush dead generations", open=False,
+                          elem_classes="imagesuite-acc"):
+            gr.Markdown(
+                "Every generation lands in the output cache (txt2img / img2img / "
+                "MultiCanvas). **Saved projects keep their own copies** and the "
+                "on-screen galleries restore independently — so flushing only removes "
+                "*orphaned* generations (not in any project, not currently shown). "
+                "Nothing scans automatically; press **Rescan** to measure.",
+                elem_classes="imagesuite-help")
+            _ff, _fb = projects.orphaned_outputs()
+            with gr.Row():
+                c["flush_size"] = gr.Markdown(projects.flush_label(len(_ff), _fb))
+                c["flush_rescan"] = gr.Button("↻ Rescan", scale=0)
+            c["flush_btn"] = gr.Button("🗑 Flush Outputs", variant="stop")
+            c["flush_status"] = gr.Markdown("", elem_classes="imagesuite-help")
 
         # -- Default Generation Values (per family; shared via .orphansuite.json) --
         with gr.Accordion("Default Generation Values (per family)", open=False,

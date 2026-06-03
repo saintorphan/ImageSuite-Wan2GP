@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover
     _HAVE_LOCKS = False
     set_main_generation_running = None
 
-from .core import discovery, gen_sd, models, paths, presets
+from .core import discovery, gen_sd, models, paths, presets, projects
 from .ui import canvas, contextmenu, logo, suite
 from .ui.styles import CSS, LIGHTBOX_HTML
 
@@ -2249,6 +2249,27 @@ class ImageSuite(WAN2GPPlugin):
             return msg, gr.update(choices=self._native_dl_choices(), value=model_type)
         s["native_download"].click(_dl_native, inputs=[s["native_key"]],
                                   outputs=[s["native_log"], s["native_key"]])
+
+        # Flush Outputs — reclaim disk from orphaned generations (sd_gen + inpaint).
+        # Projects keep their own copies and galleries restore from persist/results,
+        # so this never touches a project or the current view. JS confirm gates it.
+        def _flush_rescan():
+            f, b = projects.orphaned_outputs()
+            return projects.flush_label(len(f), b)
+        s["flush_rescan"].click(_flush_rescan, outputs=[s["flush_size"]])
+
+        def _flush():
+            n, freed = projects.flush_outputs()
+            msg = (f"✅ Freed **{projects.human_size(freed)}** — deleted {n} orphaned "
+                   f"generation{'s' if n != 1 else ''}." if n
+                   else "Nothing to flush — already clean.")
+            f, b = projects.orphaned_outputs()
+            return projects.flush_label(len(f), b), msg
+        s["flush_btn"].click(
+            _flush, outputs=[s["flush_size"], s["flush_status"]],
+            js=("() => { if(!confirm('Permanently delete all orphaned generations? "
+                "Saved projects are unaffected and the images you currently see stay. "
+                "This cannot be undone.')) throw new Error('flush cancelled'); }"))
 
         def _save_dirs(outputs, sdxl_models, sdxl_loras, models_d):
             try:

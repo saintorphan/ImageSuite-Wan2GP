@@ -108,16 +108,22 @@ class SDImagePipeline:
         except Exception:
             logger.debug("xformers not available, using default attention.")
 
-        # Enable VAE slicing and tiling to reduce peak VRAM during encode/decode
+        # VAE memory helpers. Slicing (splits the batch) is free quality-wise.
+        # Tiling is left at diffusers' default SDXL threshold (latent 128) so it ONLY
+        # kicks in ABOVE native resolution. An earlier tweak lowered the threshold to
+        # 32 to force tiling on at 1024² for VRAM — but that split the decode into a
+        # 4×4 tile grid whose seams showed up as subtle texture/colour artifacts ("looks
+        # a bit weird"). force_upcast runs the VAE decode in fp32 to avoid the classic
+        # fp16-VAE precision loss / black-image NaN (weights stay fp16; only the decode
+        # math upcasts — negligible cost).
         if hasattr(self.pipe, "vae"):
             self.pipe.vae.enable_slicing()
             self.pipe.vae.enable_tiling()
-            # Diffusers sets tile_latent_min_size = sample_size/8 (128 for SDXL),
-            # but the tiling guard is `>` not `>=`, so tiling never activates at
-            # native resolution.  Lower the threshold so it actually kicks in.
-            self.pipe.vae.tile_latent_min_size = 32
-            self.pipe.vae.tile_sample_min_size = 256
-            logger.info("Enabled VAE slicing and tiling for SD pipeline.")
+            try:
+                self.pipe.vae.config.force_upcast = True
+            except Exception:
+                pass
+            logger.info("VAE: slicing + tiling (large images only), force_upcast on.")
 
         # Load custom VAE if specified
         if vae_name != "Automatic":
@@ -174,6 +180,10 @@ class SDImagePipeline:
             )
             if torch.cuda.is_available():
                 vae = vae.to("cuda")
+            try:
+                vae.config.force_upcast = True   # fp32 decode → no fp16-VAE artifacts
+            except Exception:
+                pass
             self.pipe.vae = vae
             # Invalidate cached variant pipes so they pick up the new VAE
             self._img2img_pipe = None

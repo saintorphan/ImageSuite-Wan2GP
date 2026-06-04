@@ -81,8 +81,8 @@ def build_settings_panel(native_dl_choices=None):
                 c["link_btn"] = gr.Button("🔗 Link", scale=1)
             c["dirs_status"] = gr.Markdown("")
 
-        # -- Storage: reclaim disk from dead (orphaned) generations --
-        with gr.Accordion("Storage — flush dead generations", open=False,
+        # -- Storage & memory: reclaim disk (orphaned generations) + free VRAM --
+        with gr.Accordion("Storage & memory — free disk / VRAM", open=False,
                           elem_classes="imagesuite-acc"):
             gr.Markdown(
                 "Every generation lands in the output cache (txt2img / img2img / "
@@ -97,6 +97,13 @@ def build_settings_panel(native_dl_choices=None):
                 c["flush_rescan"] = gr.Button("↻ Rescan", scale=0)
             c["flush_btn"] = gr.Button("🗑 Flush Outputs", variant="stop")
             c["flush_status"] = gr.Markdown("", elem_classes="imagesuite-help")
+            gr.Markdown(
+                "**Unload models** — free the bundled **SDXL** + helper weights from "
+                "the GPU. Wan2GP's own unload doesn't release these; use this to hand "
+                "VRAM back without restarting. They reload on the next generation.",
+                elem_classes="imagesuite-help")
+            c["unload_models"] = gr.Button("🧹 Unload models (free VRAM)")
+            c["unload_status"] = gr.Markdown("", elem_classes="imagesuite-help")
 
         # -- Default Generation Values (per family; shared via .orphansuite.json) --
         with gr.Accordion("Default Generation Values (per family)", open=False,

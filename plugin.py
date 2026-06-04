@@ -2491,6 +2491,38 @@ class ImageSuite(WAN2GPPlugin):
                 "Saved projects are unaffected and the images you currently see stay. "
                 "This cannot be undone.')) throw new Error('flush cancelled'); }"))
 
+        # Unload the bundled SDXL + helper models from VRAM (Wan2GP's unload misses
+        # these). release_all() = the same callback handed to Wan2GP when it needs the GPU.
+        def _unload_models():
+            freed = ""
+            torch = None
+            try:
+                import torch as _t
+                torch = _t
+            except Exception:
+                torch = None
+            before = None
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    before = torch.cuda.memory_allocated()
+                except Exception:
+                    before = None
+            try:
+                gen_sd.release_all()
+            except Exception as e:
+                traceback.print_exc()
+                return f"⚠️ Unload failed: {e}"
+            if torch is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    if before is not None:
+                        freed = (" — freed ~"
+                                 + projects.human_size(max(0, before - torch.cuda.memory_allocated())))
+                except Exception:
+                    pass
+            return f"✅ Unloaded the SDXL + helper models from VRAM{freed}."
+        s["unload_models"].click(_unload_models, outputs=[s["unload_status"]])
+
         def _save_dirs(outputs, sdxl_models, sdxl_loras, models_d):
             try:
                 paths.set_dirs(outputs=outputs or None, sdxl_models=sdxl_models or None,

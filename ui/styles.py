@@ -101,7 +101,7 @@ button.imagesuite-tabbtn {
 #imagesuite-projbar #imagesuite-projname p { margin: 0; font-weight: 600;
     font-style: italic; color: #d4af37; }
 #imagesuite-projbar #imagesuite-projname .imagesuite-unsaved p { color: #8a8a93; }
-#imagesuite-projbar button { min-width: 0; }
+#imagesuite-projbar button { min-width: 130px; flex: 0 0 auto; }
 /* Project popups (Save-as / manage) — centered floating panels (Replicant-style
    gr.Group toggles), not a main-screen dropdown. */
 .imagesuite-modal { position: fixed; left: 50%; top: 14%; transform: translateX(-50%);

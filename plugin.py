@@ -726,8 +726,8 @@ class ImageSuite(WAN2GPPlugin):
             with gr.Row(elem_id="imagesuite-projbar"):
                 self._proj_name = gr.Markdown(self._projname_md(_active),
                                               elem_id="imagesuite-projname")
-                self._proj_save = gr.Button("💾 Save", scale=0, size="sm", variant="primary")
-                self._proj_open = gr.Button("📂 Projects…", scale=0, size="sm")
+                self._proj_save = gr.Button("💾 Save", scale=0, variant="primary")
+                self._proj_open = gr.Button("📂 Projects…", scale=0)
             self._proj_active = gr.Textbox(_active, visible=False,
                                            elem_id="imagesuite-proj-active")
             self._proj_status = gr.Markdown("", elem_classes="imagesuite-help")

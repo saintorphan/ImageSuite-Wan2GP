@@ -1283,7 +1283,10 @@ class ImageSuite(WAN2GPPlugin):
     _PL_SAVABLE = (gr.Textbox, gr.Dropdown, gr.Slider, gr.Number, gr.Checkbox, gr.Radio)
     _PL_EXCLUDE = {"pl_name", "pl_saved", "res_preset", "res_lock", "ov_folder",
                    "out_size", "out_top", "out_bottom", "out_left", "out_right",
-                   "out_feather"}
+                   "out_feather",
+                   # canvas bridge textboxes — transient data-URLs, not settings
+                   # (the MultiCanvas state is saved separately as canvas_state)
+                   "composite", "mask", "state"}
 
     def _pl_items(self, c):
         """Ordered (key, component) pairs this page saves/loads."""

@@ -14,10 +14,13 @@ Shared API (do NOT diverge — must match Replicant's):
     M.whenPresent(name, cb)            cb fires now if present, else when name announces.
     M.srcOf(el)                        data-media-src attr → el src → child img/video src.
 
-ImageSuite announces 'imagesuite' and registers its image items (Send to Img2Vid,
-Img2Img, MultiCanvas) for both raw images and — once Reel2Reel announces — its
-'.r2r-timeline-clip' surface. Each handler relays {a,s,t} JSON into the hidden
-#imagesuite-ctx-relay Textbox for the Python router.
+ImageSuite announces 'imagesuite' and registers its items SCOPED to its own images
+(``#imagesuite-root img``) — so it never suppresses Wan2GP's native right-click
+elsewhere in the app. On its own images the menu folds in the standard image actions
+(open / save / copy) alongside the Send-to items (Img2Vid, Img2Img, MultiCanvas), since
+a page can only replace the native menu, not append to it. Send handlers relay {a,s,t}
+JSON into the hidden #imagesuite-ctx-relay Textbox for the Python router; it also
+attaches to Reel2Reel's '.r2r-timeline-clip' surface once that announces.
 """
 
 RELAY_ID = "imagesuite-ctx-relay"
@@ -37,15 +40,19 @@ document.addEventListener('click',close);document.addEventListener('scroll',clos
 """
 
 # --- ImageSuite's own registration (guarded by M._imagesuite) -----------------
-# relay() writes {a:action,s:src,t:nonce} JSON into #imagesuite-ctx-relay; the
-# Python router resolves the src and acts. reg() registers the three image items
-# against a match surface so we can attach to both raw <img> and the Reel2Reel
-# timeline once it announces.
+# SCOPED to '#imagesuite-root img' — only ImageSuite's OWN images, so we never hijack
+# Wan2GP's native right-click elsewhere in the app. Because suppressing the native menu
+# is all a web page can do (you can't append to it), the menu also folds in the standard
+# image actions (open / save / copy) so nothing is lost where we DO take over. relay()
+# writes {a,s,t} JSON into #imagesuite-ctx-relay for the Python router.
 _REGISTER = """
 var M=window.SaintorphanMenu;if(!M._imagesuite){M._imagesuite=true;M.announce('imagesuite');
 var relay=function(action,el){var src=M.srcOf(el);if(!src)return;var b=document.querySelector('#imagesuite-ctx-relay textarea')||document.querySelector('#imagesuite-ctx-relay input');if(!b)return;b.value=JSON.stringify({a:action,s:src,t:Date.now()});b.dispatchEvent(new Event('input',{bubbles:true}));};
-var reg=function(match){M.register(match,'Send to Img2Vid',function(el){relay('img2vid',el);});M.register(match,'ImageSuite (Img2Img)',function(el){relay('img2img',el);});M.register(match,'ImageSuite (MultiCanvas)',function(el){relay('inpaint',el);});};
-reg('image');
+var openTab=function(el){var s=M.srcOf(el);if(s)window.open(s,'_blank','noopener');};
+var saveImg=function(el){var s=M.srcOf(el);if(!s)return;var a=document.createElement('a');a.href=s;a.download=(s.split('?')[0].split('/').pop()||'image.png');document.body.appendChild(a);a.click();a.remove();};
+var copyImg=function(el){var s=M.srcOf(el);if(!s)return;if(navigator.clipboard&&window.ClipboardItem&&s.indexOf('javascript:')!==0){fetch(s).then(function(r){return r.blob();}).then(function(bl){var it={};it[bl.type||'image/png']=bl;return navigator.clipboard.write([new ClipboardItem(it)]);}).catch(function(){if(navigator.clipboard)navigator.clipboard.writeText(s);});}else if(navigator.clipboard){navigator.clipboard.writeText(s);}};
+var reg=function(match){M.register(match,'🔗 Open image in new tab',openTab);M.register(match,'💾 Save image',saveImg);M.register(match,'📋 Copy image',copyImg);M.register(match,'Send to Img2Vid',function(el){relay('img2vid',el);});M.register(match,'ImageSuite (Img2Img)',function(el){relay('img2img',el);});M.register(match,'ImageSuite (MultiCanvas)',function(el){relay('inpaint',el);});};
+reg('#imagesuite-root img');
 M.whenPresent('reel2reel',function(){reg('.r2r-timeline-clip');});}
 """
 

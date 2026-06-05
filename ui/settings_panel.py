@@ -36,6 +36,15 @@ def build_settings_panel(native_dl_choices=None):
                  "Dev, 20B Qwen) and keeps light ones (Flux 2 Klein 4B, Flux Schnell, "
                  "nvfp4/int4 variants). SDXL/Pony/Illustrious are always shown.")
 
+        # -- Right-click menu scope (applied live, persisted) --
+        c["ctx_scope"] = gr.Checkbox(
+            value=paths.get_ctx_plugin_only(),
+            label="Limit right-click menu to Image Suite's own images",
+            info="Off (default): the OrphanSuite right-click menu (Open / Save / Copy + "
+                 "Send-to) appears on any image across Wan2GP. On: it only shows on Image "
+                 "Suite's own images, leaving Wan2GP's native right-click untouched "
+                 "everywhere else. Applies immediately — no reload.")
+
         # -- OrphanSuite shared resources (collapsible) --
         with gr.Accordion("OrphanSuite — shared models & folders", open=False,
                           elem_classes="imagesuite-acc"):

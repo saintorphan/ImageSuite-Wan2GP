@@ -14,13 +14,15 @@ Shared API (do NOT diverge — must match Replicant's):
     M.whenPresent(name, cb)            cb fires now if present, else when name announces.
     M.srcOf(el)                        data-media-src attr → el src → child img/video src.
 
-ImageSuite announces 'imagesuite' and registers its items SCOPED to its own images
-(``#imagesuite-root img``) — so it never suppresses Wan2GP's native right-click
-elsewhere in the app. On its own images the menu folds in the standard image actions
-(open / save / copy) alongside the Send-to items (Img2Vid, Img2Img, MultiCanvas), since
-a page can only replace the native menu, not append to it. Send handlers relay {a,s,t}
-JSON into the hidden #imagesuite-ctx-relay Textbox for the Python router; it also
-attaches to Reel2Reel's '.r2r-timeline-clip' surface once that announces.
+ImageSuite announces 'imagesuite' and registers its items against every <img>
+app-wide. Because a page can only replace the native menu (not append to it), the menu
+folds in the standard image actions (open / save / copy) alongside the Send-to items
+(Img2Vid, Img2Img, MultiCanvas) so nothing is lost where it takes over. A persisted
+Settings toggle restricts the match to '#imagesuite-root img' (ImageSuite's own images
+only) so Wan2GP's native right-click stays intact elsewhere — flipped LIVE, no reload,
+via window.__imagesuiteScope(bool) which rewrites the items' match in place. Send
+handlers relay {a,s,t} JSON into the hidden #imagesuite-ctx-relay Textbox for the Python
+router; it also attaches to Reel2Reel's '.r2r-timeline-clip' surface once that announces.
 """
 
 RELAY_ID = "imagesuite-ctx-relay"
@@ -51,9 +53,12 @@ var relay=function(action,el){var src=M.srcOf(el);if(!src)return;var b=document.
 var openTab=function(el){var s=M.srcOf(el);if(s)window.open(s,'_blank','noopener');};
 var saveImg=function(el){var s=M.srcOf(el);if(!s)return;var a=document.createElement('a');a.href=s;a.download=(s.split('?')[0].split('/').pop()||'image.png');document.body.appendChild(a);a.click();a.remove();};
 var copyImg=function(el){var s=M.srcOf(el);if(!s)return;if(navigator.clipboard&&window.ClipboardItem&&s.indexOf('javascript:')!==0){fetch(s).then(function(r){return r.blob();}).then(function(bl){var it={};it[bl.type||'image/png']=bl;return navigator.clipboard.write([new ClipboardItem(it)]);}).catch(function(){if(navigator.clipboard)navigator.clipboard.writeText(s);});}else if(navigator.clipboard){navigator.clipboard.writeText(s);}};
-var reg=function(match){M.register(match,'🔗 Open image in new tab',openTab);M.register(match,'💾 Save image',saveImg);M.register(match,'📋 Copy image',copyImg);M.register(match,'Send to Img2Vid',function(el){relay('img2vid',el);});M.register(match,'ImageSuite (Img2Img)',function(el){relay('img2img',el);});M.register(match,'ImageSuite (MultiCanvas)',function(el){relay('inpaint',el);});};
-reg('#imagesuite-root img');
-M.whenPresent('reel2reel',function(){reg('.r2r-timeline-clip');});}
+var IMG=[];
+var regImg=function(label,handler){M.register('image',label,handler);IMG.push(M.items[M.items.length-1]);};
+regImg('🔗 Open image in new tab',openTab);regImg('💾 Save image',saveImg);regImg('📋 Copy image',copyImg);
+regImg('Send to Img2Vid',function(el){relay('img2vid',el);});regImg('ImageSuite (Img2Img)',function(el){relay('img2img',el);});regImg('ImageSuite (MultiCanvas)',function(el){relay('inpaint',el);});
+window.__imagesuiteScope=function(pluginOnly){var sel=pluginOnly?'#imagesuite-root img':'image';IMG.forEach(function(it){it.match=sel;});};
+M.whenPresent('reel2reel',function(){M.register('.r2r-timeline-clip','Send to Img2Vid',function(el){relay('img2vid',el);});M.register('.r2r-timeline-clip','ImageSuite (Img2Img)',function(el){relay('img2img',el);});M.register('.r2r-timeline-clip','ImageSuite (MultiCanvas)',function(el){relay('inpaint',el);});});}
 """
 
 
@@ -62,9 +67,17 @@ def _collapse(js: str) -> str:
     return " ".join(ln.strip() for ln in js.splitlines() if ln.strip())
 
 
-def imagesuite_ctx_html() -> str:
+def imagesuite_ctx_html(plugin_only: bool = False) -> str:
     """The <img onerror> that installs the shared engine (idempotent) + registers
-    ImageSuite's items. Render once via gr.HTML inside the plugin tab."""
+    ImageSuite's items. Render once via gr.HTML inside the plugin tab.
+
+    The menu matches every <img> app-wide by default. ``plugin_only`` (a persisted
+    Settings toggle) restricts it to '#imagesuite-root img' at load; the same scope can
+    be flipped LIVE (no reload) via window.__imagesuiteScope(bool), which just rewrites
+    the registered items' match — the capture-phase listener reads it on the next click.
+    """
     inner = _collapse(_ENGINE) + " " + _collapse(_REGISTER)
+    if plugin_only:
+        inner += " try{window.__imagesuiteScope(true);}catch(e){}"
     return ("<img src=x style='display:none' onerror=\"(function(){"
             + inner + "})()\">")

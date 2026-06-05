@@ -87,6 +87,17 @@ def set_ui_state(mode: str, values: dict) -> None:
     save_config()
 
 
+def get_ctx_plugin_only() -> bool:
+    """Whether the OrphanSuite right-click menu is limited to Image Suite's own images
+    (vs every image app-wide). Persisted Settings toggle; applied live, no reload."""
+    return bool(load_config().get("ctx_plugin_only", False))
+
+
+def set_ctx_plugin_only(value: bool) -> None:
+    load_config()["ctx_plugin_only"] = bool(value)
+    save_config()
+
+
 def get_results(mode: str) -> list:
     """Persisted result-image paths for a tab (so the gallery survives a restart)."""
     r = load_config().get("results")

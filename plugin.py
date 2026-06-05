@@ -758,7 +758,8 @@ class ImageSuite(WAN2GPPlugin):
                 self._proj_manage_status = gr.Markdown("", elem_classes="imagesuite-help")
             # Shared app-wide right-click menu (idempotent engine + our items) and
             # the hidden relay it writes into.
-            gr.HTML(contextmenu.imagesuite_ctx_html(), elem_classes="imagesuite-hidden")
+            gr.HTML(contextmenu.imagesuite_ctx_html(paths.get_ctx_plugin_only()),
+                    elem_classes="imagesuite-hidden")
             self._ctx_relay = gr.Textbox(visible=False, elem_id=CTX_RELAY)
             ui = suite.build_suite(model_choices_by_mode=choices_by_mode,
                                    lora_choices=lora_choices,
@@ -2456,6 +2457,15 @@ class ImageSuite(WAN2GPPlugin):
             return _model_updates() + [gr.update(choices=self._native_dl_choices())]
         s["vram_mode"].change(_set_vram, inputs=[s["vram_mode"]],
                              outputs=model_dds + [s["native_key"]])
+
+        # Right-click menu scope toggle: persist + apply LIVE (no reload). The js
+        # rewrites the registered items' match in place; Python just remembers the choice.
+        def _set_ctx_scope(v):
+            paths.set_ctx_plugin_only(bool(v))
+        s["ctx_scope"].change(
+            _set_ctx_scope, inputs=[s["ctx_scope"]],
+            js="(v) => { try{ if(window.__imagesuiteScope) window.__imagesuiteScope(!!v); }"
+               "catch(e){} return [v]; }")
 
         # Native model manual download.
         def _dl_native(model_type, progress=gr.Progress()):

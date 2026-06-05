@@ -82,12 +82,13 @@ things once:
 - **Link existing folder** — a button in **Settings → OrphanSuite** that
   **symlinks** models you already keep (a1111 / Forge / anywhere on disk) into the
   shared area, without copying or moving the originals.
-- **Shared right-click menu** — right-click an image **inside the Image Suite tab**
-  for an **OrphanSuite** section (*Open / Save / Copy* plus *Send to Img2Vid*,
+- **Shared right-click menu** — right-click **any image** in Wan2GP for an
+  **OrphanSuite** section (*Open / Save / Copy* plus *Send to Img2Vid*,
   *ImageSuite (Img2Img)*, *ImageSuite (MultiCanvas)*); it loads straight into the right
-  page. It's scoped to our own images, so Wan2GP's native right-click is untouched
-  everywhere else. As the other plugins land they register their own surfaces into the
-  *same* shared menu, so everything cross-talks.
+  page. A **Settings toggle** limits it to Image Suite's own images if you'd rather keep
+  Wan2GP's native right-click everywhere else (applied live, no reload). As the other
+  plugins land they register their own surfaces into the *same* shared menu, so
+  everything cross-talks.
 
 ## Install
 Use the Wan2GP **Plugin Manager → Add from GitHub URL**:

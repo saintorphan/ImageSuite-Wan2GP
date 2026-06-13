@@ -62,6 +62,35 @@ def _free_torch():
         pass
 
 
+_face_app = None  # cached InsightFace buffalo_l detector (CUDA/ONNX) — see _get_face_app
+
+
+def _get_face_app():
+    """Cached InsightFace buffalo_l detector, built once and reused. Body-swap
+    masking (head_excluded_body_mask) and face ADetailer (_detect_face_boxes) used to
+    each spin up a fresh FaceAnalysis on the CUDAExecutionProvider per call — a CUDA
+    ONNX session that was a function-local, never released, and invisible to the VRAM
+    release path. Sharing one instance (freed via release_face_analysis, wired into
+    release_all) keeps it reclaimable at the GPU handoff."""
+    global _face_app
+    if _face_app is None:
+        from insightface.app import FaceAnalysis
+        app = FaceAnalysis(name="buffalo_l",
+                           providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        app.prepare(ctx_id=0, det_size=(640, 640))
+        _face_app = app
+    return _face_app
+
+
+def release_face_analysis():
+    """Drop the cached InsightFace session so its CUDA/ONNX arena is reclaimed.
+    Dropping the only Python reference is the load-bearing step — empty_cache() does
+    NOT free onnxruntime's CUDA arena."""
+    global _face_app
+    _face_app = None
+    _free_torch()
+
+
 def sharpen(image_path, radius=2.0, percent=120, threshold=3, out_dir=None) -> str:
     """Crisp the WHOLE image without changing its resolution (PIL unsharp mask).
     No model, no GPU, instant. Boosts edge contrast — keep params modest so it
@@ -106,6 +135,7 @@ def release_all():
         release_segmentation_model()
     except Exception:
         logger.debug("segmentation release failed", exc_info=True)
+    release_face_analysis()
 
 
 def available() -> bool:
@@ -375,10 +405,7 @@ def head_excluded_body_mask(base_path, models_root, hair_up=2.0,
     mask = (person > 127).astype("uint8") * 255
     try:
         import cv2
-        from insightface.app import FaceAnalysis
-        app = FaceAnalysis(name="buffalo_l",
-                           providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-        app.prepare(ctx_id=0, det_size=(640, 640))
+        app = _get_face_app()
         faces = app.get(cv2.imread(base_path))
         if faces:
             f = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
@@ -501,10 +528,7 @@ def _detect_face_boxes(image_path, threshold=0.4):
     """Return [(x1,y1,x2,y2), ...] face boxes via InsightFace (buffalo_l)."""
     try:
         import cv2
-        from insightface.app import FaceAnalysis
-        app = FaceAnalysis(name="buffalo_l",
-                           providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-        app.prepare(ctx_id=0, det_size=(640, 640))
+        app = _get_face_app()
         boxes = []
         for f in app.get(cv2.imread(image_path)):
             if float(getattr(f, "det_score", 1.0)) < threshold:

@@ -48,7 +48,7 @@ class ImageSuite(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PLUGIN_NAME
-        self.version = "0.1.0"
+        self.version = "0.2.0"
         self.description = ("Txt2Img / Img2Img / MultiCanvas workbench for Flux, "
                             "Z-Image and the SDXL lineup, with send-to-page, "
                             "send-to-Img2Vid and Save As.")
@@ -63,6 +63,7 @@ class ImageSuite(WAN2GPPlugin):
         self.request_component("state")
         self.request_component("main_tabs")
         self.request_component("refresh_form_trigger")
+        self.request_component("output")  # main preview gallery (Send current frame)
         self.request_global("get_current_model_settings")
         self.request_global("get_default_settings")  # native image generation
         self.request_global("get_model_def")          # per-model capability flags
@@ -83,6 +84,9 @@ class ImageSuite(WAN2GPPlugin):
 
         self.add_tab(tab_id=PLUGIN_ID, label=PLUGIN_NAME,
                      component_constructor=self.create_ui)
+        # Inject a "Send current frame to Image Suite" section directly under the
+        # main page's video preview gallery (host plugin DOM-insertion hook).
+        self.insert_after("gallery_tabs", self._build_send_frame_section)
 
     def on_tab_select(self, state: dict):
         # Warn if the GPU looks busy, but DON'T bounce out — a stale lock would
@@ -192,6 +196,21 @@ class ImageSuite(WAN2GPPlugin):
         except TypeError:  # older process_locks without the keep_resident kwargs
             release_GPU_ressources(state, PLUGIN_ID)
             self._release_all_vram()
+
+    def _release_native_model(self):
+        """Evict Wan2GP's native transformer (wan_model/offloadobj) after one of our
+        native image gens. The native path borrows the host engine WITHOUT going
+        through acquire_gpu (which is what calls release_model on the SD path), so
+        without this the Flux/Z-Image/Qwen model stays resident and stacks with a
+        later SDXL load -> OOM. Uses the host's own release_model (requested in
+        setup_ui); the next native gen reloads from disk (release_model sets
+        reload_needed)."""
+        rm = getattr(self, "release_model", None)
+        if callable(rm):
+            try:
+                rm()
+            except Exception:
+                traceback.print_exc()
 
     # -- preserve the Video Generator's setup across a native gen -----------
     # A native gen borrows Wan2GP's shared engine, which can change the current
@@ -765,6 +784,9 @@ class ImageSuite(WAN2GPPlugin):
                                    lora_choices=lora_choices,
                                    native_dl_choices=self._native_dl_choices(),
                                    sdxl_choices=sdxl_choices)
+        # Kept so the main-page "Send current frame" section (injected under the
+        # preview gallery, built later than this tab) can reach our pages/subtabs.
+        self._ui = ui
         self._wire(ui)
         self.on_tab_outputs = [self.main_tabs] if hasattr(self, "main_tabs") else None
         return ui
@@ -858,9 +880,48 @@ class ImageSuite(WAN2GPPlugin):
         return {"activated_loras": paths_, "loras_multipliers": mult}
 
     # -- generation backends ------------------------------------------------
+    def _await_native_job(self, job, state):
+        """Block until a submitted native task finishes — but bound the *admission*
+        wait. Native gens run through Wan2GP's webui queue, which only starts once a
+        load_queue trigger round-trips to the browser; if the tab/window is
+        backgrounded that round-trip can be dropped and the task is NEVER admitted.
+        Wan2GP's queue probe then loops forever with no admission timeout, so a plain
+        submit_task().result() (timeout=None) would block this worker thread
+        permanently with no output and no error — the 'pressed Generate and it just
+        sat there' hang. We poll instead: the moment the host shows any queue or
+        processing activity we wait as long as it needs (slow model load / many
+        steps); but if nothing is admitted within ADMIT seconds we cancel and surface
+        an actionable error. (With no usable state we can't tell stalled from busy, so
+        fall back to the original unbounded wait.)"""
+        if not isinstance(state, dict):
+            return job.result()
+        ADMIT, POLL = 90.0, 2.0
+        t0, seen_live = time.monotonic(), False
+        while True:
+            try:
+                return job.result(timeout=POLL)
+            except TimeoutError:
+                pass
+            gen = state.get("gen")
+            if isinstance(gen, dict) and (gen.get("in_progress") or gen.get("queue")
+                                          or gen.get("process_status")):
+                seen_live = True  # host accepted the task — let it run for as long as it needs
+            if not seen_live and (time.monotonic() - t0) > ADMIT:
+                for c in (lambda: job.cancel(),
+                          lambda: (getattr(self, "_api", None) or job).cancel()):
+                    try:
+                        c()
+                    except Exception:
+                        pass
+                raise gr.Error(
+                    "Wan2GP never started this generation. Native (Flux / Z-Image / "
+                    "Qwen) gens run in the Video Generator's queue, which stalls if the "
+                    "browser tab or window loses focus. Click the Video Generator tab "
+                    "to give it focus, then try Generate again.")
+
     def _gen_native(self, model_type, pos, neg, w, h, steps, cfg, seed, *,
                     mode="txt2img", denoise=1.0, guide_path=None, mask_path=None,
-                    loras=None, mult_str="", progress=None, api=None):
+                    loras=None, mult_str="", progress=None, api=None, state=None):
         """One native (Flux/Z-Image/Qwen) image via the Wan2GP task API.
 
         mode: 'txt2img' (image_mode 1), 'img2img' (image_mode 1 + image_guide +
@@ -906,7 +967,8 @@ class ImageSuite(WAN2GPPlugin):
         # progress onto the wrapped click's outputs (the visible progress bar).
         # Supplying our own here replaced that default and killed the bar.
         try:
-            result = (api or self._api).submit_task(settings).result()
+            job = (api or self._api).submit_task(settings)
+            result = self._await_native_job(job, state)
         except Exception as e:
             if "generation in progress" in str(e).lower():
                 raise gr.Error(
@@ -1874,7 +1936,7 @@ class ImageSuite(WAN2GPPlugin):
             if backend == "native":
                 if self._gpu_busy(state):
                     raise gr.Error("A generation is already running — wait for it to finish.")
-                gen_sd.release_sd()  # free our SDXL so the native model has room
+                self._release_all_vram()  # free ALL our GPU consumers (SD + inpaint/IP + seg + faceswap)
                 snap = self._snapshot_video_state(state)
                 try:
                     for i in range(n):
@@ -1883,9 +1945,10 @@ class ImageSuite(WAN2GPPlugin):
                                                   cfg, (int(seed) + i if int(seed) >= 0 else seed),
                                                   mode="txt2img",
                                                   loras=loras, mult_str=mult,
-                                                  progress=progress, api=api)
+                                                  progress=progress, api=api, state=state)
                 finally:
                     self._restore_video_state(state, snap)
+                    self._release_native_model()  # don't leave the native model stacked under a later SDXL load
             else:  # sd
                 lora_list = self._lora_list(loras, mult)
                 self.acquire_gpu(state)
@@ -1931,7 +1994,7 @@ class ImageSuite(WAN2GPPlugin):
             if backend == "native":
                 if self._gpu_busy(state):
                     raise gr.Error("A generation is already running — wait for it to finish.")
-                gen_sd.release_sd()  # free our SDXL so the native model has room
+                self._release_all_vram()  # free ALL our GPU consumers (SD + inpaint/IP + seg + faceswap)
                 snap = self._snapshot_video_state(state)
                 try:
                     for i in range(n):
@@ -1941,9 +2004,10 @@ class ImageSuite(WAN2GPPlugin):
                                                   mode="img2img",
                                                   denoise=denoise, guide_path=init_image,
                                                   loras=loras, mult_str=mult,
-                                                  progress=progress, api=api)
+                                                  progress=progress, api=api, state=state)
                 finally:
                     self._restore_video_state(state, snap)
+                    self._release_native_model()  # don't leave the native model stacked under a later SDXL load
             else:  # sd
                 lora_list = self._lora_list(loras, mult)
                 self.acquire_gpu(state)
@@ -1996,7 +2060,7 @@ class ImageSuite(WAN2GPPlugin):
         if backend == "native":
             if self._gpu_busy(state):
                 raise gr.Error("A generation is already running — wait for it to finish.")
-            gen_sd.release_sd()  # free our SDXL so the native model has room
+            self._release_all_vram()  # free ALL our GPU consumers (SD + inpaint/IP + seg + faceswap)
             m = mask
             if feather and int(feather) > 0:  # native has no pipeline mask_blur
                 from PIL import ImageFilter
@@ -2016,9 +2080,10 @@ class ImageSuite(WAN2GPPlugin):
                         (int(seed) + i if int(seed) >= 0 else seed),
                         mode="inpaint", denoise=denoise, guide_path=guide_path,
                         mask_path=mask_path, loras=loras, mult_str=mult,
-                        progress=progress, api=api)
+                        progress=progress, api=api, state=state)
             finally:
                 self._restore_video_state(state, snap)
+                self._release_native_model()  # don't leave the native model stacked under a later SDXL load
             return files
         # sd — one acquisition, loop count times for a real batch.
         lora_list = self._lora_list(loras, mult)
@@ -2689,3 +2754,155 @@ class ImageSuite(WAN2GPPlugin):
         except Exception:
             pass
         return time.time(), nav
+
+    # -- main-page "Send current frame to Image Suite" ---------------------
+    # A section injected directly under the host's video preview gallery (see the
+    # insert_after in setup_ui). Pulls the result currently selected in the preview
+    # player, lets the user pick a frame, and routes it into Img2Img's init slot or
+    # the MultiCanvas background — the inbound mirror of _send_to_img2vid.
+    _VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".avi", ".mov", ".m4v", ".gif")
+
+    def _current_selection_path(self, state):
+        """(path, kind) for the item selected in the main preview gallery. kind is
+        'audio' (ignored), 'file', or None when nothing is selected. Mirrors the
+        host's gen bookkeeping (get_gen_info / set_file_choice in wgp.py)."""
+        gen = (state or {}).get("gen", {}) or {}
+        if gen.get("current_gallery_source") == "audio":
+            return None, "audio"
+        files = gen.get("file_list") or []
+        if not files:
+            return None, None
+        idx = gen.get("selected", 0) or 0
+        if idx < 0 or idx >= len(files):
+            idx = 0
+        return files[idx], "file"
+
+    def _build_send_frame_section(self):
+        """Built AND wired here (not in post_ui_setup): the host runs this
+        insert_after constructor AFTER post_ui_setup, so by now self.state /
+        self.output / self.main_tabs and self._ui (our pages/subtabs/tab_ids) all
+        exist. Renders exactly one top-level Accordion (what insert_after relocates)."""
+        ui = getattr(self, "_ui", None)
+        if not ui:
+            return gr.Accordion("Image Suite", visible=False)
+        pages, subtabs, tab_ids = ui["pages"], ui["subtabs"], ui["tab_ids"]
+        i2i_input = pages["img2img"]["input_image"]
+        inp_bridge = pages["inpaint"]["bg_bridge"]
+
+        with gr.Accordion("📤 Send current frame to Image Suite", open=False) as box:
+            gr.Markdown(
+                "Pick a frame from the result selected in the gallery above and send it "
+                "into Image Suite. The frame is chosen with the slider (the player can't "
+                "report the exact on-screen frame); stills are sent as-is.",
+                elem_classes="imagesuite-help")
+            src_path = gr.State(None)
+            with gr.Row():
+                target = gr.Dropdown(["Img2Img", "MultiCanvas"], value="Img2Img",
+                                     label="Send current frame to", scale=2)
+                load_btn = gr.Button("⟳ Load selected", scale=1)
+            frame_no = gr.Slider(0, 0, value=0, step=1, label="Frame to send",
+                                 visible=False)
+            preview = gr.Image(label="Frame preview", type="pil", interactive=False,
+                               height=220, visible=False)
+            send_btn = gr.Button("Send frame →", variant="primary", interactive=False)
+
+        _HIDE = (gr.update(visible=False), gr.update(visible=False),
+                 gr.update(interactive=False), None)
+
+        def _updates_for(path, warn):
+            """Resolve a selected path into (preview, frame_no, send_btn, src_path)
+            updates. `warn` toggles the 'select something' hint (off for auto-sync,
+            which fires constantly)."""
+            from shared.utils.utils import get_video_frame, get_video_info
+            if not path:
+                if warn:
+                    gr.Warning("Select a result in the gallery above first.")
+                return _HIDE
+            if not str(path).lower().endswith(self._VIDEO_EXTS):
+                try:
+                    from PIL import Image
+                    img = Image.open(path).convert("RGB")
+                except Exception:
+                    traceback.print_exc()
+                    if warn:
+                        gr.Warning("Couldn't open that result.")
+                    return _HIDE
+                return (gr.update(value=img, visible=True), gr.update(visible=False),
+                        gr.update(interactive=True), path)
+            try:
+                _fps, _w, _h, frames = get_video_info(path)
+                frames = int(frames) or 1
+                first = get_video_frame(path, 0, return_last_if_missing=True,
+                                        return_PIL=True)
+            except Exception:
+                traceback.print_exc()
+                if warn:
+                    gr.Warning("Couldn't read that video.")
+                return _HIDE
+            return (gr.update(value=first, visible=True),
+                    gr.update(minimum=0, maximum=max(frames - 1, 0), value=0,
+                              visible=True),
+                    gr.update(interactive=True), path)
+
+        def _load(state):  # explicit "Load selected" button
+            path, kind = self._current_selection_path(state)
+            if kind == "audio":
+                gr.Warning("That's an audio selection — pick a video or image result.")
+                return _HIDE
+            return _updates_for(path, warn=True)
+
+        def _load_sel(state, evt: gr.SelectData):
+            # Auto-sync: resolve from the click's own index (gen['selected'] may not
+            # be updated yet — the host's select_video runs as a separate listener).
+            files = ((state or {}).get("gen", {}) or {}).get("file_list") or []
+            idx = getattr(evt, "index", None)
+            if isinstance(idx, (list, tuple)):
+                idx = idx[0] if idx else None
+            path = files[idx] if isinstance(idx, int) and 0 <= idx < len(files) else None
+            return _updates_for(path, warn=False)
+
+        def _scrub(path, n):
+            from shared.utils.utils import get_video_frame
+            if not path or not str(path).lower().endswith(self._VIDEO_EXTS):
+                return gr.update()
+            try:
+                img = get_video_frame(path, int(n), return_last_if_missing=True,
+                                      return_PIL=True)
+            except Exception:
+                traceback.print_exc()
+                return gr.update()
+            return gr.update(value=img)
+
+        def _send(state, tgt, frame_img):
+            noop = gr.update()
+            if frame_img is None:
+                gr.Warning("Load a frame first.")
+                return [noop, noop, noop, noop]
+            try:
+                from PIL import Image
+                if not isinstance(frame_img, Image.Image):
+                    frame_img = Image.fromarray(frame_img)
+                path = self._save_img(frame_img.convert("RGB"), "sentframe")
+            except Exception:
+                traceback.print_exc()
+                raise gr.Error("Couldn't save that frame.")
+            if tgt == "MultiCanvas":
+                html = canvas.bg_bridge_html(self._file_to_dataurl(path), "inpaint",
+                                             nonce=time.time())
+                gr.Info("Frame sent to the MultiCanvas background.")
+                return [noop, html, gr.update(selected=tab_ids["inpaint"]),
+                        gr.update(selected=PLUGIN_ID)]
+            gr.Info("Frame sent to Img2Img as the init image.")
+            return [path, noop, gr.update(selected=tab_ids["img2img"]),
+                    gr.update(selected=PLUGIN_ID)]
+
+        load_outs = [preview, frame_no, send_btn, src_path]
+        load_btn.click(_load, inputs=[self.state], outputs=load_outs)
+        # Auto-reflect the gallery's current selection (what the user asked for).
+        if getattr(self, "output", None) is not None:
+            self.output.select(_load_sel, inputs=[self.state], outputs=load_outs)
+        # .release (not .change) so we decode on drag-end, not every pixel.
+        frame_no.release(_scrub, inputs=[src_path, frame_no], outputs=[preview])
+        send_btn.click(_send, inputs=[self.state, target, preview],
+                       outputs=[i2i_input, inp_bridge, subtabs, self.main_tabs])
+        return box

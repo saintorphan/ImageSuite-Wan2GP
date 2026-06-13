@@ -48,7 +48,7 @@ class ImageSuite(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PLUGIN_NAME
-        self.version = "0.2.0"
+        self.version = "0.2.1"
         self.description = ("Txt2Img / Img2Img / MultiCanvas workbench for Flux, "
                             "Z-Image and the SDXL lineup, with send-to-page, "
                             "send-to-Img2Vid and Save As.")
@@ -785,9 +785,17 @@ class ImageSuite(WAN2GPPlugin):
                                    native_dl_choices=self._native_dl_choices(),
                                    sdxl_choices=sdxl_choices)
         # Kept so the main-page "Send current frame" section (injected under the
-        # preview gallery, built later than this tab) can reach our pages/subtabs.
+        # preview gallery BEFORE this tab is built) can reach our pages/subtabs when
+        # we wire it, just below.
         self._ui = ui
         self._wire(ui)
+        # The section's widgets were created at insert time (self._sf); now that our
+        # pages exist, connect its handlers. Guarded so a wiring hiccup can't take
+        # down the whole tab (create_ui falls back to an error panel on raise).
+        try:
+            self._wire_send_frame_section()
+        except Exception:
+            traceback.print_exc()
         self.on_tab_outputs = [self.main_tabs] if hasattr(self, "main_tabs") else None
         return ui
 
@@ -2778,17 +2786,12 @@ class ImageSuite(WAN2GPPlugin):
         return files[idx], "file"
 
     def _build_send_frame_section(self):
-        """Built AND wired here (not in post_ui_setup): the host runs this
-        insert_after constructor AFTER post_ui_setup, so by now self.state /
-        self.output / self.main_tabs and self._ui (our pages/subtabs/tab_ids) all
-        exist. Renders exactly one top-level Accordion (what insert_after relocates)."""
-        ui = getattr(self, "_ui", None)
-        if not ui:
-            return gr.Accordion("Image Suite", visible=False)
-        pages, subtabs, tab_ids = ui["pages"], ui["subtabs"], ui["tab_ids"]
-        i2i_input = pages["img2img"]["input_image"]
-        inp_bridge = pages["inpaint"]["bg_bridge"]
-
+        """BUILD ONLY (no wiring). The host runs this insert_after constructor during
+        component insertion (wgp.py ~13034), which is BEFORE it builds our plugin tab
+        (~13365) — so self._ui and our page components don't exist yet. We render the
+        section's widgets, stash them on self._sf, and wire the handlers later in
+        _wire_send_frame_section (end of _build_ui, once the pages exist). Renders
+        exactly one top-level Accordion (what insert_after relocates)."""
         with gr.Accordion("📤 Send current frame to Image Suite", open=False) as box:
             gr.Markdown(
                 "Pick a frame from the result selected in the gallery above and send it "
@@ -2805,6 +2808,27 @@ class ImageSuite(WAN2GPPlugin):
             preview = gr.Image(label="Frame preview", type="pil", interactive=False,
                                height=220, visible=False)
             send_btn = gr.Button("Send frame →", variant="primary", interactive=False)
+        self._sf = {"src_path": src_path, "target": target, "load_btn": load_btn,
+                    "frame_no": frame_no, "preview": preview, "send_btn": send_btn}
+        return box
+
+    def _wire_send_frame_section(self):
+        """Wire the injected 'Send current frame' section. Called at the end of
+        _build_ui: by now the section widgets exist (built at insert time) AND our
+        pages exist (just built), so the cross-tab handlers can connect (Gradio event
+        wiring is context-independent). No-op if the section wasn't injected (older
+        host without insert_after) or it's already wired."""
+        sf = getattr(self, "_sf", None)
+        ui = getattr(self, "_ui", None)
+        if not sf or not ui or getattr(self, "_sf_wired", False):
+            return
+        self._sf_wired = True
+        pages, subtabs, tab_ids = ui["pages"], ui["subtabs"], ui["tab_ids"]
+        i2i_input = pages["img2img"]["input_image"]
+        inp_bridge = pages["inpaint"]["bg_bridge"]
+        src_path, target = sf["src_path"], sf["target"]
+        load_btn, frame_no = sf["load_btn"], sf["frame_no"]
+        preview, send_btn = sf["preview"], sf["send_btn"]
 
         _HIDE = (gr.update(visible=False), gr.update(visible=False),
                  gr.update(interactive=False), None)
@@ -2905,4 +2929,3 @@ class ImageSuite(WAN2GPPlugin):
         frame_no.release(_scrub, inputs=[src_path, frame_no], outputs=[preview])
         send_btn.click(_send, inputs=[self.state, target, preview],
                        outputs=[i2i_input, inp_bridge, subtabs, self.main_tabs])
-        return box

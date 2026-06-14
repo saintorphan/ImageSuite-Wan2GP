@@ -2785,6 +2785,40 @@ class ImageSuite(WAN2GPPlugin):
             idx = 0
         return files[idx], "file"
 
+    def _color_match_to_init(self, state, frame_img):
+        """Recolour `frame_img` (PIL) to match the host's current img2vid init image
+        (image_start) via LAB mean/std transfer. Returns a PIL image, or None when
+        there's no usable init image or the transfer fails."""
+        if frame_img is None:
+            return None
+        try:
+            settings = self.get_current_model_settings(state) or {}
+        except Exception:
+            return None
+        init = settings.get("image_start")
+        while isinstance(init, (list, tuple)):   # unwrap [path] or [(img, caption)]
+            init = init[0] if init else None
+        if init is None:
+            return None
+        try:
+            import numpy as np, cv2
+            from PIL import Image
+            from .core import faceswap
+            if isinstance(init, str):
+                init_img = Image.open(init).convert("RGB")
+            elif isinstance(init, Image.Image):
+                init_img = init.convert("RGB")
+            else:
+                init_img = Image.fromarray(np.asarray(init)).convert("RGB")
+            src_bgr = cv2.cvtColor(np.asarray(frame_img.convert("RGB")),
+                                   cv2.COLOR_RGB2BGR)
+            ref_bgr = cv2.cvtColor(np.asarray(init_img), cv2.COLOR_RGB2BGR)
+            out_bgr = faceswap._color_transfer_lab(src_bgr, ref_bgr)
+            return Image.fromarray(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
+        except Exception:
+            traceback.print_exc()
+            return None
+
     def _build_send_frame_section(self):
         """BUILD ONLY (no wiring). The host runs this insert_after constructor during
         component insertion (wgp.py ~13034), which is BEFORE it builds our plugin tab
@@ -2792,24 +2826,36 @@ class ImageSuite(WAN2GPPlugin):
         section's widgets, stash them on self._sf, and wire the handlers later in
         _wire_send_frame_section (end of _build_ui, once the pages exist). Renders
         exactly one top-level Accordion (what insert_after relocates)."""
-        with gr.Accordion("📤 Send current frame to Image Suite", open=False) as box:
+        with gr.Accordion("📤 Send current frame", open=False) as box:
             gr.Markdown(
                 "Pick a frame from the result selected in the gallery above and send it "
-                "into Image Suite. The frame is chosen with the slider (the player can't "
-                "report the exact on-screen frame); stills are sent as-is.",
+                "to Image Suite (Img2Img / MultiCanvas) or to the Video Generator "
+                "(img2vid init / end image). The frame is chosen with the slider (the "
+                "player can't report the exact on-screen frame); stills are sent as-is. "
+                "When the Video Generator has an init image, a colour-matched "
+                "'Corrected frame' is shown too — choose which one to send.",
                 elem_classes="imagesuite-help")
             src_path = gr.State(None)
             with gr.Row():
-                target = gr.Dropdown(["Img2Img", "MultiCanvas"], value="Img2Img",
-                                     label="Send current frame to", scale=2)
+                target = gr.Dropdown(
+                    ["Img2Img", "MultiCanvas", "img2vid (init)", "img2vid (end image)"],
+                    value="Img2Img", label="Send current frame to", scale=2)
                 load_btn = gr.Button("⟳ Load selected", scale=1)
             frame_no = gr.Slider(0, 0, value=0, step=1, label="Frame to send",
                                  visible=False)
-            preview = gr.Image(label="Frame preview", type="pil", interactive=False,
-                               height=220, visible=False)
+            with gr.Row():
+                preview = gr.Image(label="Current frame", type="pil",
+                                   interactive=False, height=220, visible=False)
+                corrected = gr.Image(label="Corrected frame (colour-matched to init)",
+                                     type="pil", interactive=False, height=220,
+                                     visible=False)
+            which = gr.Radio(["Current frame", "Corrected frame"],
+                             value="Current frame", label="Send which frame",
+                             visible=False)
             send_btn = gr.Button("Send frame →", variant="primary", interactive=False)
         self._sf = {"src_path": src_path, "target": target, "load_btn": load_btn,
-                    "frame_no": frame_no, "preview": preview, "send_btn": send_btn}
+                    "frame_no": frame_no, "preview": preview, "corrected": corrected,
+                    "which": which, "send_btn": send_btn}
         return box
 
     def _wire_send_frame_section(self):
@@ -2829,14 +2875,28 @@ class ImageSuite(WAN2GPPlugin):
         src_path, target = sf["src_path"], sf["target"]
         load_btn, frame_no = sf["load_btn"], sf["frame_no"]
         preview, send_btn = sf["preview"], sf["send_btn"]
+        corrected, which = sf["corrected"], sf["which"]
 
+        # 6-tuple matching load_outs below:
+        # preview, frame_no, send_btn, src_path, corrected, which
         _HIDE = (gr.update(visible=False), gr.update(visible=False),
-                 gr.update(interactive=False), None)
+                 gr.update(interactive=False), None,
+                 gr.update(value=None, visible=False),
+                 gr.update(visible=False, value="Current frame"))
 
-        def _updates_for(path, warn):
-            """Resolve a selected path into (preview, frame_no, send_btn, src_path)
-            updates. `warn` toggles the 'select something' hint (off for auto-sync,
-            which fires constantly)."""
+        def _corrected_updates(state, frame_img):
+            """(corrected_preview, which_radio) updates for a frame: show the
+            colour-matched-to-init version when an init image is available, else
+            hide both and force the radio back to 'Current frame'."""
+            corr = self._color_match_to_init(state, frame_img)
+            if corr is None:
+                return (gr.update(value=None, visible=False),
+                        gr.update(visible=False, value="Current frame"))
+            return (gr.update(value=corr, visible=True), gr.update(visible=True))
+
+        def _updates_for(state, path, warn):
+            """Resolve a selected path into the 6 load_outs updates. `warn` toggles
+            the 'select something' hint (off for auto-sync, which fires constantly)."""
             from shared.utils.utils import get_video_frame, get_video_info
             if not path:
                 if warn:
@@ -2851,8 +2911,9 @@ class ImageSuite(WAN2GPPlugin):
                     if warn:
                         gr.Warning("Couldn't open that result.")
                     return _HIDE
+                corr_p, which_u = _corrected_updates(state, img)
                 return (gr.update(value=img, visible=True), gr.update(visible=False),
-                        gr.update(interactive=True), path)
+                        gr.update(interactive=True), path, corr_p, which_u)
             try:
                 _fps, _w, _h, frames = get_video_info(path)
                 frames = int(frames) or 1
@@ -2863,17 +2924,18 @@ class ImageSuite(WAN2GPPlugin):
                 if warn:
                     gr.Warning("Couldn't read that video.")
                 return _HIDE
+            corr_p, which_u = _corrected_updates(state, first)
             return (gr.update(value=first, visible=True),
                     gr.update(minimum=0, maximum=max(frames - 1, 0), value=0,
                               visible=True),
-                    gr.update(interactive=True), path)
+                    gr.update(interactive=True), path, corr_p, which_u)
 
         def _load(state):  # explicit "Load selected" button
             path, kind = self._current_selection_path(state)
             if kind == "audio":
                 gr.Warning("That's an audio selection — pick a video or image result.")
                 return _HIDE
-            return _updates_for(path, warn=True)
+            return _updates_for(state, path, warn=True)
 
         def _load_sel(state, evt: gr.SelectData):
             # Auto-sync: resolve from the click's own index (gen['selected'] may not
@@ -2883,30 +2945,37 @@ class ImageSuite(WAN2GPPlugin):
             if isinstance(idx, (list, tuple)):
                 idx = idx[0] if idx else None
             path = files[idx] if isinstance(idx, int) and 0 <= idx < len(files) else None
-            return _updates_for(path, warn=False)
+            return _updates_for(state, path, warn=False)
 
-        def _scrub(path, n):
+        def _scrub(state, path, n):
             from shared.utils.utils import get_video_frame
             if not path or not str(path).lower().endswith(self._VIDEO_EXTS):
-                return gr.update()
+                return gr.update(), gr.update(), gr.update()
             try:
                 img = get_video_frame(path, int(n), return_last_if_missing=True,
                                       return_PIL=True)
             except Exception:
                 traceback.print_exc()
-                return gr.update()
-            return gr.update(value=img)
+                return gr.update(), gr.update(), gr.update()
+            corr_p, which_u = _corrected_updates(state, img)
+            return gr.update(value=img), corr_p, which_u
 
-        def _send(state, tgt, frame_img):
+        def _send(state, tgt, which_val, frame_img, corrected_img):
             noop = gr.update()
-            if frame_img is None:
+            if which_val == "Corrected frame":
+                send_img = corrected_img if corrected_img is not None else frame_img
+                if corrected_img is None:
+                    gr.Warning("No corrected frame available — sending the current frame.")
+            else:
+                send_img = frame_img
+            if send_img is None:
                 gr.Warning("Load a frame first.")
-                return [noop, noop, noop, noop]
+                return [noop, noop, noop, noop, noop]
             try:
                 from PIL import Image
-                if not isinstance(frame_img, Image.Image):
-                    frame_img = Image.fromarray(frame_img)
-                path = self._save_img(frame_img.convert("RGB"), "sentframe")
+                if not isinstance(send_img, Image.Image):
+                    send_img = Image.fromarray(send_img)
+                path = self._save_img(send_img.convert("RGB"), "sentframe")
             except Exception:
                 traceback.print_exc()
                 raise gr.Error("Couldn't save that frame.")
@@ -2915,17 +2984,40 @@ class ImageSuite(WAN2GPPlugin):
                                              nonce=time.time())
                 gr.Info("Frame sent to the MultiCanvas background.")
                 return [noop, html, gr.update(selected=tab_ids["inpaint"]),
-                        gr.update(selected=PLUGIN_ID)]
+                        gr.update(selected=PLUGIN_ID), noop]
+            if tgt in ("img2vid (init)", "img2vid (end image)"):
+                is_end = tgt == "img2vid (end image)"
+                try:
+                    settings = self.get_current_model_settings(state)
+                    settings["image_end" if is_end else "image_start"] = [path]
+                    letter = "E" if is_end else "S"
+                    ipt = settings.get("image_prompt_type") or ""
+                    if letter not in ipt:
+                        settings["image_prompt_type"] = (letter + ipt) if ipt else letter
+                except Exception:
+                    traceback.print_exc()
+                    raise gr.Error("Could not push the frame to the Video Generator.")
+                nav = gr.update()
+                try:
+                    nav = self.goto_video_tab(state)
+                except Exception:
+                    pass
+                slot = "end image" if is_end else "init"
+                gr.Info(f"Frame sent to the Video Generator as the img2vid {slot}. "
+                        "Pick an Image-to-Video model there if the current one isn't i2v.")
+                return [noop, noop, noop, nav, time.time()]
             gr.Info("Frame sent to Img2Img as the init image.")
             return [path, noop, gr.update(selected=tab_ids["img2img"]),
-                    gr.update(selected=PLUGIN_ID)]
+                    gr.update(selected=PLUGIN_ID), noop]
 
-        load_outs = [preview, frame_no, send_btn, src_path]
+        load_outs = [preview, frame_no, send_btn, src_path, corrected, which]
         load_btn.click(_load, inputs=[self.state], outputs=load_outs)
         # Auto-reflect the gallery's current selection (what the user asked for).
         if getattr(self, "output", None) is not None:
             self.output.select(_load_sel, inputs=[self.state], outputs=load_outs)
         # .release (not .change) so we decode on drag-end, not every pixel.
-        frame_no.release(_scrub, inputs=[src_path, frame_no], outputs=[preview])
-        send_btn.click(_send, inputs=[self.state, target, preview],
-                       outputs=[i2i_input, inp_bridge, subtabs, self.main_tabs])
+        frame_no.release(_scrub, inputs=[self.state, src_path, frame_no],
+                         outputs=[preview, corrected, which])
+        send_btn.click(_send, inputs=[self.state, target, which, preview, corrected],
+                       outputs=[i2i_input, inp_bridge, subtabs, self.main_tabs,
+                                self.refresh_form_trigger])

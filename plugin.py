@@ -888,45 +888,6 @@ class ImageSuite(WAN2GPPlugin):
         return {"activated_loras": paths_, "loras_multipliers": mult}
 
     # -- generation backends ------------------------------------------------
-    def _await_native_job(self, job, state):
-        """Block until a submitted native task finishes — but bound the *admission*
-        wait. Native gens run through Wan2GP's webui queue, which only starts once a
-        load_queue trigger round-trips to the browser; if the tab/window is
-        backgrounded that round-trip can be dropped and the task is NEVER admitted.
-        Wan2GP's queue probe then loops forever with no admission timeout, so a plain
-        submit_task().result() (timeout=None) would block this worker thread
-        permanently with no output and no error — the 'pressed Generate and it just
-        sat there' hang. We poll instead: the moment the host shows any queue or
-        processing activity we wait as long as it needs (slow model load / many
-        steps); but if nothing is admitted within ADMIT seconds we cancel and surface
-        an actionable error. (With no usable state we can't tell stalled from busy, so
-        fall back to the original unbounded wait.)"""
-        if not isinstance(state, dict):
-            return job.result()
-        ADMIT, POLL = 90.0, 2.0
-        t0, seen_live = time.monotonic(), False
-        while True:
-            try:
-                return job.result(timeout=POLL)
-            except TimeoutError:
-                pass
-            gen = state.get("gen")
-            if isinstance(gen, dict) and (gen.get("in_progress") or gen.get("queue")
-                                          or gen.get("process_status")):
-                seen_live = True  # host accepted the task — let it run for as long as it needs
-            if not seen_live and (time.monotonic() - t0) > ADMIT:
-                for c in (lambda: job.cancel(),
-                          lambda: (getattr(self, "_api", None) or job).cancel()):
-                    try:
-                        c()
-                    except Exception:
-                        pass
-                raise gr.Error(
-                    "Wan2GP never started this generation. Native (Flux / Z-Image / "
-                    "Qwen) gens run in the Video Generator's queue, which stalls if the "
-                    "browser tab or window loses focus. Click the Video Generator tab "
-                    "to give it focus, then try Generate again.")
-
     def _gen_native(self, model_type, pos, neg, w, h, steps, cfg, seed, *,
                     mode="txt2img", denoise=1.0, guide_path=None, mask_path=None,
                     loras=None, mult_str="", progress=None, api=None, state=None):
@@ -976,14 +937,12 @@ class ImageSuite(WAN2GPPlugin):
         # Supplying our own here replaced that default and killed the bar.
         try:
             job = (api or self._api).submit_task(settings)
-            result = self._await_native_job(job, state)
+            result = job.result()
         except Exception as e:
             if "generation in progress" in str(e).lower():
                 raise gr.Error(
-                    "Another generation is still pending. Native (Flux/Z-Image/Qwen) "
-                    "gens run in Wan2GP's queue and PAUSE if the browser loses focus — "
-                    "click the Video Generator tab to let it finish, then try again "
-                    "(or restart Wan2GP).")
+                    "Another generation is still pending — let it finish, then "
+                    "try again.")
             raise
         if result.success and result.generated_files:
             return list(result.generated_files)
@@ -1579,8 +1538,11 @@ class ImageSuite(WAN2GPPlugin):
         #    the selection; the buttons push it into the editor (same targets as the
         #    cross-plugin Send menu + the new add-layer canvas bridge), then jump to
         #    that tab.
-        def _ov_select(evt: gr.SelectData):
-            v = evt.value
+        def _ov_select(evt: gr.EventData):
+            # gr.SelectData.__init__ KeyErrors when Gradio sends a select event
+            # without "value"; read the raw payload off gr.EventData instead.
+            data = getattr(evt, "_data", {}) or {}
+            v = data.get("value") if isinstance(data, dict) else None
             path = ((v.get("image", {}).get("path") or v.get("path"))
                     if isinstance(v, dict) else v if isinstance(v, str) else None)
             return path, gr.update(value=path)
@@ -1868,8 +1830,11 @@ class ImageSuite(WAN2GPPlugin):
         # Gradio cache — which both the stock check_all_files_in_cache and our
         # allow-list patch (_cache_allow_dirs) accept. 'picked' is still armed to the
         # first result at generation time, so it's correct before any click.
-        def _pick(evt: gr.SelectData):
-            v = evt.value
+        def _pick(evt: gr.EventData):
+            # gr.SelectData.__init__ KeyErrors when Gradio sends a select event
+            # without "value"; read the raw payload off gr.EventData instead.
+            data = getattr(evt, "_data", {}) or {}
+            v = data.get("value") if isinstance(data, dict) else None
             p = None
             if isinstance(v, dict):
                 p = (v.get("image") or {}).get("path") or v.get("path")
@@ -2937,11 +2902,14 @@ class ImageSuite(WAN2GPPlugin):
                 return _HIDE
             return _updates_for(state, path, warn=True)
 
-        def _load_sel(state, evt: gr.SelectData):
+        def _load_sel(state, evt: gr.EventData):
             # Auto-sync: resolve from the click's own index (gen['selected'] may not
             # be updated yet — the host's select_video runs as a separate listener).
+            # Use gr.EventData (not gr.SelectData, whose __init__ KeyErrors when the
+            # select payload has no "value") and read the index off the raw payload.
             files = ((state or {}).get("gen", {}) or {}).get("file_list") or []
-            idx = getattr(evt, "index", None)
+            data = getattr(evt, "_data", {}) or {}
+            idx = data.get("index") if isinstance(data, dict) else None
             if isinstance(idx, (list, tuple)):
                 idx = idx[0] if idx else None
             path = files[idx] if isinstance(idx, int) and 0 <= idx < len(files) else None

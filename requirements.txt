@@ -1,33 +1,20 @@
 # Image Suite — runtime deps.
 #
-# Everything here is for the OPTIONAL SDXL-family backend + the enhancement suite;
-# all are lazily imported, so the plugin loads and the native (Flux / Z-Image / Qwen)
-# path works even if they're absent. Versions are intentionally UNPINNED so they defer
-# to whatever Wan2GP already pins — pip leaves an already-satisfied requirement alone,
-# so this won't churn the host's versions.
+# This plugin runs inside Wan2GP, so anything Wan2GP already pins is intentionally
+# NOT re-listed here. Re-declaring its deps (often unpinned) makes pip re-resolve
+# and can break Wan2GP's exact pins — most importantly its custom onnxruntime-gpu
+# nightly. Provided by Wan2GP already: gradio, torch, torchvision, Pillow, numpy,
+# diffusers, transformers, accelerate, safetensors, huggingface_hub, opencv-python,
+# onnx, onnxruntime-gpu, insightface, facexlib.
 #
-# Already shipped by Wan2GP (all platforms): gradio, torch, torchvision, Pillow,
-# numpy, diffusers, transformers, accelerate, opencv-python, onnxruntime-gpu. They're
-# re-listed below only so a standalone/partial install still resolves them.
-# Auto-installed on first use by core/deps.py (NOT listed here): kornia (BiRefNet
-# modeling code), controlnet_aux + ultralytics (ADetailer / pose).
+# Auto-installed on first use by core/deps.py (NOT listed here): kornia,
+# controlnet_aux, ultralytics.
+#
+# Optional, deliberately NOT installed here (conflict-prone — pulls protobuf/numpy
+# constraints that fight Wan2GP's): mediapipe. It only powers hand preservation
+# during body-swap, and the code skips it gracefully when absent. Install manually
+# with `pip install mediapipe` if you want that refinement.
 
-# SDXL / Pony / Illustrious generation + img2img + inpaint + outpaint + IP-Adapter
-# (Colour Reference & Body Swap). Runs in-plugin via 🤗 diffusers (see core/sd/) —
-# no external checkout required.
-diffusers
-transformers
-accelerate
-safetensors
-huggingface_hub  # snapshot_download for on-demand model fetch (core/interrogate.py, core/models.py)
-
-# Face swap + ADetailer (face / person detect) + WD14 interrogate tagger. NOTE:
-# insightface is Wan2GP-bundled on Windows only, so it's genuinely additive on Linux.
-insightface
-onnxruntime-gpu
-onnx
-opencv-python
+# scikit-image: SimilarityTransform for face alignment (core/faceswap.py). The only
+# direct dependency Wan2GP doesn't already provide.
 scikit-image
-
-# Body-swap segmentation + head mask (BiRefNet via transformers + mediapipe).
-mediapipe

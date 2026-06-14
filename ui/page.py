@@ -99,13 +99,14 @@ def _settings_bar(model_choices, lora_choices, mode):
     if mode == "inpaint":
         # Mask + inpaint knobs live in their own block, so the generation settings
         # above stay byte-for-byte identical to the other tabs. The SDXL-only knobs
-        # are nested + collapsed (native Flux/Z-Image/Qwen ignore them).
+        # are nested but open by default (this workbench is used SDXL-first; native
+        # Flux/Z-Image/Qwen simply ignore them).
         with gr.Accordion("Mask & inpaint", open=True, elem_classes="imagesuite-acc"):
             c["mask_mode"] = gr.Radio(
                 ["Inpaint masked", "Inpaint not masked"],
                 value="Inpaint masked", label="Mask mode")
             c["feather"] = gr.Slider(0, 64, value=4, step=1, label="Mask blur (px)")
-            with gr.Accordion("SDXL inpaint options", open=False,
+            with gr.Accordion("SDXL inpaint options", open=True,
                               elem_classes="imagesuite-acc"):
                 gr.Markdown(
                     "Used only by **SDXL / Pony / Illustrious**. Native "

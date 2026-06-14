@@ -79,7 +79,7 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
 /* overlays strip (below the layers manager) */
 #ovbar{flex:0 0 auto;background:#181820;border-top:1px solid #333}
 #ovhead{display:flex;align-items:center;gap:10px;padding:5px 8px;font-size:11px}
-#ovtoggle{background:#2a2a35;border:1px solid #3a3a48;color:#cfcfe0;border-radius:6px;
+#ovtoggle,.ovbtn{background:#2a2a35;border:1px solid #3a3a48;color:#cfcfe0;border-radius:6px;
   padding:3px 9px;font-size:11px;cursor:pointer}
 #ovhint{color:#7a7a8a;font-size:10px}
 #ovstrip{display:none;align-items:center;gap:8px;padding:0 8px 8px;overflow-x:auto;height:86px}
@@ -109,9 +109,9 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
       <div class="sec">
         <div class="seclabel">Mode</div>
         <div class="modeseg" id="modeseg">
-          <button data-mode="mask" title="Mask mode — paint the mask only">&#127917;</button>
-          <button data-mode="draw" class="on" title="Draw mode — paint the active layer only">&#9999;</button>
-          <button data-mode="drawmask" title="Draw + Mask — paint the layer AND mask together">&#9999;&#127917;</button>
+          <button data-mode="mask" title="Mask mode — paint only the mask (the region that gets regenerated)">&#127917;<br>Mask</button>
+          <button data-mode="draw" class="on" title="Draw mode — paint only the active layer">&#9999;&#65039;<br>Draw</button>
+          <button data-mode="drawmask" title="Draw + Mask — paint the layer AND the mask together">&#9999;&#65039;&#127917;<br>Both</button>
         </div>
         <div class="row3">
           <button id="upload" title="Upload an image as the background">&#8593;</button>
@@ -124,6 +124,11 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
           <button id="flipv" title="Flip the active layer vertically">&#8597;</button>
         </div>
         <div class="fld"><span>Zoom</span><span id="zmv">100</span>%</div>
+      </div>
+      <div class="sec">
+        <div class="seclabel">Brush size</div>
+        <div class="fld"><span>Size</span><span id="szv">14</span></div>
+        <input type="range" id="size" min="1" max="200" value="14">
       </div>
       <div class="sec">
         <div class="seclabel">Mask</div>
@@ -166,8 +171,6 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
         <div class="seclabel">Brush</div>
         <div class="palrow" id="pal"></div>
         <input type="color" id="pick" value="#e83e8c" title="Custom colour">
-        <div class="fld"><span>Size</span><span id="szv">14</span></div>
-        <input type="range" id="size" min="1" max="200" value="14">
         <div class="fld" id="hardfld"><span>Hardness</span><span id="hdv">80</span></div>
         <input type="range" id="hard" min="0" max="100" value="80" title="Brush edge hardness (lower = softer)">
         <div class="fld"><span>Opacity</span><span id="opv">100</span></div>
@@ -197,7 +200,10 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
   <div id="ovbar">
     <div id="ovhead">
       <button id="ovtoggle">&#9656; Overlays</button>
-      <span id="ovhint">drag a thumbnail onto the canvas → new layer (below the mask) · double-click to preview</span>
+      <button id="ovxform" class="ovbtn" title="Grab / transform the active layer (move · scale · rotate)">&#10021; Transform</button>
+      <button id="ovfliph" class="ovbtn" title="Flip the active layer horizontally">&#8596; Flip H</button>
+      <button id="ovflipv" class="ovbtn" title="Flip the active layer vertically">&#8597; Flip V</button>
+      <span id="ovhint">drag a thumbnail or an image file onto the canvas → new layer · double-click to preview</span>
     </div>
     <div id="ovstrip"></div>
   </div>
@@ -422,6 +428,7 @@ function shrinkMask(){ pushUndo(mbx,'mask');
   mbx.drawImage(t,0,0); mbx.restore(); compose(); pushExport(); }
 // -- flip the active layer --
 function flipLayer(horiz){ if(!hasBg) return; var l=activeLayer(); pushUndo(l.ctx,'draw'); l.src=null;
+  if(tSession===l.id){ tSession=-1; tSnap=null; tBox=null; }   // flipped pixels supersede any pending transform snapshot
   var tmp=document.createElement('canvas'); tmp.width=W;tmp.height=H; tmp.getContext('2d').drawImage(l.cv,0,0);
   l.ctx.save(); l.ctx.clearRect(0,0,W,H); l.ctx.translate(horiz?W:0,horiz?0:H);
   l.ctx.scale(horiz?-1:1,horiz?1:-1); l.ctx.drawImage(tmp,0,0); l.ctx.restore(); compose(); pushExport(); }
@@ -520,6 +527,12 @@ function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=
   // erase/restore source bookkeeping (only touch the active layer for tools that need it)
   if(tool==='eraser'&&mode!=='mask') ensureSrc(activeLayer());   // snapshot so the restore brush can bring erased pixels back
   else if(mode!=='mask'&&(tool==='brush'||tool==='fill'||tool==='clone'||tool==='smudge'||tool==='rect'||tool==='ellipse'||tool==='line')) activeLayer().src=null;  // new positive content on the layer → re-base
+  // A destructive edit to the active layer invalidates any pending transform
+  // snapshot of it, so the next transform re-captures the edited pixels instead of
+  // overwriting the layer with the stale snapshot (which would undo the erase/paint
+  // done since the transform session began).
+  if(mode!=='mask' && tool!=='xform' && tool!=='eye' && tool!=='wand' && tool!=='lasso'){
+    var _al=activeLayer(); if(tSession===_al.id){ tSession=-1; tSnap=null; tBox=null; } }
   if(tool==='eye'){ pickColor(p.x,p.y); return; }
   if(tool==='wand'){ pushUndo(mbx,'mask'); magicWand(p.x,p.y); compose(); pushExport(); return; }
   if(tool==='xform'){ ensureXform(); drawing=true; startXform(p); return; }
@@ -598,6 +611,10 @@ document.getElementById('op').addEventListener('input',function(e){ opacity=(+e.
 document.getElementById('hard').addEventListener('input',function(e){ hardness=(+e.target.value)/100; document.getElementById('hdv').textContent=e.target.value; });
 document.getElementById('fliph').addEventListener('click',function(){ flipLayer(true); });
 document.getElementById('flipv').addEventListener('click',function(){ flipLayer(false); });
+// overlay-section duplicates (under the canvas, by the layers/overlays strip)
+document.getElementById('ovfliph').addEventListener('click',function(){ flipLayer(true); });
+document.getElementById('ovflipv').addEventListener('click',function(){ flipLayer(false); });
+document.getElementById('ovxform').addEventListener('click',function(){ if(!hasBg) return; selTool('xform'); ensureXform(); });
 document.getElementById('growmask').addEventListener('click',function(){ if(hasBg) growMask(); });
 document.getElementById('shrinkmask').addEventListener('click',function(){ if(hasBg) shrinkMask(); });
 document.getElementById('auto').addEventListener('click',function(){ autoMask=!autoMask; this.classList.toggle('on',autoMask); pushExport(); });
@@ -605,7 +622,7 @@ document.getElementById('dil').addEventListener('input',function(e){ dilate=+e.t
 document.getElementById('showmask').addEventListener('click',function(){ showMask=!showMask; this.classList.toggle('on',showMask); compose(); });
 document.getElementById('undo').addEventListener('click',function(){ restore(undoStack,redoStack); pushExport(); });
 document.getElementById('redo').addEventListener('click',function(){ restore(redoStack,undoStack); pushExport(); });
-document.getElementById('clrpaint').addEventListener('click',function(){ var l=activeLayer(); pushUndo(l.ctx,'draw'); l.ctx.clearRect(0,0,W,H); l.src=null; compose(); pushExport(); });
+document.getElementById('clrpaint').addEventListener('click',function(){ var l=activeLayer(); pushUndo(l.ctx,'draw'); l.ctx.clearRect(0,0,W,H); l.src=null; if(tSession===l.id){ tSession=-1; tSnap=null; tBox=null; } compose(); pushExport(); });
 document.getElementById('clrmask').addEventListener('click',function(){ pushUndo(mbx,'mask'); mbx.clearRect(0,0,W,H); compose(); pushExport(); });
 document.getElementById('invmask').addEventListener('click',function(){ if(!hasBg) return; pushUndo(mbx,'mask');
   var t=document.createElement('canvas'); t.width=W;t.height=H; var tc=t.getContext('2d');
@@ -767,9 +784,27 @@ function addOverlayLayer(url,cx,cy){ if(!hasBg){ setBg(url); return; }
     l.ctx.drawImage(im,x,y,dw,dh); selTool('xform'); ensureXform();
     renderLayers(); compose(); pushExport(); }; im.src=url; }
 try{ parent.window['__is_'+MODE+'_addlayer']=function(u){ addOverlayLayer(u); }; }catch(e){}
-stage.addEventListener('dragover',function(e){ if(e.dataTransfer && (''+e.dataTransfer.types).indexOf('text/plain')>=0){ e.preventDefault(); e.dataTransfer.dropEffect='copy'; document.body.classList.add('dragover'); } });
+// external image file drop → draw onto the active (selected) layer at the drop
+// point; if the canvas is empty the image becomes the background. Scaled to fit.
+function dropImageOnLayer(url,cx,cy){ if(!hasBg){ setBg(url); return; }
+  var im=new Image(); im.onload=function(){ var l=activeLayer(); pushUndo(l.ctx,'draw'); l.src=null;
+    if(tSession===l.id){ tSession=-1; tSnap=null; tBox=null; }   // new content invalidates a pending transform snapshot
+    var ow=im.naturalWidth,oh=im.naturalHeight, fit=Math.min(1,(W*0.9)/ow,(H*0.9)/oh), dw=ow*fit,dh=oh*fit;
+    var x=(cx==null?W/2:cx)-dw/2, y=(cy==null?H/2:cy)-dh/2;
+    x=Math.max(0,Math.min(W-dw,x)); y=Math.max(0,Math.min(H-dh,y));
+    l.ctx.drawImage(im,x,y,dw,dh); selTool('xform'); ensureXform(); renderLayers(); compose(); pushExport(); }; im.src=url; }
+stage.addEventListener('dragover',function(e){ var t=e.dataTransfer?(''+e.dataTransfer.types):'';
+  if(t.indexOf('text/plain')>=0||t.indexOf('Files')>=0){ e.preventDefault(); e.dataTransfer.dropEffect='copy'; document.body.classList.add('dragover'); } });
 stage.addEventListener('dragleave',function(){ document.body.classList.remove('dragover'); });
-stage.addEventListener('drop',function(e){ var data=e.dataTransfer?e.dataTransfer.getData('text/plain'):''; document.body.classList.remove('dragover');
+stage.addEventListener('drop',function(e){ var dt=e.dataTransfer; document.body.classList.remove('dragover');
+  // external image file dropped from the OS / another app
+  if(dt && dt.files && dt.files.length){ var f=null;
+    for(var i=0;i<dt.files.length;i++){ if(/^image\//.test(dt.files[i].type)){ f=dt.files[i]; break; } }
+    if(f){ e.preventDefault(); var rf=disp.getBoundingClientRect();
+      var fx=(e.clientX-rf.left)/rf.width*W, fy=(e.clientY-rf.top)/rf.height*H;
+      var rd=new FileReader(); rd.onload=function(){ dropImageOnLayer(rd.result,fx,fy); }; rd.readAsDataURL(f); return; } }
+  // internal overlay thumbnail → new layer
+  var data=dt?dt.getData('text/plain'):'';
   if(data.indexOf('ov:')!==0) return; e.preventDefault(); var o=overlays[+data.slice(3)]; if(!o) return;
   var r=disp.getBoundingClientRect(); var x=(e.clientX-r.left)/r.width*W, y=(e.clientY-r.top)/r.height*H;
   addOverlayLayer(o.url,x,y); });

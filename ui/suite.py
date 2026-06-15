@@ -16,9 +16,10 @@ from .overlays_panel import build_overlays_panel
 from .settings_panel import build_settings_panel
 
 _TAB_IDS = {"txt2img": "imagesuite-t2i", "img2img": "imagesuite-i2i",
-            "inpaint": "imagesuite-inp", "overlays": "imagesuite-overlays",
-            "settings": "imagesuite-settings"}
-_LABELS = {"txt2img": "Txt2Img", "img2img": "Img2Img", "inpaint": "MultiCanvas"}
+            "inpaint": "imagesuite-inp", "modify": "imagesuite-mod",
+            "overlays": "imagesuite-overlays", "settings": "imagesuite-settings"}
+_LABELS = {"txt2img": "Txt2Img", "img2img": "Img2Img", "inpaint": "MultiCanvas",
+           "modify": "Modify"}
 
 
 def build_suite(model_choices_by_mode=None, lora_choices=None, native_dl_choices=None,

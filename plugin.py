@@ -13,6 +13,7 @@ URL" flow; do not add to the bundled plugins.json without dbm's approval.
 from __future__ import annotations
 
 import functools
+import os
 import time
 import traceback
 
@@ -33,8 +34,8 @@ except Exception:  # pragma: no cover
     _HAVE_LOCKS = False
     set_main_generation_running = None
 
-from .core import discovery, gen_sd, models, paths, presets, projects
-from .ui import canvas, contextmenu, logo, suite
+from .core import discovery, gen_sd, inbox, models, paths, presets, projects
+from .ui import canvas, contextmenu, logo, modify_canvas, suite
 from .ui.styles import CSS, LIGHTBOX_HTML
 
 PLUGIN_ID = "ImageSuite"
@@ -84,9 +85,20 @@ class ImageSuite(WAN2GPPlugin):
 
         self.add_tab(tab_id=PLUGIN_ID, label=PLUGIN_NAME,
                      component_constructor=self.create_ui)
-        # Inject a "Send current frame to Image Suite" section directly under the
-        # main page's video preview gallery (host plugin DOM-insertion hook).
-        self.insert_after("gallery_tabs", self._build_send_frame_section)
+        # Inject our own "Send current frame" section under the preview gallery —
+        # but ONLY when the standalone SendTo plugin isn't installed. When SendTo is
+        # present it owns that panel (and routes here via our sendto.json inbox), so
+        # we skip ours to avoid a duplicate. Either way we still drain the inbox in
+        # on_tab_select, so frames sent to us land regardless.
+        if not self._sendto_installed():
+            self.insert_after("gallery_tabs", self._build_send_frame_section)
+
+    @staticmethod
+    def _sendto_installed() -> bool:
+        """True if the standalone SendTo-Wan2GP plugin folder is present (host runs
+        from the repo root with ``plugins`` on sys.path)."""
+        base = os.path.abspath("plugins")
+        return os.path.isdir(os.path.join(base, "SendTo-Wan2GP"))
 
     def on_tab_select(self, state: dict):
         # Warn if the GPU looks busy, but DON'T bounce out — a stale lock would
@@ -95,7 +107,50 @@ class ImageSuite(WAN2GPPlugin):
         if _HAVE_LOCKS and any_GPU_process_running(state, PLUGIN_ID):
             gr.Warning("A generation appears to be running — if it's actually stuck, "
                        "hit ⛔ Abort to clear it.")
-        return gr.update()
+        # Drain any frames handed to us by SendTo (or another sender using our
+        # sendto.json inbox) and load them into the right slot.
+        return self._drain_inbox(state)
+
+    def _drain_inbox(self, state):
+        """on_tab_select handler: pull queued frames from state['imagesuite_inbox']
+        and route each to its slot. Returns updates for self.on_tab_outputs:
+        [img2img input, inpaint bg_bridge, modify bg_bridge, subtabs]."""
+        noop = gr.update()
+        out = [noop, noop, noop, noop]
+        ui = getattr(self, "_ui", None)
+        if not ui:
+            return out
+        try:
+            items = inbox.drain(state)
+        except Exception:
+            traceback.print_exc()
+            return out
+        if not items:
+            return out
+        pages, tab_ids = ui.get("pages", {}), ui.get("tab_ids", {})
+        last_slot = None
+        for it in items:
+            path = (it or {}).get("path")
+            slot = (it or {}).get("slot")
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                if slot == "img2img" and "img2img" in pages:
+                    out[0] = gr.update(value=path)
+                elif slot == "inpaint" and "inpaint" in pages:
+                    out[1] = canvas.bg_bridge_html(self._file_to_dataurl(path),
+                                                   "inpaint", nonce=time.time())
+                elif slot == "modify" and "modify" in pages:
+                    out[2] = modify_canvas.modify_bg_bridge_html(
+                        self._file_to_dataurl(path), "modify", nonce=time.time())
+                else:
+                    continue
+                last_slot = slot
+            except Exception:
+                traceback.print_exc()
+        if last_slot is not None and last_slot in tab_ids:
+            out[3] = gr.update(selected=tab_ids[last_slot])
+        return out
 
     # -- GPU arbitration ----------------------------------------------------
     # Wan2GP's GPU manager only knows about its OWN models (wan_model/offloadobj),
@@ -796,7 +851,17 @@ class ImageSuite(WAN2GPPlugin):
             self._wire_send_frame_section()
         except Exception:
             traceback.print_exc()
-        self.on_tab_outputs = [self.main_tabs] if hasattr(self, "main_tabs") else None
+        # on_tab_select drains the SendTo inbox into these (see _drain_inbox):
+        # [img2img input, inpaint bg_bridge, modify bg_bridge, subtabs].
+        try:
+            pages = ui["pages"]
+            self.on_tab_outputs = [pages["img2img"]["input_image"],
+                                   pages["inpaint"]["bg_bridge"],
+                                   pages["modify"]["bg_bridge"],
+                                   ui["subtabs"]]
+        except Exception:
+            traceback.print_exc()
+            self.on_tab_outputs = None
         return ui
 
     # -- LoRA helpers -------------------------------------------------------
@@ -1112,7 +1177,10 @@ class ImageSuite(WAN2GPPlugin):
     def _wire(self, ui):
         pages = ui["pages"]
         for mode, c in pages.items():
-            self._wire_page(mode, c)
+            if mode == "modify":          # settings-less editor page, wired apart
+                self._wire_modify_page(c)
+            else:
+                self._wire_page(mode, c)
         self._wire_prompt_library(pages)
         self._wire_sends(ui)
         self._wire_settings(ui)
@@ -1601,6 +1669,8 @@ class ImageSuite(WAN2GPPlugin):
         pages = ui["pages"]
         spec, comps = [], []  # spec[i] = (mode, key); comps[i] = component
         for mode, c in pages.items():
+            if "generate" not in c:       # non-gen pages (Modify) have nothing to persist
+                continue
             keys = [k for k in self._PERSIST_KEYS if k in c]
 
             def _save(*vals, _mode=mode, _keys=keys):
@@ -2446,24 +2516,146 @@ class ImageSuite(WAN2GPPlugin):
         btn.click(_h, inputs=inputs, outputs=outputs)
 
     # -- cross-page + Img2Vid sends ----------------------------------------
+    def _wire_image_send(self, btn, src, dst, dst_mode, subtabs, tab_ids, target):
+        """Send the picked result IMAGE without carrying any generation settings —
+        used by the settings-less Modify page and by every page's 'Modify' button.
+        target: 'image' (into an init-image slot) | 'inpaint_bridge' | 'modify_bridge'
+        (load onto a canvas via its bg bridge), then switch sub-tab."""
+        if target == "image":
+            outs = [dst["input_image"], subtabs]
+
+            def _h(picked):
+                if not picked:
+                    raise gr.Error("Select a result first.")
+                return picked, gr.update(selected=tab_ids[dst_mode])
+        else:
+            outs = [dst["bg_bridge"], subtabs]
+            fam = "modify" if target == "modify_bridge" else "inpaint"
+            bridge = (modify_canvas.modify_bg_bridge_html if target == "modify_bridge"
+                      else canvas.bg_bridge_html)
+
+            def _h(picked):
+                if not picked:
+                    raise gr.Error("Select a result first.")
+                return (bridge(self._file_to_dataurl(picked), fam, nonce=time.time()),
+                        gr.update(selected=tab_ids[dst_mode]))
+        btn.click(_h, inputs=[src["picked"]], outputs=outs)
+
+    def _wire_modify_page(self, c):
+        """The Modify tab: load an image into the editor, colour-match it to a
+        reference, and save the edited (cropped + colour-corrected) result into the
+        gallery. Crop/zoom/colour-correction live in the editor iframe; Python only
+        loads images in and reads the exported data-URL (c['out']) back out."""
+        import base64
+        import io
+        from PIL import Image
+
+        def _durl_to_pil(durl):
+            if not durl or "," not in durl:
+                return None
+            try:
+                raw = base64.b64decode(durl.split(",", 1)[1])
+                return Image.open(io.BytesIO(raw)).convert("RGB")
+            except Exception:
+                traceback.print_exc()
+                return None
+
+        # Load an uploaded / dropped image into the editor.
+        def _load_input(path):
+            if not path:
+                return gr.update()
+            return modify_canvas.modify_bg_bridge_html(
+                self._file_to_dataurl(path), "modify", nonce=time.time())
+        c["mod_input"].change(_load_input, inputs=[c["mod_input"]],
+                              outputs=[c["bg_bridge"]])
+
+        # Colour-match the current edited image to a reference, then reload it onto the
+        # canvas so further crop/colour edits stack. The js flushes the editor's export
+        # first so c['out'] is current, not the debounced previous value.
+        def _match(edited, ref_path):
+            src = _durl_to_pil(edited)
+            if src is None:
+                raise gr.Error("Load an image into the Modify canvas first.")
+            if not ref_path:
+                raise gr.Error("Pick a reference image first.")
+            try:
+                import cv2
+                import numpy as np
+                from .core import faceswap
+                ref = Image.open(ref_path).convert("RGB")
+                src_bgr = cv2.cvtColor(np.asarray(src), cv2.COLOR_RGB2BGR)
+                ref_bgr = cv2.cvtColor(np.asarray(ref), cv2.COLOR_RGB2BGR)
+                out_bgr = faceswap._color_transfer_lab(src_bgr, ref_bgr)
+                out = Image.fromarray(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
+            except Exception as e:
+                traceback.print_exc()
+                raise gr.Error(f"Colour match failed: {e}")
+            buf = io.BytesIO()
+            out.save(buf, format="PNG")
+            durl = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+            return (modify_canvas.modify_bg_bridge_html(durl, "modify", nonce=time.time()),
+                    "🎨 Colour-matched to the reference.")
+        c["mod_match"].click(
+            _match, inputs=[c["out"], c["mod_ref"]],
+            outputs=[c["bg_bridge"], c["mod_status"]],
+            js="() => { try{ window.__is_modify_exportnow(); }catch(e){} }")
+
+        # Save the edited image into the results gallery (so send-to can act on it).
+        def _save(edited):
+            img = _durl_to_pil(edited)
+            if img is None:
+                raise gr.Error("Nothing to save — load and edit an image first.")
+            gallery, picked, save = self._gallery_result(
+                [self._save_img(img, "modify")], "modify")
+            return gallery, picked, save, "💾 Saved to results."
+        c["mod_save"].click(
+            _save, inputs=[c["out"]],
+            outputs=[c["gallery"], c["picked"], c["save"], c["mod_status"]],
+            js="() => { try{ window.__is_modify_exportnow(); }catch(e){} }")
+
+        # Gallery select → picked (mirrors _wire_page's _pick) so send-to / Save As act
+        # on whichever saved result is clicked.
+        def _pick(evt: gr.EventData):
+            data = getattr(evt, "_data", {}) or {}
+            v = data.get("value") if isinstance(data, dict) else None
+            p = None
+            if isinstance(v, dict):
+                p = (v.get("image") or {}).get("path") or v.get("path")
+            elif isinstance(v, str):
+                p = v
+            return (p, gr.update(value=p)) if p else (gr.update(), gr.update())
+        c["gallery"].select(_pick, outputs=[c["picked"], c["save"]])
+
     def _wire_sends(self, ui):
         pages, subtabs, tab_ids = ui["pages"], ui["subtabs"], ui["tab_ids"]
 
         for mode, c in pages.items():
-            # → Img2Img: carry model+params+prompt + drop the picked image in.
-            if "to_i2i" in c and c["to_i2i"].visible:
-                self._wire_carry(c["to_i2i"], c, "img2img", pages["img2img"],
-                                 subtabs, tab_ids, with_image=True)
+            if mode == "modify":
+                # Modify has no model/prompt to carry — send the edited result IMAGE only.
+                self._wire_image_send(c["to_i2i"], c, pages["img2img"], "img2img",
+                                      subtabs, tab_ids, "image")
+                self._wire_image_send(c["to_inp"], c, pages["inpaint"], "inpaint",
+                                      subtabs, tab_ids, "inpaint_bridge")
+            else:
+                # → Img2Img: carry model+params+prompt + drop the picked image in.
+                if "to_i2i" in c and c["to_i2i"].visible:
+                    self._wire_carry(c["to_i2i"], c, "img2img", pages["img2img"],
+                                     subtabs, tab_ids, with_image=True)
 
-            # → MultiCanvas: carry settings + load the picked image as the canvas bg.
-            if "to_inp" in c and c["to_inp"].visible:
-                self._wire_carry(c["to_inp"], c, "inpaint", pages["inpaint"],
-                                 subtabs, tab_ids, bridge=True)
+                # → MultiCanvas: carry settings + load the picked image as the canvas bg.
+                if "to_inp" in c and c["to_inp"].visible:
+                    self._wire_carry(c["to_inp"], c, "inpaint", pages["inpaint"],
+                                     subtabs, tab_ids, bridge=True)
 
-            # → Txt2Img: carry model + all params + prompt (no image slot).
-            if "to_t2i" in c and c["to_t2i"].visible:
-                self._wire_carry(c["to_t2i"], c, "txt2img", pages["txt2img"],
-                                 subtabs, tab_ids)
+                # → Txt2Img: carry model + all params + prompt (no image slot).
+                if "to_t2i" in c and c["to_t2i"].visible:
+                    self._wire_carry(c["to_t2i"], c, "txt2img", pages["txt2img"],
+                                     subtabs, tab_ids)
+
+            # → Modify: load the picked image onto the Modify canvas (every page).
+            if "to_mod" in c and c["to_mod"].visible:
+                self._wire_image_send(c["to_mod"], c, pages["modify"], "modify",
+                                      subtabs, tab_ids, "modify_bridge")
 
             # → Img2Vid: hand the picked image to the Video Generator as its start frame.
             c["to_i2v"].click(self._send_to_img2vid, inputs=[self.state, c["picked"]],
@@ -2477,7 +2669,7 @@ class ImageSuite(WAN2GPPlugin):
         # Rescan rebuilds every page's model + LoRA dropdown choices. Each page's
         # model list is mode-specific (txt2img shows all; img2img/inpaint only
         # guide-capable), so build per-mode updates in pages-dict order.
-        modes = list(pages.keys())
+        modes = [m for m in pages if "model" in pages[m]]   # gen pages only (skip Modify)
         model_dds = [pages[m]["model"] for m in modes]
         lora_dds = [pages[m]["loras"] for m in modes]
 
@@ -2803,7 +2995,7 @@ class ImageSuite(WAN2GPPlugin):
             src_path = gr.State(None)
             with gr.Row():
                 target = gr.Dropdown(
-                    ["Img2Img", "MultiCanvas", "img2vid (init)", "img2vid (end image)"],
+                    ["Img2Img", "MultiCanvas", "Modify", "img2vid (init)", "img2vid (end image)"],
                     value="Img2Img", label="Send current frame to", scale=2)
                 load_btn = gr.Button("⟳ Load selected", scale=1)
             frame_no = gr.Slider(0, 0, value=0, step=1, label="Frame to send",
@@ -2837,6 +3029,7 @@ class ImageSuite(WAN2GPPlugin):
         pages, subtabs, tab_ids = ui["pages"], ui["subtabs"], ui["tab_ids"]
         i2i_input = pages["img2img"]["input_image"]
         inp_bridge = pages["inpaint"]["bg_bridge"]
+        mod_bridge = pages["modify"]["bg_bridge"]
         src_path, target = sf["src_path"], sf["target"]
         load_btn, frame_no = sf["load_btn"], sf["frame_no"]
         preview, send_btn = sf["preview"], sf["send_btn"]
@@ -2938,7 +3131,7 @@ class ImageSuite(WAN2GPPlugin):
                 send_img = frame_img
             if send_img is None:
                 gr.Warning("Load a frame first.")
-                return [noop, noop, noop, noop, noop]
+                return [noop, noop, noop, noop, noop, noop]
             try:
                 from PIL import Image
                 if not isinstance(send_img, Image.Image):
@@ -2951,7 +3144,13 @@ class ImageSuite(WAN2GPPlugin):
                 html = canvas.bg_bridge_html(self._file_to_dataurl(path), "inpaint",
                                              nonce=time.time())
                 gr.Info("Frame sent to the MultiCanvas background.")
-                return [noop, html, gr.update(selected=tab_ids["inpaint"]),
+                return [noop, html, noop, gr.update(selected=tab_ids["inpaint"]),
+                        gr.update(selected=PLUGIN_ID), noop]
+            if tgt == "Modify":
+                html = modify_canvas.modify_bg_bridge_html(
+                    self._file_to_dataurl(path), "modify", nonce=time.time())
+                gr.Info("Frame sent to the Modify canvas.")
+                return [noop, noop, html, gr.update(selected=tab_ids["modify"]),
                         gr.update(selected=PLUGIN_ID), noop]
             if tgt in ("img2vid (init)", "img2vid (end image)"):
                 is_end = tgt == "img2vid (end image)"
@@ -2973,9 +3172,9 @@ class ImageSuite(WAN2GPPlugin):
                 slot = "end image" if is_end else "init"
                 gr.Info(f"Frame sent to the Video Generator as the img2vid {slot}. "
                         "Pick an Image-to-Video model there if the current one isn't i2v.")
-                return [noop, noop, noop, nav, time.time()]
+                return [noop, noop, noop, noop, nav, time.time()]
             gr.Info("Frame sent to Img2Img as the init image.")
-            return [path, noop, gr.update(selected=tab_ids["img2img"]),
+            return [path, noop, noop, gr.update(selected=tab_ids["img2img"]),
                     gr.update(selected=PLUGIN_ID), noop]
 
         load_outs = [preview, frame_no, send_btn, src_path, corrected, which]
@@ -2987,5 +3186,5 @@ class ImageSuite(WAN2GPPlugin):
         frame_no.release(_scrub, inputs=[self.state, src_path, frame_no],
                          outputs=[preview, corrected, which])
         send_btn.click(_send, inputs=[self.state, target, which, preview, corrected],
-                       outputs=[i2i_input, inp_bridge, subtabs, self.main_tabs,
-                                self.refresh_form_trigger])
+                       outputs=[i2i_input, inp_bridge, mod_bridge, subtabs,
+                                self.main_tabs, self.refresh_form_trigger])

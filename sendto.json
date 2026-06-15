@@ -1,0 +1,10 @@
+{
+  "tab": "ImageSuite",
+  "inbox_key": "imagesuite_inbox",
+  "payload": "frame",
+  "targets": [
+    {"label": "Img2Img",     "slot": "img2img"},
+    {"label": "MultiCanvas", "slot": "inpaint"},
+    {"label": "Modify",      "slot": "modify"}
+  ]
+}

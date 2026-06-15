@@ -17,6 +17,7 @@ from __future__ import annotations
 import gradio as gr
 
 from . import canvas as _canvas
+from . import modify_canvas as _modify
 from . import enhance as _enhance
 from ..core import overlays as _ovcore
 from ..core import prompt_library as _plib
@@ -42,7 +43,7 @@ _RES_PRESETS_INIT = [
     ("🖼 Landscape · 1536×640", "1536×640"),
 ]
 
-MODES = ("txt2img", "img2img", "inpaint")
+MODES = ("txt2img", "img2img", "inpaint", "modify")
 
 
 def _settings_bar(model_choices, lora_choices, mode):
@@ -251,7 +252,7 @@ def _results_block(c, mode, include_gallery=True):
     if include_gallery:
         _results_gallery(c, mode)
     c["picked"] = gr.State(_init_path)  # path of the selected (clicked) result
-    if mode != "inpaint":   # Generate/Abort + status sit directly under the gallery
+    if mode not in ("inpaint", "modify"):   # Generate/Abort + status sit directly under the gallery
         with gr.Row(elem_classes="imagesuite-genrow"):
             c["generate"] = gr.Button(
                 {"txt2img": "Generate", "img2img": "Reimagine (img2img)"}[mode],
@@ -262,10 +263,11 @@ def _results_block(c, mode, include_gallery=True):
     with gr.Row(elem_classes="imagesuite-sendrow"):
         # Txt2Img/Img2Img hide their own-page button; MultiCanvas keeps it as
         # "Back to canvas" so the inpainted result can be re-loaded for another pass.
-        c["to_t2i"] = gr.Button("Txt2Img", visible=mode != "txt2img")
+        c["to_t2i"] = gr.Button("Txt2Img", visible=mode not in ("txt2img", "modify"))
         c["to_i2i"] = gr.Button("Img2Img", visible=mode != "img2img")
         c["to_inp"] = gr.Button("↻ Back to canvas" if mode == "inpaint"
                                 else "MultiCanvas")
+        c["to_mod"] = gr.Button("Modify", visible=mode != "modify")
         c["to_i2v"] = gr.Button("Img2Vid")
     c["save"] = gr.DownloadButton("Save As…", value=_init_path,
                                   elem_classes="imagesuite-savebtn")
@@ -298,6 +300,37 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
                     c["generate"] = gr.Button("Inpaint", variant="primary", scale=4)
                     c["abort"] = gr.Button("⛔ Abort", variant="stop", scale=1)
                 c["gen_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
+        return c
+
+    if mode == "modify":
+        # Editor layout mirrors MultiCanvas: the Modify canvas + results on the
+        # left; the load / colour-match / save controls on the right. No prompt or
+        # model settings — this page only edits an existing image.
+        with gr.Row():
+            with gr.Column(scale=3):
+                gr.Markdown(
+                    "Crop, zoom and colour-correct an image. Load one on the right "
+                    "or **Send to Modify** from any result. Adjustments preview live; "
+                    "click **Save to results** to keep the edited image, then send it "
+                    "anywhere.", elem_classes="imagesuite-help")
+                c.update(_modify.build_modify_canvas("modify"))
+                _results_block(c, mode)
+            with gr.Column(scale=2):
+                c["mod_input"] = gr.Image(
+                    label="Image to modify (double-click to enlarge)",
+                    type="filepath", height=220, elem_classes="imagesuite-initthumb")
+                with gr.Accordion("Colour match", open=True,
+                                  elem_classes="imagesuite-acc"):
+                    gr.Markdown(
+                        "Match the edited image's colours to a reference (LAB "
+                        "mean/std transfer), then keep editing on top.",
+                        elem_classes="imagesuite-help")
+                    c["mod_ref"] = gr.Image(label="Reference image",
+                                            type="filepath", height=180)
+                    c["mod_match"] = gr.Button("🎨 Apply colour match")
+                with gr.Row(elem_classes="imagesuite-genrow"):
+                    c["mod_save"] = gr.Button("💾 Save to results", variant="primary")
+                c["mod_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
         return c
 
     with gr.Row():

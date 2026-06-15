@@ -83,6 +83,28 @@ input[type=range]{width:100%}
         </div>
       </div>
       <div class="sec">
+        <div class="seclabel">Resize output</div>
+        <label class="fld" style="cursor:pointer"><span>Resize export</span>
+          <input type="checkbox" id="rs_on"></label>
+        <div id="rs_body" style="display:none">
+          <div class="aspseg" id="rsseg">
+            <button data-px="512" title="Square 512">512</button>
+            <button data-px="768" title="Square 768">768</button>
+            <button data-px="1024" title="Square 1024">1024</button>
+            <button data-px="1536" title="Square 1536">1536</button>
+          </div>
+          <div class="row2">
+            <label style="font-size:11px;color:#cfcfe0">W<input type="number" id="rs_w"
+              min="8" max="8192" step="8" style="width:100%"></label>
+            <label style="font-size:11px;color:#cfcfe0">H<input type="number" id="rs_h"
+              min="8" max="8192" step="8" style="width:100%"></label>
+          </div>
+          <label class="fld" style="cursor:pointer"><span>Lock to crop aspect</span>
+            <input type="checkbox" id="rs_lock" checked></label>
+          <div id="rs_info" class="fld" style="font-size:10px;opacity:.65"></div>
+        </div>
+      </div>
+      <div class="sec">
         <div class="seclabel">Colour</div>
         <div class="fld"><span>Brightness</span><span id="briv">100</span></div>
         <input type="range" id="bri" min="50" max="150" value="100">
@@ -115,6 +137,8 @@ var crop={x:0,y:0,w:0,h:0};
 var aspect=0;  // 0 = free, else w/h ratio
 var baked={x:0,y:0,w:0,h:0};  // region of baseImg that the export covers
 var dragging=null,dragStart=null;  // crop interaction state
+// resize/output: when outOn, the export is scaled to outW x outH (else native crop)
+var outOn=false,outW=0,outH=0,outLock=true;
 
 // does this engine support 2D ctx.filter? (assigning an unsupported value is
 // silently ignored rather than thrown, so feature-detect explicitly)
@@ -277,6 +301,37 @@ function resetColUI(){ bri=100;con=100;sat=100;hue=0;warmth=0;
     var lab=document.getElementById(o[1]); if(lab) lab.textContent=o[2]; }); }
 document.getElementById('resetcol').addEventListener('click',function(){ resetColUI(); render(); pushExport(); });
 
+// -- resize / output size: crop selects the region, this sets the exported pixels.
+// e.g. crop a 1:1 679x679 region and emit it at 1024x1024. --
+function cropAspect(){ return (crop.h>0)? crop.w/crop.h : 1; }
+function rsInfo(){ var i=document.getElementById('rs_info'); if(!i) return;
+  var cw=Math.round(crop.w), ch=Math.round(crop.h);
+  i.textContent=(outOn && outW>0 && outH>0)
+    ? ('crop '+cw+'×'+ch+' → '+outW+'×'+outH)
+    : ('crop '+cw+'×'+ch+' (native)'); }
+function rsSet(w,h){ outW=Math.max(8,Math.round(w)); outH=Math.max(8,Math.round(h));
+  var ew=document.getElementById('rs_w'),eh=document.getElementById('rs_h');
+  if(ew) ew.value=outW; if(eh) eh.value=outH; rsInfo(); }
+function resetRsUI(){ outOn=false; outW=0; outH=0; outLock=true;
+  var on=document.getElementById('rs_on'); if(on) on.checked=false;
+  var body=document.getElementById('rs_body'); if(body) body.style.display='none';
+  var lk=document.getElementById('rs_lock'); if(lk) lk.checked=true;
+  document.querySelectorAll('#rsseg button').forEach(function(o){ o.classList.remove('on'); }); }
+document.getElementById('rs_on').addEventListener('change',function(e){ outOn=e.target.checked;
+  document.getElementById('rs_body').style.display=outOn?'':'none';
+  if(outOn && (!outW||!outH)) rsSet(Math.round(crop.w),Math.round(crop.h));
+  rsInfo(); pushExport(); });
+document.querySelectorAll('#rsseg button').forEach(function(b){ b.addEventListener('click',function(){
+  document.querySelectorAll('#rsseg button').forEach(function(o){ o.classList.toggle('on',o===b); });
+  var px=+b.dataset.px; rsSet(px, outLock? px/cropAspect() : px); pushExport(); }); });
+document.getElementById('rs_w').addEventListener('input',function(e){ outW=Math.max(8,Math.round(+e.target.value||0));
+  if(outLock){ outH=Math.max(8,Math.round(outW/cropAspect()));
+    var eh=document.getElementById('rs_h'); if(eh) eh.value=outH; } rsInfo(); pushExport(); });
+document.getElementById('rs_h').addEventListener('input',function(e){ outH=Math.max(8,Math.round(+e.target.value||0));
+  if(outLock){ outW=Math.max(8,Math.round(outH*cropAspect()));
+    var ew=document.getElementById('rs_w'); if(ew) ew.value=outW; } rsInfo(); pushExport(); });
+document.getElementById('rs_lock').addEventListener('change',function(e){ outLock=e.target.checked; });
+
 // -- export (JS -> Python hidden Textbox) --
 function setHidden(id,val){ try{ var pd=parent.document;
   var e=pd.querySelector('#'+id+' textarea')||pd.querySelector('#'+id+' input'); if(!e) return;
@@ -285,22 +340,26 @@ function setHidden(id,val){ try{ var pd=parent.document;
   e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); }catch(err){} }
 function buildExport(){ if(!baseImg) return '';
   // export = the current crop region of the live baseImg, with the colour filter
-  // baked into the pixels via ctx.filter (or drawn raw if filters unsupported).
+  // baked into the pixels via ctx.filter (or drawn raw if filters unsupported),
+  // scaled to outW x outH when Resize is on (else the crop's native pixels).
   var cw=Math.max(1,Math.round(crop.w)), ch=Math.max(1,Math.round(crop.h));
-  var t=document.createElement('canvas'); t.width=cw; t.height=ch; var tc=t.getContext('2d');
+  var ow=cw, oh=ch;
+  if(outOn && outW>0 && outH>0){ ow=outW; oh=outH; }
+  var t=document.createElement('canvas'); t.width=ow; t.height=oh; var tc=t.getContext('2d');
   if(_CTX_FILTER){ try{ tc.filter=filterStr(); }catch(e){} }
-  tc.drawImage(baseImg, crop.x, crop.y, crop.w, crop.h, 0,0,cw,ch);
+  tc.imageSmoothingQuality='high';
+  tc.drawImage(baseImg, crop.x, crop.y, crop.w, crop.h, 0,0,ow,oh);
   return t.toDataURL('image/png'); }
 function exportNow(){ if(!hasBg) return; setHidden('imagesuite-'+MODE+'-out', buildExport()); }
 var exportTimer=null;
-function pushExport(){ if(!hasBg) return; clearTimeout(exportTimer); exportTimer=setTimeout(exportNow,120); }
+function pushExport(){ if(!hasBg) return; rsInfo(); clearTimeout(exportTimer); exportTimer=setTimeout(exportNow,120); }
 try{ parent.window['__is_'+MODE+'_exportnow']=exportNow; }catch(e){}
 
 function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im;
   setSize(im.naturalWidth,im.naturalHeight);
   crop={x:0,y:0,w:W,h:H}; baked={x:0,y:0,w:W,h:H};
   aspect=0; document.querySelectorAll('#aspseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.asp==='free'); });
-  resetColUI();
+  resetColUI(); resetRsUI();
   hasBg=true; document.getElementById('empty').style.display='none';
   fitView(); render(); pushExport(); }; im.src=dataUrl; }
 try{ parent.window['__is_'+MODE+'_setbg']=setBg; }catch(e){}

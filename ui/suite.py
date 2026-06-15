@@ -23,14 +23,14 @@ _LABELS = {"txt2img": "Txt2Img", "img2img": "Img2Img", "inpaint": "MultiCanvas",
 
 
 def build_suite(model_choices_by_mode=None, lora_choices=None, native_dl_choices=None,
-                sdxl_choices=None):
+                sdxl_choices=None, send_panel_fn=None):
     mc = model_choices_by_mode or {}
     pages = {}
     with gr.Tabs() as subtabs:
         for mode in page.MODES:
             with gr.Tab(_LABELS[mode], id=_TAB_IDS[mode]):
                 pages[mode] = page.build_page(mode, mc.get(mode), lora_choices,
-                                              sdxl_choices)
+                                              sdxl_choices, send_panel_fn=send_panel_fn)
         with gr.Tab("🖼 Overlays", id=_TAB_IDS["overlays"]):
             overlays = build_overlays_panel()
         with gr.Tab("⚙ Settings", id=_TAB_IDS["settings"]):

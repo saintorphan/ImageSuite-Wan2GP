@@ -242,12 +242,17 @@ def _results_gallery(c, mode):
                               object_fit="contain")
 
 
-def _results_block(c, mode, include_gallery=True):
+def _results_block(c, mode, include_gallery=True, send_panel_fn=None):
     """The shared results column: the gallery (unless already placed elsewhere —
     MultiCanvas puts it in the left column), then (Txt2Img/Img2Img) the Generate/Abort
     row + status, then the send-to row + Save As. Click a gallery item to make it the
     selection (``picked``). MultiCanvas builds its own 'Inpaint' button beside the
-    canvas, so this block skips the Generate row for it."""
+    canvas, so this block skips the Generate row for it.
+
+    send_panel_fn(picked) — optional: renders the unified SendTo picker for
+    cross-destination sends (img2vid, other plugins). The in-suite buttons above
+    stay for instant same-plugin (Txt2Img/Img2Img/MultiCanvas/Modify) moves, which
+    the SendTo inbox can't do (a same-tab switch doesn't fire the drain)."""
     _, _init_path = _persisted_results(mode)
     if include_gallery:
         _results_gallery(c, mode)
@@ -268,12 +273,19 @@ def _results_block(c, mode, include_gallery=True):
         c["to_inp"] = gr.Button("↻ Back to canvas" if mode == "inpaint"
                                 else "MultiCanvas")
         c["to_mod"] = gr.Button("Modify", visible=mode != "modify")
-        c["to_i2v"] = gr.Button("Img2Vid")
+        # Img2Vid + cross-plugin sends live in the unified SendTo panel below when the
+        # SendTo plugin is installed; this standalone button is the no-SendTo fallback
+        # (its handler stays wired either way).
+        c["to_i2v"] = gr.Button("Img2Vid", visible=send_panel_fn is None)
     c["save"] = gr.DownloadButton("Save As…", value=_init_path,
                                   elem_classes="imagesuite-savebtn")
+    # Unified SendTo picker (cross-destination: img2vid + other plugins). Rendered
+    # only when SendTo is present (plugin.py passes send_panel_fn=None otherwise).
+    c["_sendto_panel"] = send_panel_fn(c["picked"]) if send_panel_fn else None
 
 
-def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
+def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None,
+               send_panel_fn=None):
     assert mode in MODES, mode
     c = {"mode": mode}
 
@@ -289,7 +301,7 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
                     "model follows your paint.", elem_classes="imagesuite-help")
                 c.update(_canvas.build_canvas("inpaint"))
                 _overlays_strip_block(c)                           # folder picker
-                _results_block(c, mode)                            # results between overlays & enhance
+                _results_block(c, mode, send_panel_fn=send_panel_fn)                            # results between overlays & enhance
                 _touchup_block(c)                                  # under the canvas
                 c.update(_enhance.build_enhance_sections(mode, sdxl_choices, lora_choices))  # under the canvas
             with gr.Column(scale=2):
@@ -314,7 +326,7 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
                     "click **Save to results** to keep the edited image, then send it "
                     "anywhere.", elem_classes="imagesuite-help")
                 c.update(_modify.build_modify_canvas("modify"))
-                _results_block(c, mode)
+                _results_block(c, mode, send_panel_fn=send_panel_fn)
             with gr.Column(scale=2):
                 c["mod_input"] = gr.Image(
                     label="Image to modify (double-click to enlarge)",
@@ -358,5 +370,5 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None):
 
         # -- right: results + Generate/Abort --
         with gr.Column(scale=1):
-            _results_block(c, mode)
+            _results_block(c, mode, send_panel_fn=send_panel_fn)
     return c

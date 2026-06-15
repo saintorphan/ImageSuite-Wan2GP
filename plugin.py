@@ -100,6 +100,29 @@ class ImageSuite(WAN2GPPlugin):
         base = os.path.abspath("plugins")
         return os.path.isdir(os.path.join(base, "SendTo-Wan2GP"))
 
+    def _sendto_panel_fn(self):
+        """fn(picked_state) -> the unified SendTo picker for CROSS-destination sends
+        (img2vid + other plugins). None when SendTo isn't installed — then each tab's
+        Img2Vid button shows as the fallback. Same-plugin moves stay on the direct
+        buttons (Txt2Img/Img2Img/MultiCanvas/Modify): SendTo's inbox can't do a
+        same-tab hop, so we exclude our own tab from the panel."""
+        try:
+            from sendto.embed import build_send_panel
+        except Exception:
+            return None
+
+        def _fn(picked):
+            try:
+                return build_send_panel(
+                    self.state, self.main_tabs, [picked], (lambda p: p),
+                    refresh_trigger=getattr(self, "refresh_form_trigger", None),
+                    get_settings=getattr(self, "get_current_model_settings", None),
+                    exclude_tab=PLUGIN_ID, include_save=False, title="📤 Send to")
+            except Exception:
+                traceback.print_exc()
+                return None
+        return _fn
+
     def on_tab_select(self, state: dict):
         # Warn if the GPU looks busy, but DON'T bounce out — a stale lock would
         # otherwise trap the user out of the tab (and away from ⛔ Abort, which
@@ -838,7 +861,8 @@ class ImageSuite(WAN2GPPlugin):
             ui = suite.build_suite(model_choices_by_mode=choices_by_mode,
                                    lora_choices=lora_choices,
                                    native_dl_choices=self._native_dl_choices(),
-                                   sdxl_choices=sdxl_choices)
+                                   sdxl_choices=sdxl_choices,
+                                   send_panel_fn=self._sendto_panel_fn())
         # Kept so the main-page "Send current frame" section (injected under the
         # preview gallery BEFORE this tab is built) can reach our pages/subtabs when
         # we wire it, just below.

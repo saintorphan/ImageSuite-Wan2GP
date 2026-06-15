@@ -81,9 +81,59 @@ def build_enhance_sections(mode, sdxl_choices=None, lora_choices=None):
                 c["color_ref"] = gr.Image(label="Color / style reference", type="filepath",
                                           height=150, elem_classes="imagesuite-refthumb")
                 with gr.Column():
+                    # Plus = look/texture only (default, current behaviour). FaceID
+                    # variants transfer the reference face's *identity* via InsightFace
+                    # embeddings — need a clear face + the FaceID weights (Settings → Models).
+                    c["color_variant"] = gr.Dropdown(
+                        choices=[("Plus (look)", "plus"),
+                                 ("FaceID", "faceid"),
+                                 ("FaceID-Plus-v2 (identity)", "faceid_plus")],
+                        value="plus", label="IP-Adapter variant")
                     c["color_scale"] = gr.Slider(0.0, 1.0, value=0.6, step=0.05,
                                                  label="Reference strength")
                     c["color_denoise"] = gr.Slider(0.0, 1.0, value=0.6, step=0.05,
                                                    label="Denoise")
             c["color_run"] = gr.Button("Apply color reference on the selected result", size="sm")
+
+        _build_compare(c)
     return c
+
+
+def _build_compare(c):
+    """Before/after compare + Accept/Revert for the destructive enhancement passes.
+
+    Hidden until a pass runs (so the normal gallery flow is untouched when unused).
+    Uses gr.ImageSlider where the running Gradio offers it (a single drag-to-compare
+    widget), else falls back to two side-by-side gr.Image previews. plugin.py reads
+    ``cmp_kind`` to know which it built, fills ``cmp_before``/``cmp_after`` (the
+    original + enhanced paths) on every pass, and wires Accept (keep) / Revert
+    (restore the original into the gallery)."""
+    # original ("before") + enhanced ("after") paths held for the Revert handler.
+    c["cmp_before"] = gr.State(None)
+    c["cmp_after"] = gr.State(None)
+    with gr.Accordion("Before / after — Accept or Revert", open=True,
+                      visible=False, elem_classes="imagesuite-acc") as cmp_acc:
+        c["cmp_panel"] = cmp_acc
+        gr.Markdown("Drag the handle to compare the **original** (left) with the "
+                    "**enhanced** result (right). The enhanced result is already in "
+                    "the gallery — click **Revert** to put the original back, or "
+                    "**Accept** to keep it and close this.",
+                    elem_classes="imagesuite-help")
+        if hasattr(gr, "ImageSlider"):
+            c["cmp_kind"] = "slider"
+            c["cmp_slider"] = gr.ImageSlider(label="Original ↔ Enhanced",
+                                             type="filepath", height=420,
+                                             show_download_button=False,
+                                             interactive=False)
+        else:  # older Gradio without ImageSlider → two side-by-side previews
+            c["cmp_kind"] = "pair"
+            with gr.Row():
+                c["cmp_before_img"] = gr.Image(label="Original", type="filepath",
+                                               height=360, interactive=False)
+                c["cmp_after_img"] = gr.Image(label="Enhanced", type="filepath",
+                                              height=360, interactive=False)
+        with gr.Row():
+            c["cmp_accept"] = gr.Button("✅ Accept (keep enhanced)", size="sm",
+                                        variant="primary")
+            c["cmp_revert"] = gr.Button("↩ Revert (restore original)", size="sm",
+                                        variant="stop")

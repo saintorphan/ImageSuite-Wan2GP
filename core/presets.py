@@ -50,6 +50,97 @@ _DENOISE = {"img2img": 0.6, "inpaint": 0.75}
 # Keep within the UI slider bounds.
 _W_MIN, _W_MAX, _STEPS_MAX, _CFG_MIN, _CFG_MAX = 256, 2048, 60, 1.0, 15.0
 
+# --- distilled "Turbo" presets (SD/SDXL family only) -----------------------
+# Each non-Off mode pins a distill LoRA (matched by filename hint against the
+# user's SDXL LoRA dir), the scheduler the distillation expects (LCM/TCD), and
+# clamped few-step / low-CFG numbers. ``hints`` are case-insensitive substrings
+# searched in LoRA filenames; the first match wins. ``sampler``/``scheduler`` are
+# create_scheduler() keys (LCM → LCMScheduler, TCD → DPM++ family at CFG~1).
+# At CFG ~1 classifier-free guidance is effectively off, so the negative prompt
+# is ignored — the UI surfaces this.
+TURBO_OFF = "Off"
+TURBO_PROFILES = {
+    # name: distill LoRA filename hints, scheduler sampler, scheduler variant,
+    #       steps, cfg.
+    "LCM": {
+        "hints": ["lcm"],
+        "sampler": "LCM", "scheduler": "Normal",
+        "steps": 6, "cfg": 1.5,
+    },
+    "Hyper-SD": {
+        # Hyper-SD ships LCM-compatible distill LoRAs (and an 8-step CFG variant);
+        # the LCM scheduler is the safe default for the common few-step weights.
+        "hints": ["hyper", "hypersd", "hyper-sd", "hyper_sd"],
+        "sampler": "LCM", "scheduler": "Normal",
+        "steps": 8, "cfg": 1.0,
+    },
+    "Lightning": {
+        # SDXL-Lightning distillation runs on Euler at CFG 1 (no extra scheduler).
+        "hints": ["lightning", "lightnig", "sdxl_lightning", "sdxl-lightning"],
+        "sampler": "Euler", "scheduler": "SGM Uniform",
+        "steps": 8, "cfg": 1.0,
+    },
+}
+# Turbo step counts are intentionally tiny; clamp to a sane distill range so a
+# stray profile edit can never request 60 steps from a 4-8-step distillation.
+_TURBO_STEPS_MIN, _TURBO_STEPS_MAX = 4, 12
+
+
+def turbo_choices() -> list[str]:
+    """Dropdown values: Off (default) + each distilled profile name."""
+    return [TURBO_OFF] + list(TURBO_PROFILES.keys())
+
+
+def _find_distill_lora(hints, lora_dir) -> str | None:
+    """First LoRA filename (stem) under *lora_dir* whose name contains any hint
+    (case-insensitive), searched recursively. None if the dir is missing or no
+    file matches — the caller then warns and falls back to normal generation."""
+    try:
+        lora_dir = Path(lora_dir)
+        if not lora_dir.is_dir():
+            return None
+        hints = [h.lower() for h in (hints or [])]
+        for ext in (".safetensors", ".ckpt", ".pt"):
+            for f in sorted(lora_dir.rglob(f"*{ext}")):
+                name = f.name.lower()
+                if any(h in name for h in hints):
+                    return f.stem
+    except Exception:
+        return None
+    return None
+
+
+def resolve_turbo(turbo, lora_dir) -> dict:
+    """Resolve a Turbo selection into an applicable profile against *lora_dir*.
+
+    Returns a dict:
+      - {"enabled": False}                          — Off / unknown (unchanged).
+      - {"enabled": True, ...}                       — matched: carries ``lora``
+        (stem), ``sampler``, ``scheduler``, ``steps`` (clamped), ``cfg``, ``name``.
+      - {"enabled": False, "warn": "..."}            — selected but no distill LoRA
+        found; caller warns and runs normally.
+
+    Does NOT touch the GPU or load anything — pure file lookup + clamping, so it's
+    safe to call before deciding whether to apply.
+    """
+    name = (turbo or TURBO_OFF)
+    prof = TURBO_PROFILES.get(name)
+    if not prof:
+        return {"enabled": False}
+    lora = _find_distill_lora(prof.get("hints"), lora_dir)
+    if not lora:
+        return {"enabled": False, "warn": (
+            f"Turbo '{name}' selected but no matching distill LoRA "
+            f"(hint: {', '.join(prof.get('hints') or [])}) was found in the SDXL "
+            f"LoRA dir — generating normally.")}
+    steps = max(_TURBO_STEPS_MIN, min(_TURBO_STEPS_MAX, int(prof["steps"])))
+    cfg = float(max(_CFG_MIN, min(_CFG_MAX, prof["cfg"])))
+    return {
+        "enabled": True, "name": name, "lora": lora,
+        "sampler": prof["sampler"], "scheduler": prof["scheduler"],
+        "steps": steps, "cfg": cfg,
+    }
+
 
 def _snap(v, lo=_W_MIN, hi=_W_MAX, step=64) -> int:
     return max(lo, min(hi, int(round(v / step) * step)))

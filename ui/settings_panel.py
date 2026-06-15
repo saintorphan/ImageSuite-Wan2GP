@@ -136,6 +136,33 @@ def build_settings_panel(native_dl_choices=None):
                 elem_classes="imagesuite-help")
             c["unload_models"] = gr.Button("🧹 Unload models (free VRAM)")
             c["unload_status"] = gr.Markdown("", elem_classes="imagesuite-help")
+            gr.Markdown(
+                "**SD memory policy** — how the bundled SDXL pipeline manages VRAM. "
+                "*Balanced* (default) moves the checkpoint to the GPU and fully frees "
+                "it when another model needs the GPU (the next SD gen re-reads ~6.5GB "
+                "from disk). *Keep resident* skips that free for back-to-back SD gens "
+                "(handing the GPU to Wan2GP still frees it). *Sequential offload* "
+                "streams weights per-step for the lowest peak VRAM on tight GPUs "
+                "(slower).",
+                elem_classes="imagesuite-help")
+            c["sd_mem_policy"] = gr.Dropdown(
+                label="SD memory policy",
+                choices=[("Balanced (default)", "balanced"),
+                         ("Keep resident", "keep"),
+                         ("Sequential offload", "sequential")],
+                value=paths.get_sd_mem_policy())
+
+            gr.Markdown(
+                "**Live preview while sampling** — decode the in-progress image "
+                "every few steps with a tiny VAE (TAESD, ~10MB, auto-downloaded on "
+                "first use) and show it under the Txt2Img Generate button. OFF by "
+                "default. Adds a little overhead per step; SDXL/Pony/Illustrious only "
+                "(native Flux/Z-Image/Qwen aren't affected). If TAESD can't be "
+                "downloaded the preview is simply skipped — generation is unaffected.",
+                elem_classes="imagesuite-help")
+            c["sd_live_preview"] = gr.Checkbox(
+                label="Show live latent preview (Txt2Img)",
+                value=paths.get_sd_live_preview())
 
         # -- Default Generation Values (per family; shared via .orphansuite.json) --
         with gr.Accordion("Default Generation Values (per family)", open=False,

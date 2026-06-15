@@ -20,6 +20,7 @@ from . import canvas as _canvas
 from . import modify_canvas as _modify
 from . import enhance as _enhance
 from ..core import overlays as _ovcore
+from ..core import presets as _presets
 from ..core import prompt_library as _plib
 from ..core.sd import sd_samplers as _sd_samplers
 
@@ -50,7 +51,7 @@ _RES_PRESETS_INIT = [
 MODES = ("txt2img", "img2img", "inpaint", "modify")
 
 
-def _settings_bar(model_choices, lora_choices, mode):
+def _settings_bar(model_choices, lora_choices, mode, sdxl_choices=None):
     c = {}
     # Universal generation settings — laid out identically on every tab so the
     # panel reads the same whichever sub-tab you're on. Two controls per row
@@ -109,6 +110,57 @@ def _settings_bar(model_choices, lora_choices, mode):
             c["loras"] = gr.Dropdown(label="LoRAs (SDXL family)", multiselect=True,
                                      choices=lora_choices or [], scale=3)
             c["lora_mult"] = gr.Textbox(label="Multipliers", placeholder="0.8, 1.0", scale=1)
+        # Distilled few-step presets (SDXL family). Off (default) = unchanged. Each
+        # other mode fuses a matched distill LoRA from your SDXL LoRA dir and forces
+        # the scheduler + clamped steps/CFG; if no matching distill LoRA is found it
+        # warns and generates normally. Native Flux/Z-Image/Qwen ignore it.
+        with gr.Row():
+            c["turbo"] = gr.Dropdown(
+                label="⚡ Turbo (distilled few-step)",
+                choices=_presets.turbo_choices(), value=_presets.TURBO_OFF, scale=3,
+                info="SDXL family only. Fuses a matched distill LoRA (LCM / Hyper-SD "
+                     "/ Lightning) and forces sampler + steps + CFG. CFG ~1 means "
+                     "classifier-free guidance is off, so the NEGATIVE prompt is "
+                     "IGNORED. No matching LoRA → warns and runs normally.")
+        # Hi-res fix (txt2img only, SDXL family): base gen → upscale by HR scale →
+        # low-denoise img2img second pass on the same loaded pipe (no second model).
+        # HR scale 1.0 (default) = OFF → behaviour unchanged. Native models ignore it.
+        if mode == "txt2img":
+            with gr.Row():
+                c["hr_scale"] = gr.Slider(
+                    1.0, 2.0, value=1.0, step=0.05, label="🔍 Hi-res fix scale",
+                    info="1.0 = off. >1.0 upscales then runs a low-denoise img2img "
+                         "refine pass (sharper, larger). SDXL family only.")
+                c["hr_denoise"] = gr.Slider(
+                    0.2, 0.7, value=0.4, step=0.05, label="Hi-res denoise",
+                    info="Refine-pass strength. Lower keeps the base composition; "
+                         "higher adds detail (and can drift). Used when scale > 1.0.")
+            # SDXL refiner (txt2img only, SDXL family): the base pass stops at the
+            # switch-at fraction and a SECOND SDXL checkpoint finishes the schedule
+            # (diffusers ensemble-of-experts). Disabled by default → single-pass,
+            # behaviour unchanged. Native Flux/Z-Image/Qwen ignore it.
+            with gr.Accordion("🪄 Refiner (SDXL only)", open=False,
+                              elem_classes="imagesuite-acc"):
+                gr.Markdown(
+                    "Run a second **SDXL / Pony / Illustrious** checkpoint over the "
+                    "tail end of the schedule for crisper detail (diffusers "
+                    "ensemble-of-experts). Off = single pass. Native "
+                    "Flux / Z-Image / Qwen ignore this.",
+                    elem_classes="imagesuite-help")
+                c["refiner_enable"] = gr.Checkbox(
+                    value=False, label="Enable refiner pass")
+                c["refiner_model"] = gr.Dropdown(
+                    label="Refiner checkpoint (SDXL family)",
+                    choices=sdxl_choices or [], value=None)
+                with gr.Row():
+                    c["refiner_switch_at"] = gr.Slider(
+                        0.5, 0.95, value=0.8, step=0.05, label="Switch at",
+                        info="Fraction of the schedule done on the BASE model before "
+                             "the refiner takes over (0.8 = base does 80%).")
+                    c["refiner_steps"] = gr.Slider(
+                        4, 40, value=10, step=1, label="Refiner steps")
+                    c["refiner_cfg"] = gr.Slider(
+                        1.0, 15.0, value=7.0, step=0.5, label="Refiner CFG")
 
     if mode == "inpaint":
         # Mask + inpaint knobs live in their own block, so the generation settings
@@ -164,6 +216,12 @@ def _prompt_library_block(c, mode):
             c["pl_update"] = gr.Button("⟳ Update", size="sm")
             c["pl_load"] = gr.Button("📥 Load", variant="primary", size="sm")
             c["pl_delete"] = gr.Button("🗑 Delete", variant="stop", size="sm")
+        # Recall A1111-style "parameters" PNG metadata from any image (one written by
+        # this plugin's SDXL backend, or any A1111/Forge/reForge export) straight into
+        # the form. UploadButton hands a temp file path to the handler in plugin.py;
+        # an image with no readable metadata is a friendly no-op.
+        c["pl_read"] = gr.UploadButton("🔎 Read params from PNG", file_count="single",
+                                       file_types=["image"], size="sm")
         c["pl_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
 
 
@@ -281,6 +339,20 @@ def _results_block(c, mode, include_gallery=True, send_panel_fn=None):
     _, _init_path = _persisted_results(mode)
     if include_gallery:
         _results_gallery(c, mode)
+    # Live latent preview (txt2img only): a small TAESD-decoded image that updates
+    # every few sampling steps while generating. Hidden unless the Settings toggle
+    # is on (default OFF) so nothing changes for existing users. Wired to the
+    # streaming Generate handler in plugin.py.
+    if mode == "txt2img":
+        try:
+            from ..core import paths as _paths_live
+            _live_on = bool(_paths_live.get_sd_live_preview())
+        except Exception:
+            _live_on = False
+        c["live_preview"] = gr.Image(
+            label="Live preview (sampling…)", visible=_live_on, height=256,
+            interactive=False, show_download_button=False,
+            elem_classes="imagesuite-live-preview")
     c["picked"] = gr.State(_init_path)  # path of the selected (clicked) result
     if mode not in ("inpaint", "modify"):   # Generate/Abort + status sit directly under the gallery
         with gr.Row(elem_classes="imagesuite-genrow"):
@@ -325,6 +397,12 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None,
                     "inpaint; outside it's a direct edit. **Denoise** = how loosely the "
                     "model follows your paint.", elem_classes="imagesuite-help")
                 c.update(_canvas.build_canvas("inpaint"))
+                with gr.Row(elem_classes="imagesuite-genrow"):
+                    c["mc_magicmask"] = gr.Button(
+                        "🪄 Magic select subject",
+                        elem_classes="imagesuite-help")
+                    c["mc_mask_status"] = gr.Markdown(
+                        "", elem_classes="imagesuite-genstatus")
                 _overlays_strip_block(c)                           # folder picker
                 _results_block(c, mode, send_panel_fn=send_panel_fn)                            # results between overlays & enhance
                 _touchup_block(c)                                  # under the canvas
@@ -366,6 +444,8 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None,
                                             type="filepath", height=180)
                     c["mod_match"] = gr.Button("🎨 Apply colour match")
                 with gr.Row(elem_classes="imagesuite-genrow"):
+                    c["mod_removebg"] = gr.Button("✂️ Remove background")
+                with gr.Row(elem_classes="imagesuite-genrow"):
                     c["mod_save"] = gr.Button("💾 Save to results", variant="primary")
                 c["mod_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
         return c
@@ -374,7 +454,8 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None,
         # -- left: inputs --
         with gr.Column(scale=1):
             _prompt_library_block(c, mode)                         # above settings
-            c.update(_settings_bar(model_choices, lora_choices, mode))
+            c.update(_settings_bar(model_choices, lora_choices, mode,
+                                   sdxl_choices=sdxl_choices))
             if mode == "img2img":
                 # Init image sits to the RIGHT of the prompt/negative (same row),
                 # not as a full-width block below it — groups the inputs and reclaims

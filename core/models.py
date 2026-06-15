@@ -144,6 +144,10 @@ REGISTRY: list[ModelSpec] = [
     ModelSpec("ip_adapter", "IP-Adapter (body swap identity)",
               "Body swap: applies the source person's identity.", required=False,
               repo="h94/IP-Adapter"),
+    ModelSpec("ip_adapter_faceid", "IP-Adapter FaceID (true identity)",
+              "Colour Reference 'FaceID' variants: transfers the reference face's "
+              "identity (InsightFace embeddings) instead of just its look.",
+              required=False, repo="h94/IP-Adapter-FaceID"),
 ]
 
 # Models the body-swap path needs present (or it errors, not auto-downloads).

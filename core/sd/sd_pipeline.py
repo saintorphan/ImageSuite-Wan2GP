@@ -41,6 +41,13 @@ class SDImagePipeline:
         self._current_checkpoint: str = ""
         self._model_type: str = ""  # "sd15" or "sdxl"
         self._current_vae: str = ""
+        # Memory policy: "balanced" (default — .to('cuda') + full free on unload),
+        # "keep" (stay resident across unload so back-to-back gens skip the ~6.5GB
+        # disk re-read), "sequential" (accelerate sequential CPU offload — lowest
+        # peak VRAM, slower). gen_sd sets this from the persisted project setting
+        # before each load(); default keeps current behaviour so nothing regresses.
+        self._mem_policy: str = "balanced"
+        self._offloaded: bool = False  # True when the loaded pipe uses CPU offload
 
     # ------------------------------------------------------------------
     # Loading
@@ -70,9 +77,10 @@ class SDImagePipeline:
                 self._load_vae(vae_name, vae_precision)
             return
 
-        # Unload existing pipeline
+        # Unload existing pipeline. force=True: a checkpoint switch must always free
+        # the old pipe even under the "keep resident" policy (we're replacing it).
         if self._loaded:
-            self.unload()
+            self.unload(force=True)
 
         logger.info("Loading SD checkpoint: %s", checkpoint_path)
         model_type = detect_model_type(checkpoint_path)
@@ -97,9 +105,11 @@ class SDImagePipeline:
             logger.error("Failed to load checkpoint %s: %s", checkpoint_path, exc)
             raise
 
-        # Move to GPU
-        if torch.cuda.is_available():
-            self.pipe = self.pipe.to("cuda")
+        # Place the pipe per the memory policy. "balanced"/"keep" move it straight
+        # to CUDA (current behaviour); "sequential" wires accelerate's per-step CPU
+        # offload for the lowest peak VRAM. Any failure falls back to plain CUDA so
+        # load() can never break on a policy choice.
+        self._offloaded = self._apply_mem_policy_on_load()
 
         # Attention: prefer diffusers' default SDPA (AttnProcessor2_0) on
         # torch>=2 — it matches/beats xformers and drops a fragile optional dep,
@@ -206,11 +216,100 @@ class SDImagePipeline:
             logger.warning("Failed to load VAE %s: %s", vae_file, exc)
 
     # ------------------------------------------------------------------
+    # Memory policy
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _free_vram_gb() -> float | None:
+        """Free CUDA VRAM in GB via ``torch.cuda.mem_get_info`` (None if unknown).
+
+        Same heuristic source used by the variant pipes — generalised here so the
+        load path can decide whether plain-CUDA placement is safe under a policy.
+        """
+        if torch is None or not torch.cuda.is_available():
+            return None
+        try:
+            free_bytes, _total = torch.cuda.mem_get_info()
+            return free_bytes / (1024 ** 3)
+        except Exception:
+            return None
+
+    def _apply_mem_policy_on_load(self) -> bool:
+        """Move/offload the freshly-built ``self.pipe`` per ``self._mem_policy``.
+
+        Returns True if the pipe ended up on accelerate CPU offload (so the rest
+        of load() and unload() can adapt). Always falls back to plain ``.to('cuda')``
+        on any error so a policy choice can never break loading.
+        """
+        if torch is None or not torch.cuda.is_available():
+            return False  # CPU-only: nothing to move/offload
+
+        policy = self._mem_policy
+        if policy == "sequential":
+            # Lowest peak VRAM: stream weights to GPU per step. enable_*_offload
+            # manages device placement itself, so do NOT also .to('cuda').
+            try:
+                self.pipe.enable_sequential_cpu_offload()
+                logger.info("SD memory policy 'sequential' — sequential CPU offload on.")
+                return True
+            except Exception:
+                logger.warning(
+                    "Sequential CPU offload failed; falling back to CUDA.",
+                    exc_info=True)
+
+        # "balanced" / "keep" (and the sequential fallback): straight to CUDA. A
+        # mem_get_info check only warns — we still try, matching prior behaviour.
+        free_gb = self._free_vram_gb()
+        if free_gb is not None and free_gb < 6.5:
+            logger.warning(
+                "Only ~%.1f GB VRAM free for the SD pipe (~6.5GB needed); "
+                "consider the 'Sequential offload' memory policy if this OOMs.",
+                free_gb)
+        try:
+            self.pipe = self.pipe.to("cuda")
+        except Exception:
+            logger.warning("Could not move SD pipe to CUDA.", exc_info=True)
+        return False
+
+    # ------------------------------------------------------------------
     # Unloading
     # ------------------------------------------------------------------
 
-    def unload(self) -> None:
-        """Free the pipeline and release GPU memory."""
+    def unload(self, force: bool = False) -> None:
+        """Free the pipeline and release GPU memory.
+
+        Under the "keep resident" memory policy a *non-forced* unload (the GPU
+        handoff / Unload-models button) keeps the main pipe loaded so back-to-back
+        SD gens skip the ~6.5GB checkpoint re-read; it still tears down the heavy
+        auxiliary pipes (body double / ControlNet) and empties the cache. ``force``
+        (used by load() on a checkpoint switch) always frees everything.
+        """
+        keep_resident = (
+            not force
+            and self._mem_policy == "keep"
+            and self._loaded
+            and self.pipe is not None
+            and not self._offloaded  # offloaded pipes aren't holding VRAM resident
+        )
+        if keep_resident:
+            # Free only the heavy aux pipes; keep the main + shared-component
+            # variants resident. (Body double / ControlNet fully unload the main
+            # pipe themselves, so they can't both be active with a resident main.)
+            if self._body_double_pipe is not None:
+                self._teardown_body_double(unloading=True)
+            if self._controlnet_pipe is not None:
+                self._teardown_controlnet()
+            if self._refiner_pipe is not None:
+                del self._refiner_pipe
+                self._refiner_pipe = None
+                self._refiner_checkpoint = ""
+            gc_module.collect()
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info(
+                "SD memory policy 'keep' — main pipe kept resident across unload.")
+            return
+
         if self._body_double_pipe is not None:
             # unloading=True: a full unload only FREES — never re-load the ~6.5GB
             # main pipe (the default restore-on-teardown would re-instantiate it
@@ -229,6 +328,13 @@ class SDImagePipeline:
             del self._img2img_pipe
             self._img2img_pipe = None
         if self.pipe is not None:
+            # If the pipe used accelerate CPU offload (sequential policy), strip its
+            # hooks first — .to('cpu') conflicts with offload-managed placement.
+            if self._offloaded:
+                try:
+                    self.pipe.remove_all_hooks()
+                except Exception:
+                    pass
             # Move all components to CPU before delete
             try:
                 self.pipe.to("cpu")
@@ -238,6 +344,7 @@ class SDImagePipeline:
             self.pipe = None
 
         self._loaded = False
+        self._offloaded = False
         self._current_checkpoint = ""
         self._model_type = ""
         self._current_vae = ""
@@ -274,8 +381,29 @@ class SDImagePipeline:
             torch_dtype=torch.float16,
             use_safetensors=checkpoint_path.endswith(".safetensors"),
         )
-        if torch.cuda.is_available():
-            self._refiner_pipe = self._refiner_pipe.to("cuda")
+        # The refiner is a SECOND SDXL pipe stacked on top of the still-resident base
+        # — a 12 GB-class card can't hold both. Mirror _get_inpaint's guard: model CPU
+        # offload (active submodule only on GPU) on <=16 GB cards, plain .to('cuda')
+        # above. .to('cuda') and offload conflict, so it's one or the other; any error
+        # falls back to offload (the safe, low-VRAM path).
+        try:
+            if torch.cuda.is_available():
+                _free, total = torch.cuda.mem_get_info()
+                if total <= 16 * 1024 ** 3:
+                    self._refiner_pipe.enable_model_cpu_offload()
+                else:
+                    self._refiner_pipe = self._refiner_pipe.to("cuda")
+        except Exception:
+            try:
+                self._refiner_pipe.enable_model_cpu_offload()
+            except Exception:
+                logger.warning("Refiner offload setup failed.", exc_info=True)
+        # VAE memory helpers (free; matches the base pipe / inpaint pipe).
+        try:
+            self._refiner_pipe.vae.enable_slicing()
+            self._refiner_pipe.vae.enable_tiling()
+        except Exception:
+            pass
         self._refiner_checkpoint = checkpoint_path
         logger.info("SDXL refiner loaded.")
         return self._refiner_pipe
@@ -883,7 +1011,7 @@ class SDImagePipeline:
         main_was_loaded = self._loaded
         main_checkpoint = self._current_checkpoint
         main_vae = self._current_vae
-        self.unload()
+        self.unload(force=True)  # must free even under "keep" — CN+IP pipe needs the VRAM
 
         model_type = detect_model_type(checkpoint_path)
         is_sdxl = model_type == "sdxl"
@@ -1398,7 +1526,7 @@ class SDImagePipeline:
         main_was_loaded = self._loaded
         main_checkpoint = self._current_checkpoint
         main_vae = self._current_vae
-        self.unload()
+        self.unload(force=True)  # must free even under "keep" — ControlNet pipe needs the VRAM
 
         model_type = detect_model_type(checkpoint_path)
         is_sdxl = model_type == "sdxl"

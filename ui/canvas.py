@@ -760,6 +760,24 @@ function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im;
   renderLayers(); compose(); pushExport(); }; im.src=dataUrl; }
 try{ parent.window['__is_'+MODE+'_setbg']=setBg; }catch(e){}
 
+// -- Magic select subject (Python -> JS): load an alpha/grayscale mask PNG
+//    (white = subject) into the mask layer. Mirrors setBg but writes mbx only,
+//    leaving the background + draw layers untouched. Thresholded so the mask is
+//    a clean white-on-black selection the inpaint/copy tools can act on. --
+function setMask(dataUrl){ if(!hasBg||!dataUrl) return;
+  var im=new Image(); im.onload=function(){
+    pushUndo(mbx,'mask');
+    var t=document.createElement('canvas'); t.width=W; t.height=H; var tc=t.getContext('2d');
+    tc.drawImage(im,0,0,W,H);
+    var d=tc.getImageData(0,0,W,H),p=d.data;
+    for(var i=0;i<p.length;i+=4){ var on=(p[i]>127||p[i+1]>127||p[i+2]>127);
+      p[i]=p[i+1]=p[i+2]=255; p[i+3]=on?255:0; }   // white where selected, transparent elsewhere
+    tc.putImageData(d,0,0);
+    mbx.clearRect(0,0,W,H); mbx.drawImage(t,0,0);
+    showMask=true; var sm=document.getElementById('showmask'); if(sm) sm.classList.add('on');
+    compose(); renderLayers(); pushExport(); }; im.src=dataUrl; }
+try{ parent.window['__is_'+MODE+'_setmask']=setMask; }catch(e){}
+
 // -- full MultiCanvas state for Projects: serialize ALL layers + base + mask
 //    (Save Project) and rebuild them (Load Project). Distinct from the flattened
 //    composite export above — this round-trips the editable layer stack. --
@@ -872,6 +890,7 @@ def build_canvas(mode="inpaint"):
     c["composite"] = gr.Textbox(visible=False, elem_id=f"imagesuite-{mode}-composite")
     c["mask"] = gr.Textbox(visible=False, elem_id=f"imagesuite-{mode}-mask")
     c["bg_bridge"] = gr.HTML(visible=False)
+    c["setmask_bridge"] = gr.HTML(visible=False)  # loads a segmentation alpha as the mask
     c["ov_bridge"] = gr.HTML(visible=False)  # pushes overlay thumbnails into the strip
     c["addlayer_bridge"] = gr.HTML(visible=False)  # adds one overlay as a new layer
     # Project save/load: 'state' carries the full layer-stack JSON (filled by
@@ -884,6 +903,15 @@ def build_canvas(mode="inpaint"):
 def bg_bridge_html(data_url: str, mode="inpaint", nonce="") -> str:
     inner = ("<script>/*" + str(nonce) + "*/try{parent.window['__is_" + mode
              + "_setbg'](" + _js_string(data_url) + ");}catch(e){}</script>")
+    return ('<iframe srcdoc="' + _html.escape(inner, quote=True)
+            + '" style="display:none;width:0;height:0;border:none"></iframe>')
+
+
+def setmask_bridge_html(data_url: str, mode="inpaint", nonce="") -> str:
+    """Load a segmentation alpha/grayscale PNG (white = subject) into the canvas
+    mask layer — see setMask in the iframe JS. Used by Magic select subject."""
+    inner = ("<script>/*" + str(nonce) + "*/try{parent.window['__is_" + mode
+             + "_setmask'](" + _js_string(data_url) + ");}catch(e){}</script>")
     return ('<iframe srcdoc="' + _html.escape(inner, quote=True)
             + '" style="display:none;width:0;height:0;border:none"></iframe>')
 

@@ -40,6 +40,7 @@ body{background:#15151b;color:#ddd;overflow:hidden;user-select:none}
 #rail button{background:#2a2a35;border:1px solid #3a3a48;color:#cfcfe0;border-radius:6px;
   padding:6px 4px;font-size:11px;cursor:pointer;line-height:1.1}
 #rail button.on{background:#e83e8c;border-color:#e83e8c;color:#fff}
+#rail button:disabled{opacity:.35;cursor:default}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:4px}
 .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px}
 .aspseg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px}
@@ -87,6 +88,23 @@ input[type=range]{width:100%}
         <div class="row2">
           <button id="fliph" title="Flip horizontally">&#8596;</button>
           <button id="flipv" title="Flip vertically">&#8597;</button>
+        </div>
+        <div class="row2">
+          <button id="rotl" title="Rotate 90&#176; left">&#8634; 90&#176;</button>
+          <button id="rotr" title="Rotate 90&#176; right">&#8635; 90&#176;</button>
+        </div>
+        <div class="fld"><span>Straighten</span><span id="finev">0</span>&#176;</div>
+        <input type="range" id="fine" min="-45" max="45" value="0" step="0.5">
+        <div class="row2">
+          <button id="fineapply" title="Re-raster at this angle (auto-fit)">&#10003; Apply rotate</button>
+          <button id="finereset" title="Reset straighten to 0&#176;">&#8634; 0&#176;</button>
+        </div>
+      </div>
+      <div class="sec">
+        <div class="seclabel">History</div>
+        <div class="row2">
+          <button id="undo" title="Undo (Ctrl+Z)">&#8630; Undo</button>
+          <button id="redo" title="Redo (Ctrl+Y)">&#8631; Redo</button>
         </div>
       </div>
       <div class="sec">
@@ -146,6 +164,10 @@ var baked={x:0,y:0,w:0,h:0};  // region of baseImg that the export covers
 var dragging=null,dragStart=null;  // crop interaction state
 // resize/output: when outOn, the export is scaled to outW x outH (else native crop)
 var outOn=false,outW=0,outH=0,outLock=true;
+// straighten: live preview angle (deg) applied by rotating the whole working image
+var fineAng=0;
+// undo/redo: bounded snapshot stack of full editor state (working image as data-URL)
+var UNDO=[],REDO=[],HCAP=10,restoring=false;
 
 // does this engine support 2D ctx.filter? (assigning an unsupported value is
 // silently ignored rather than thrown, so feature-detect explicitly)
@@ -174,11 +196,22 @@ function applyView(){ var s=baseScale*viewScale;
   disp.style.width='100%'; disp.style.height='100%';
   var z=document.getElementById('zmv'); if(z) z.textContent=Math.round(s*100); }
 
+// scale factor that keeps a W x H box fully inside itself after rotating by ang
+// (deg). Used so the live straighten preview never clips the corners.
+function fitRotScale(ang,w,h){ var a=Math.abs(ang)*Math.PI/180;
+  var c=Math.cos(a), s=Math.sin(a);
+  var bw=w*c+h*s, bh=w*s+h*c;  // bounding box of the rotated box
+  return Math.min(w/bw, h/bh); }
 // -- render: paint baseImg with the colour filter on bg, then the crop overlay on disp --
 function paintBg(){ bgx.clearRect(0,0,W,H);
   if(!baseImg) return; bgx.save();
   if(_CTX_FILTER){ try{ bgx.filter=filterStr(); }catch(e){} }
-  bgx.drawImage(baseImg,0,0,W,H); bgx.restore(); }
+  if(fineAng){ // live straighten preview: rotate+scale-to-fit around the centre
+    var k=fitRotScale(fineAng,W,H);
+    bgx.translate(W/2,H/2); bgx.rotate(fineAng*Math.PI/180); bgx.scale(k,k);
+    bgx.drawImage(baseImg,-W/2,-H/2,W,H);
+  } else { bgx.drawImage(baseImg,0,0,W,H); }
+  bgx.restore(); }
 function drawCropOverlay(){ dx.clearRect(0,0,W,H); if(!hasBg) return;
   // dim everything outside the crop rect
   dx.save(); dx.fillStyle='rgba(0,0,0,.5)';
@@ -283,23 +316,78 @@ document.querySelectorAll('#aspseg button').forEach(function(b){ b.addEventListe
   document.querySelectorAll('#aspseg button').forEach(function(o){ o.classList.toggle('on',o===b); });
   setAspect(ASPMAP[b.dataset.asp]||0); }); });
 document.getElementById('applycrop').addEventListener('click',function(){ if(!hasBg) return;
+  pushUndo();
+  // crop bakes the live straighten too, so source the rotated working raster.
+  var src=fineAng?workingCanvas():baseImg;
   // bake: the new source region is the current crop area of the live baseImg.
   baked={x:Math.round(baked.x+crop.x), y:Math.round(baked.y+crop.y),
          w:Math.round(crop.w), h:Math.round(crop.h)};
   // re-base the working image to the cropped pixels (colour filter NOT yet baked;
   // it stays live and is applied at export), then reset the crop rect to full.
   var t=document.createElement('canvas'); t.width=Math.max(1,Math.round(crop.w)); t.height=Math.max(1,Math.round(crop.h));
-  t.getContext('2d').drawImage(baseImg, crop.x, crop.y, crop.w, crop.h, 0,0,t.width,t.height);
-  var im=new Image(); im.onload=function(){ baseImg=im; setSize(im.naturalWidth,im.naturalHeight);
+  t.getContext('2d').drawImage(src, crop.x, crop.y, crop.w, crop.h, 0,0,t.width,t.height);
+  var im=new Image(); im.onload=function(){ baseImg=im; fineAng=0; syncFineUI();
+    setSize(im.naturalWidth,im.naturalHeight);
     crop={x:0,y:0,w:W,h:H}; render(); pushExport(); }; im.src=t.toDataURL('image/png'); });
 document.getElementById('resetcrop').addEventListener('click',function(){ if(!hasBg) return;
+  pushUndo();
   // restore the full original image (undo any Apply crop) before re-selecting all.
   if(origImg && baseImg!==origImg){ baseImg=origImg; baked={x:0,y:0,w:0,h:0};
-    setSize(origImg.naturalWidth,origImg.naturalHeight); }
+    fineAng=0; syncFineUI(); setSize(origImg.naturalWidth,origImg.naturalHeight); }
   crop={x:0,y:0,w:W,h:H}; render(); pushExport(); });
 
+// -- undo/redo: capture the full editor state so destructive ops are reversible.
+// The working image is stored as a PNG data-URL (capped stack, ~HCAP deep). --
+function snapshot(){ if(!baseImg) return null;
+  var t=document.createElement('canvas'); t.width=W; t.height=H;
+  t.getContext('2d').drawImage(baseImg,0,0,W,H);  // raw working pixels, no filter
+  return {url:t.toDataURL('image/png'), w:W, h:H,
+    crop:{x:crop.x,y:crop.y,w:crop.w,h:crop.h}, baked:{x:baked.x,y:baked.y,w:baked.w,h:baked.h},
+    aspect:aspect, bri:bri,con:con,sat:sat,hue:hue,warmth:warmth, fineAng:fineAng,
+    outOn:outOn,outW:outW,outH:outH,outLock:outLock}; }
+// push the current state onto UNDO before a destructive op; clears the REDO branch.
+function pushUndo(){ var s=snapshot(); if(!s) return;
+  UNDO.push(s); if(UNDO.length>HCAP) UNDO.shift(); REDO=[]; updateHistUI(); }
+function applyState(s,done){ restoring=true;
+  var im=new Image(); im.onload=function(){ baseImg=im;
+    setSize(s.w,s.h);  // recomputes fit
+    crop={x:s.crop.x,y:s.crop.y,w:s.crop.w,h:s.crop.h};
+    baked={x:s.baked.x,y:s.baked.y,w:s.baked.w,h:s.baked.h}; aspect=s.aspect||0;
+    bri=s.bri;con=s.con;sat=s.sat;hue=s.hue;warmth=s.warmth; fineAng=s.fineAng||0;
+    outOn=!!s.outOn;outW=s.outW||0;outH=s.outH||0;outLock=(s.outLock!==false);
+    syncColUI(); syncRsUI(); syncFineUI(); syncAspUI();
+    render(); pushExport(); restoring=false; updateHistUI(); if(done) done(); };
+  im.src=s.url; }
+function doUndo(){ if(!UNDO.length) return; var cur=snapshot(); var s=UNDO.pop();
+  if(cur) REDO.push(cur); applyState(s); }
+function doRedo(){ if(!REDO.length) return; var cur=snapshot(); var s=REDO.pop();
+  if(cur) UNDO.push(cur); applyState(s); }
+function updateHistUI(){ var u=document.getElementById('undo'),r=document.getElementById('redo');
+  if(u) u.disabled=!UNDO.length; if(r) r.disabled=!REDO.length; }
+// reflect restored state back into the UI controls
+function syncColUI(){ var m=[['bri','briv',bri],['con','conv',con],['sat','satv',sat],
+    ['hue','huev',hue],['war','warv',warmth]];
+  m.forEach(function(o){ var el=document.getElementById(o[0]); if(el) el.value=o[2];
+    var lab=document.getElementById(o[1]); if(lab) lab.textContent=o[2]; }); }
+function syncRsUI(){ var on=document.getElementById('rs_on'); if(on) on.checked=outOn;
+  var body=document.getElementById('rs_body'); if(body) body.style.display=outOn?'':'none';
+  var ew=document.getElementById('rs_w'),eh=document.getElementById('rs_h');
+  if(ew&&outW) ew.value=outW; if(eh&&outH) eh.value=outH;
+  var lk=document.getElementById('rs_lock'); if(lk) lk.checked=outLock; rsInfo(); }
+function syncFineUI(){ var el=document.getElementById('fine'); if(el) el.value=fineAng;
+  var lab=document.getElementById('finev'); if(lab) lab.textContent=fineAng; }
+function syncAspUI(){ // best-effort highlight of the aspect seg from the ratio
+  document.querySelectorAll('#aspseg button').forEach(function(b){
+    var a=ASPMAP[b.dataset.asp]||0; b.classList.toggle('on',Math.abs(a-aspect)<1e-6); }); }
+document.getElementById('undo').addEventListener('click',doUndo);
+document.getElementById('redo').addEventListener('click',doRedo);
+window.addEventListener('keydown',function(e){ if(!hasBg) return;
+  var k=(e.key||'').toLowerCase();
+  if((e.ctrlKey||e.metaKey)&&k==='z'&&!e.shiftKey){ e.preventDefault(); doUndo(); }
+  else if((e.ctrlKey||e.metaKey)&&(k==='y'||(k==='z'&&e.shiftKey))){ e.preventDefault(); doRedo(); } });
+
 // -- transform: flip the working image; mirror the crop rect so it tracks content --
-function flipImage(horiz){ if(!hasBg) return;
+function flipImage(horiz){ if(!hasBg) return; pushUndo();
   var t=document.createElement('canvas'); t.width=W; t.height=H; var tc=t.getContext('2d');
   if(horiz){ tc.translate(W,0); tc.scale(-1,1); } else { tc.translate(0,H); tc.scale(1,-1); }
   tc.drawImage(baseImg,0,0,W,H);
@@ -308,6 +396,34 @@ function flipImage(horiz){ if(!hasBg) return;
     clampCrop(); render(); pushExport(); }; im.src=t.toDataURL('image/png'); }
 document.getElementById('fliph').addEventListener('click',function(){ flipImage(true); });
 document.getElementById('flipv').addEventListener('click',function(){ flipImage(false); });
+
+// -- transform: rotate the working image 90 deg (re-rasters; swaps W/H) --
+function rotate90(cw){ if(!hasBg) return; pushUndo();
+  var t=document.createElement('canvas'); t.width=H; t.height=W; var tc=t.getContext('2d');
+  // cw=true rotates clockwise (90 right); else counter-clockwise (90 left)
+  if(cw){ tc.translate(t.width,0); tc.rotate(Math.PI/2); }
+  else { tc.translate(0,t.height); tc.rotate(-Math.PI/2); }
+  tc.drawImage(baseImg,0,0,W,H);
+  var im=new Image(); im.onload=function(){ baseImg=im; fineAng=0; syncFineUI();
+    setSize(im.naturalWidth,im.naturalHeight);
+    crop={x:0,y:0,w:W,h:H}; render(); pushExport(); }; im.src=t.toDataURL('image/png'); }
+document.getElementById('rotl').addEventListener('click',function(){ rotate90(false); });
+document.getElementById('rotr').addEventListener('click',function(){ rotate90(true); });
+
+// -- straighten: live preview via the slider; Apply rotate re-rasters (auto-fit) --
+document.getElementById('fine').addEventListener('input',function(e){ if(!hasBg) return;
+  fineAng=+e.target.value||0; document.getElementById('finev').textContent=fineAng;
+  render(); pushExport(); });
+function applyFine(){ if(!hasBg || !fineAng) { fineAng=0; syncFineUI(); render(); return; }
+  pushUndo();
+  // bake the live rotated+fit-scaled preview into a new full-size working image
+  var src=workingCanvas();
+  var im=new Image(); im.onload=function(){ baseImg=im; fineAng=0; syncFineUI();
+    setSize(im.naturalWidth,im.naturalHeight);
+    crop={x:0,y:0,w:W,h:H}; render(); pushExport(); }; im.src=src.toDataURL('image/png'); }
+document.getElementById('fineapply').addEventListener('click',applyFine);
+document.getElementById('finereset').addEventListener('click',function(){ if(!hasBg) return;
+  fineAng=0; syncFineUI(); render(); pushExport(); });
 
 function bindCol(id,vid,setter,suffix){ var el=document.getElementById(id),lab=document.getElementById(vid);
   el.addEventListener('input',function(e){ setter(+e.target.value); lab.textContent=e.target.value; render(); pushExport(); }); }
@@ -320,7 +436,9 @@ function resetColUI(){ bri=100;con=100;sat=100;hue=0;warmth=0;
   var m=[['bri','briv',100],['con','conv',100],['sat','satv',100],['hue','huev',0],['war','warv',0]];
   m.forEach(function(o){ var el=document.getElementById(o[0]); if(el) el.value=o[2];
     var lab=document.getElementById(o[1]); if(lab) lab.textContent=o[2]; }); }
-document.getElementById('resetcol').addEventListener('click',function(){ resetColUI(); render(); pushExport(); });
+document.getElementById('resetcol').addEventListener('click',function(){
+  if(hasBg && (bri!==100||con!==100||sat!==100||hue!==0||warmth!==0)) pushUndo();
+  resetColUI(); render(); pushExport(); });
 
 // -- resize / output size: crop selects the region, this sets the exported pixels.
 // e.g. crop a 1:1 679x679 region and emit it at 1024x1024. --
@@ -338,7 +456,9 @@ function resetRsUI(){ outOn=false; outW=0; outH=0; outLock=true;
   var body=document.getElementById('rs_body'); if(body) body.style.display='none';
   var lk=document.getElementById('rs_lock'); if(lk) lk.checked=true;
   document.querySelectorAll('#rsseg button').forEach(function(o){ o.classList.remove('on'); }); }
-document.getElementById('rs_on').addEventListener('change',function(e){ outOn=e.target.checked;
+document.getElementById('rs_on').addEventListener('change',function(e){
+  if(hasBg && !restoring) pushUndo();
+  outOn=e.target.checked;
   document.getElementById('rs_body').style.display=outOn?'':'none';
   if(outOn && (!outW||!outH)) rsSet(Math.round(crop.w),Math.round(crop.h));
   rsInfo(); pushExport(); });
@@ -359,17 +479,27 @@ function setHidden(id,val){ try{ var pd=parent.document;
   var proto=(e.tagName==='TEXTAREA')?parent.HTMLTextAreaElement.prototype:parent.HTMLInputElement.prototype;
   Object.getOwnPropertyDescriptor(proto,'value').set.call(e,val);
   e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); }catch(err){} }
+// the working raster as currently displayed (W x H): baseImg, or baseImg rotated
+// + fit-scaled when a live straighten angle is set. Crop coords map onto this.
+function workingCanvas(){ var t=document.createElement('canvas'); t.width=W; t.height=H;
+  var tc=t.getContext('2d');
+  if(fineAng){ var k=fitRotScale(fineAng,W,H);
+    tc.translate(W/2,H/2); tc.rotate(fineAng*Math.PI/180); tc.scale(k,k);
+    tc.drawImage(baseImg,-W/2,-H/2,W,H);
+  } else { tc.drawImage(baseImg,0,0,W,H); }
+  return t; }
 function buildExport(){ if(!baseImg) return '';
-  // export = the current crop region of the live baseImg, with the colour filter
-  // baked into the pixels via ctx.filter (or drawn raw if filters unsupported),
-  // scaled to outW x outH when Resize is on (else the crop's native pixels).
+  // export = the current crop region of the live working raster, with the colour
+  // filter baked into the pixels via ctx.filter (or drawn raw if filters
+  // unsupported), scaled to outW x outH when Resize is on (else crop's native px).
+  var src=fineAng?workingCanvas():baseImg;
   var cw=Math.max(1,Math.round(crop.w)), ch=Math.max(1,Math.round(crop.h));
   var ow=cw, oh=ch;
   if(outOn && outW>0 && outH>0){ ow=outW; oh=outH; }
   var t=document.createElement('canvas'); t.width=ow; t.height=oh; var tc=t.getContext('2d');
   if(_CTX_FILTER){ try{ tc.filter=filterStr(); }catch(e){} }
   tc.imageSmoothingQuality='high';
-  tc.drawImage(baseImg, crop.x, crop.y, crop.w, crop.h, 0,0,ow,oh);
+  tc.drawImage(src, crop.x, crop.y, crop.w, crop.h, 0,0,ow,oh);
   return t.toDataURL('image/png'); }
 function exportNow(){ if(!hasBg) return; setHidden('imagesuite-'+MODE+'-out', buildExport()); }
 var exportTimer=null;
@@ -380,9 +510,11 @@ function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im; o
   setSize(im.naturalWidth,im.naturalHeight);
   crop={x:0,y:0,w:W,h:H}; baked={x:0,y:0,w:W,h:H};
   aspect=0; document.querySelectorAll('#aspseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.asp==='free'); });
-  resetColUI(); resetRsUI();
+  resetColUI(); resetRsUI(); fineAng=0; syncFineUI();
+  UNDO=[]; REDO=[]; updateHistUI();  // a fresh image starts a clean history
   hasBg=true; document.getElementById('empty').style.display='none';
   fitView(); render(); pushExport(); }; im.src=dataUrl; }
+updateHistUI();
 try{ parent.window['__is_'+MODE+'_setbg']=setBg; }catch(e){}
 
 // On window/layout resize do NOT touch the pixel buffers (assigning canvas

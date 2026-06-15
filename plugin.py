@@ -375,10 +375,26 @@ class ImageSuite(WAN2GPPlugin):
         img_or_path.save(p)
         return str(p)
 
-    def _enh_result(self, res):
+    def _enh_compare(self, before, after):
+        """Outputs that drive the before/after compare panel after a destructive pass.
+
+        ``before`` = the original selected path, ``after`` = the enhanced result path.
+        Shape matches the outputs list built in _wire_enhance and depends on which
+        widget ui.enhance built (slider vs. side-by-side pair); both end with the
+        two State holders so Revert can restore the original."""
+        if getattr(self, "_enh_cmp_kind", None) == "slider":
+            return [gr.update(visible=True), (before, after), before, after]
+        if getattr(self, "_enh_cmp_kind", None) == "pair":
+            return [gr.update(visible=True), before, after, before, after]
+        return []  # no compare widget built — degrade to plain gallery-only flow
+
+    def _enh_result(self, res, before=None):
         if not res:
             raise gr.Error("Enhancement produced no image.")
-        return self._gallery_result(res)
+        gallery, picked, save = self._gallery_result(res)
+        # ``picked`` is the served (cache-safe) path of the enhanced result; compare it
+        # against the original ``before`` the pass started from.
+        return [gallery, picked, save] + self._enh_compare(before, picked)
 
     def _enh_faceswap(self, state, picked, ref, enhancer, blend, strength,
                       progress=gr.Progress()):
@@ -400,7 +416,7 @@ class ImageSuite(WAN2GPPlugin):
         finally:
             self._release_faceswap()  # don't leak InsightFace/ONNX VRAM
             self.release_gpu(state)
-        return self._enh_result(self._save_enh(img, "face"))
+        return self._enh_result(self._save_enh(img, "face"), before=picked)
 
     def _enh_adetailer(self, state, model, picked, pos, neg, detector,
                        loras=None, mult="", progress=gr.Progress()):
@@ -422,7 +438,7 @@ class ImageSuite(WAN2GPPlugin):
                                        loras=self._lora_list(loras, mult))
         finally:
             self.release_gpu(state)
-        return self._enh_result(res)
+        return self._enh_result(res, before=picked)
 
     def _enh_bodyswap(self, state, body_model, picked, ref, body_loras=None,
                       body_lora_mult="", progress=gr.Progress()):
@@ -455,16 +471,22 @@ class ImageSuite(WAN2GPPlugin):
                                    progress=progress)
         finally:
             self.release_gpu(state)
-        return self._enh_result(res)
+        return self._enh_result(res, before=picked)
 
-    def _enh_color(self, state, model, picked, ref, scale, denoise,
+    def _enh_color(self, state, model, picked, ref, variant, scale, denoise,
                    loras=None, mult="", progress=gr.Progress()):
         if not picked:
             raise gr.Error("Select a result first.")
         if not ref:
             raise gr.Error("Add a colour / style reference.")
         ident = self._sd_ident(model)
-        self._require(["ip_adapter"], "Colour reference")
+        variant = variant or "plus"
+        # Plus needs the base IP-Adapter weights; FaceID variants need the separate
+        # FaceID repo (true identity transfer) plus buffalo_l for face embeddings.
+        if str(variant).startswith("faceid"):
+            self._require(["ip_adapter_faceid", "buffalo_l"], "FaceID reference")
+        else:
+            self._require(["ip_adapter"], "Colour reference")
         # Clear any stale abort flag from a prior cancelled gen — otherwise the
         # IP-Adapter callback trips _interrupt on step 1 and discards the result,
         # persistently breaking Colour Reference until an unrelated handler clears it.
@@ -479,13 +501,23 @@ class ImageSuite(WAN2GPPlugin):
             res = gen_sd.ip_adapter_inpaint(ident, picked, ref, mask, "", "",
                                             denoise=float(denoise), ip_scale=float(scale),
                                             loras=self._lora_list(loras, mult),
-                                            progress=progress)
+                                            ip_variant=variant, progress=progress)
         finally:
             self.release_gpu(state)
-        return self._enh_result(res)
+        return self._enh_result(res, before=picked)
 
     def _wire_enhance(self, c):
-        out = [c["gallery"], c["picked"], c["save"]]
+        # Remember which compare widget ui.enhance built so the handlers return a
+        # matching-length tuple; the extra outputs append after (gallery, picked, save)
+        # and are a no-op when no compare widget was built (older Gradio + fallback off).
+        self._enh_cmp_kind = c.get("cmp_kind")
+        cmp_out = []
+        if self._enh_cmp_kind == "slider":
+            cmp_out = [c["cmp_panel"], c["cmp_slider"], c["cmp_before"], c["cmp_after"]]
+        elif self._enh_cmp_kind == "pair":
+            cmp_out = [c["cmp_panel"], c["cmp_before_img"], c["cmp_after_img"],
+                       c["cmp_before"], c["cmp_after"]]
+        out = [c["gallery"], c["picked"], c["save"]] + cmp_out
         st, model, picked = self.state, c["model"], c["picked"]
         lo, mu = c["loras"], c["lora_mult"]  # page LoRAs: ADetailer/colour run on the page model
         c["adetf_run"].click(
@@ -505,8 +537,25 @@ class ImageSuite(WAN2GPPlugin):
                     c["body_lora_mult"]], outputs=out)
         c["color_run"].click(
             self._enh_color,
-            inputs=[st, model, picked, c["color_ref"], c["color_scale"],
-                    c["color_denoise"], lo, mu], outputs=out)
+            inputs=[st, model, picked, c["color_ref"], c["color_variant"],
+                    c["color_scale"], c["color_denoise"], lo, mu], outputs=out)
+        if cmp_out:
+            self._wire_enh_compare(c)
+
+    def _wire_enh_compare(self, c):
+        """Accept (keep the enhanced result, just close the panel) / Revert (restore
+        the original ``cmp_before`` into the gallery + selection + Save As, then close)."""
+        c["cmp_accept"].click(lambda: gr.update(visible=False), outputs=[c["cmp_panel"]])
+        c["cmp_revert"].click(
+            self._enh_revert, inputs=[c["cmp_before"]],
+            outputs=[c["gallery"], c["picked"], c["save"], c["cmp_panel"]])
+
+    def _enh_revert(self, before):
+        """Put the pre-enhancement original back as the sole gallery item + selection."""
+        if not before:
+            return gr.update(), gr.update(), gr.update(), gr.update(visible=False)
+        gallery, picked, save = self._gallery_result(before)
+        return gallery, picked, save, gr.update(visible=False)
 
     # -- prompt enhancer (Wan2GP's native Qwen-abliterated enhancer) --------
     def _enhance(self, state, text, progress=gr.Progress()):
@@ -917,12 +966,19 @@ class ImageSuite(WAN2GPPlugin):
             pass
 
     @staticmethod
-    def _sd_step_cb(progress, img_index, steps, total):
+    def _sd_step_cb(progress, img_index, steps, total, live_preview=False,
+                    preview_every=3):
         """A diffusers ``callback_on_step_end`` that advances the Gradio progress
         bar as SD sampling runs (the load is silent; this fills once steps begin)
         AND honours Abort mid-image: when gen_sd.was_aborted() it sets
         pipe._interrupt so diffusers bails out of the current denoise loop.
-        Must return the callback_kwargs dict diffusers hands it."""
+        Must return the callback_kwargs dict diffusers hands it.
+
+        When ``live_preview`` is on, every ``preview_every`` steps it decodes the
+        in-progress latents with TAESD and publishes a small preview image (via
+        gen_sd.set_preview) for the streaming handler to surface. The decode is
+        fully guarded — any failure (missing TAESD weights, etc.) just skips the
+        frame, never the generation."""
         def _cb(pipe, step, timestep, cb_kwargs):
             try:
                 if gen_sd.was_aborted():
@@ -934,6 +990,22 @@ class ImageSuite(WAN2GPPlugin):
                 progress(done / max(1, total), desc=f"Generating… step {done}/{total}")
             except Exception:
                 pass
+            if live_preview:
+                try:
+                    # Decode only every Nth step (and the last) — TAESD is cheap but
+                    # not free, and per-step previews add no information.
+                    last = (step + 1) >= steps
+                    if last or (step % max(1, int(preview_every)) == 0):
+                        lat = cb_kwargs.get("latents")
+                        if lat is not None:
+                            # SDXL vs SD1.5 by diffusers pipe class name (the wrapper's
+                            # _model_type isn't reachable from the raw pipe here).
+                            mt = "sdxl" if "XL" in type(pipe).__name__ else "sd15"
+                            img = gen_sd.taesd_preview(lat, model_type=mt)
+                            if img is not None:
+                                gen_sd.set_preview(img)
+                except Exception:
+                    pass  # preview is best-effort; never disturb the gen
             return cb_kwargs
         return _cb
 
@@ -1215,6 +1287,81 @@ class ImageSuite(WAN2GPPlugin):
             im.convert("RGBA").save(buf, format="PNG")
         return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
+    @staticmethod
+    def _durl_to_pil(durl):
+        """PNG/whatever data-URL -> PIL RGB image (or None). Shared by the canvas /
+        modify segmentation handlers."""
+        import base64
+        import io
+        from PIL import Image
+        if not durl or "," not in durl:
+            return None
+        try:
+            raw = base64.b64decode(durl.split(",", 1)[1])
+            return Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    @staticmethod
+    def _pil_to_dataurl(img) -> str:
+        """PIL image -> PNG data-URL (preserves alpha, so a cutout stays transparent)."""
+        import base64
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    def _segment_subject(self, img) -> "object":
+        """Run BiRefNet foreground segmentation on a PIL RGB image and return the
+        alpha as a grayscale ('L') PIL mask (white = subject). GPU op — runs only
+        on an explicit button click. Frees VRAM after. Raises gr.Error with a
+        friendly hint if the model isn't downloaded / segmentation can't run, so a
+        missing model never crashes the page."""
+        import os
+        import tempfile
+        from PIL import Image
+        from .core.sd.segmentation import (segment_foreground,
+                                           release_segmentation_model)
+        from .core import deps
+        # Free OUR other GPU consumers first so the ~1GB BiRefNet load has headroom.
+        self._release_all_vram()
+        try:
+            deps.ensure({"kornia": "kornia"})  # BiRefNet modeling code dependency
+        except Exception:
+            pass  # best-effort; segment_foreground raises a clear error if truly needed
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", prefix="is_seg_", delete=False)
+        try:
+            img.convert("RGB").save(tmp.name)
+            tmp.close()
+            mp = segment_foreground(tmp.name, str(paths.models_dir()))
+            try:
+                mask = Image.open(mp).convert("L").copy()
+            finally:
+                try:
+                    os.unlink(mp)
+                except Exception:
+                    pass
+            return mask
+        except gr.Error:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            raise gr.Error(
+                "Subject segmentation failed — the BiRefNet model may not be "
+                "downloaded. Install it from the Models tab (BiRefNet — body-swap "
+                f"segmentation), then retry. ({e})")
+        finally:
+            try:
+                release_segmentation_model()
+            except Exception:
+                pass
+            self._release_all_vram()
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
     # -- wiring -------------------------------------------------------------
     def _wire(self, ui):
         pages = ui["pages"]
@@ -1251,7 +1398,9 @@ class ImageSuite(WAN2GPPlugin):
         img_comps, img_idx = [], []
         for m, c in pages.items():
             for k, comp in c.items():
-                if isinstance(comp, gr.Image):
+                # Skip the txt2img live-preview Image — it's a transient streaming
+                # surface, not a reference image to persist/restore with a project.
+                if isinstance(comp, gr.Image) and k != "live_preview":
                     img_comps.append(comp); img_idx.append((m, k))
         gal_out = []
         for m in pages:
@@ -1438,6 +1587,40 @@ class ImageSuite(WAN2GPPlugin):
         return [(k, comp) for k, comp in c.items()
                 if isinstance(comp, self._PL_SAVABLE) and k not in self._PL_EXCLUDE]
 
+    # core.metadata field name → this page's component key. Width/height/seed/steps/
+    # cfg/sampler/scheduler/clip_skip already share names. ``model`` is intentionally
+    # NOT mapped: metadata holds a bare checkpoint stem, not a valid "sd::<path>"
+    # dropdown value, so setting it would corrupt the Model dropdown — we surface it
+    # as a note instead.
+    _PL_META_TO_FORM = {"prompt": "pos", "negative": "neg"}
+
+    def _read_png_params(self, fileobj) -> dict:
+        """Read an A1111 ``parameters`` PNG chunk from an uploaded file and return a
+        dict keyed to this page's form components (via _PL_META_TO_FORM). ``{}`` if
+        there's no file or no readable metadata (caller treats that as a no-op)."""
+        path = getattr(fileobj, "name", None) or (fileobj if isinstance(fileobj, str) else None)
+        if not path:
+            return {}
+        try:
+            from PIL import Image
+            from .core import metadata
+            with Image.open(path) as im:
+                text = (im.info or {}).get("parameters", "")
+            parsed = metadata.parse_a1111(text)
+        except Exception:
+            traceback.print_exc()
+            return {}
+        if not parsed:
+            return {}
+        out: dict = {}
+        for mk, mv in parsed.items():
+            fk = self._PL_META_TO_FORM.get(mk, mk)
+            out[fk] = mv
+        if "model" in parsed:  # surfaced as a hint, not applied to the dropdown
+            out["_model_note"] = parsed["model"]
+            out.pop("model", None)
+        return out
+
     def _lora_choices_for(self, model_value):
         """LoRA dropdown choices for a model (mirrors _on_model) so Load can refresh
         the list to the saved model's family WITHOUT firing model.change (which would
@@ -1516,6 +1699,31 @@ class ImageSuite(WAN2GPPlugin):
                 return outs + [gr.update(value=sel), f"Loaded “{sel}”."]
             c["pl_load"].click(_load, inputs=[c["pl_saved"]],
                                outputs=comps + [c["pl_name"], c["pl_status"]])
+
+            def _read_params(fileobj, _keys=keys):
+                # Recall A1111 "parameters" PNG metadata into the form. Metadata
+                # field keys (prompt/negative/width/height/...) → this page's
+                # component keys via _PL_META_TO_FORM; unknown / absent fields are
+                # left untouched. No file or no readable metadata → friendly no-op.
+                entry = self._read_png_params(fileobj)
+                if not entry:
+                    return ([gr.update() for _ in _keys]
+                            + ["No A1111 metadata found in that image."])
+                set_keys = []
+                outs = []
+                for k in _keys:
+                    if k in entry:  # value already keyed to this component
+                        outs.append(gr.update(value=entry[k]))
+                        set_keys.append(k)
+                    else:
+                        outs.append(gr.update())
+                msg = ("Read params: " + ", ".join(set_keys) + "."
+                       if set_keys else "No matching fields in that image's metadata.")
+                if entry.get("_model_note"):
+                    msg += f" (Model in file: “{entry['_model_note']}” — pick it manually.)"
+                return outs + [msg]
+            c["pl_read"].upload(_read_params, inputs=[c["pl_read"]],
+                                outputs=comps + [c["pl_status"]])
 
     def _push_overlays(self, folder, mode):
         """Load a folder's overlay images (as data-URLs) into the canvas strip."""
@@ -1705,7 +1913,7 @@ class ImageSuite(WAN2GPPlugin):
     # Settings persisted per tab so the image tabs come back as you left them
     # after a restart (written on Generate, restored on page load).
     _PERSIST_KEYS = ["model", "sampler", "scheduler", "steps", "cfg", "clip_skip",
-                     "seed", "width", "height", "count", "loras", "lora_mult",
+                     "seed", "width", "height", "count", "loras", "lora_mult", "turbo",
                      "pos", "neg", "denoise", "resize_mode", "feather", "mask_mode",
                      "inpaint_fill", "inpaint_area", "padding", "seamless"]
 
@@ -1917,10 +2125,14 @@ class ImageSuite(WAN2GPPlugin):
 
         SET = [c["model"], c["sampler"], c["scheduler"], c["steps"], c["cfg"],
                c["clip_skip"], c["seed"], c["width"], c["height"], c["count"],
-               c["loras"], c["lora_mult"]]
+               c["loras"], c["lora_mult"], c["turbo"]]
         gen_js = None
         if mode == "txt2img":
-            gen_inputs = [self.state] + SET + [c["pos"], c["neg"]]
+            gen_inputs = [self.state] + SET + [
+                c["hr_scale"], c["hr_denoise"],
+                c["refiner_enable"], c["refiner_model"], c["refiner_switch_at"],
+                c["refiner_steps"], c["refiner_cfg"],
+                c["pos"], c["neg"]]
             fn = self._make_txt2img(mode)
         elif mode == "img2img":
             gen_inputs = [self.state] + SET + [c["denoise"], c["resize_mode"],
@@ -1952,9 +2164,14 @@ class ImageSuite(WAN2GPPlugin):
                 " if(msk!=null) args[n-1]=msk;"
                 " return args; }")
 
+        gen_outputs = [c["gallery"], c["picked"], c["save"], c["last_seed"]]
+        # txt2img streams a live TAESD preview into an extra output (the on-page
+        # preview Image). Its handler is a GENERATOR that yields preview frames then
+        # the final result; img2img/inpaint stay single-return (no live_preview out).
+        if mode == "txt2img" and "live_preview" in c:
+            gen_outputs.append(c["live_preview"])
         c["generate"].click(
-            fn, inputs=gen_inputs,
-            outputs=[c["gallery"], c["picked"], c["save"], c["last_seed"]], js=gen_js)
+            fn, inputs=gen_inputs, outputs=gen_outputs, js=gen_js)
 
         # ♻ Reuse seed: copy the actual seed used (surfaced into Last seed by the gen
         # handler) back into the Seed input. No-op when Last seed is empty.
@@ -2024,6 +2241,28 @@ class ImageSuite(WAN2GPPlugin):
             c["ov_folder"].change(push, inputs=[c["ov_folder"]], outputs=[c["ov_bridge"]])
             c["ov_reload"].click(push, inputs=[c["ov_folder"]], outputs=[c["ov_bridge"]])
 
+        # Magic select subject (inpaint canvas only): BiRefNet-segment the current
+        # composite and load the subject alpha as the MASK. The js flushes the
+        # canvas export first so the composite textbox is current (not the debounced
+        # previous value), then returns it as the handler input (Gradio 5.29: a js=
+        # returning undefined nulls the inputs).
+        if "mc_magicmask" in c:
+            def _magic_mask(composite):
+                img = self._durl_to_pil(composite)
+                if img is None:
+                    raise gr.Error("Load an image into the MultiCanvas first.")
+                mask = self._segment_subject(img)
+                durl = self._pil_to_dataurl(mask)
+                return (canvas.setmask_bridge_html(durl, "inpaint", nonce=time.time()),
+                        "🪄 Subject selected into the mask.")
+            c["mc_magicmask"].click(
+                _magic_mask, inputs=[c["composite"]],
+                outputs=[c["setmask_bridge"], c["mc_mask_status"]],
+                js=("(composite) => { try{ window.__is_inpaint_exportnow(); }catch(e){} "
+                    "var el=document.querySelector('#imagesuite-inpaint-composite textarea')"
+                    "||document.querySelector('#imagesuite-inpaint-composite input'); "
+                    "return el ? el.value : composite; }"))
+
     def _wire_touchup(self, mode, c):
         out = [c["gallery"], c["picked"], c["save"]]
         c["out_run"].click(
@@ -2037,16 +2276,30 @@ class ImageSuite(WAN2GPPlugin):
 
     def _make_txt2img(self, mode):
         import random as _rng
+        import threading
         api = self._api  # closed over so the click is webui-wrapped (see _callback_uses_api_session)
 
+        # This handler is a GENERATOR (yields), so it can stream a live TAESD
+        # preview into the on-page preview Image while sampling runs. The click
+        # wires a 5th output (c["live_preview"]); EVERY yield/return must be a
+        # 5-tuple (gallery, picked, save, last_seed, preview_update). With live
+        # preview OFF (default) it yields exactly once — identical to the old
+        # single-return behaviour, so nothing regresses.
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
-                 width, height, count, loras, mult, pos, neg, progress=gr.Progress()):
+                 width, height, count, loras, mult, turbo, hr_scale, hr_denoise,
+                 refiner_enable, refiner_model, refiner_switch_at, refiner_steps,
+                 refiner_cfg, pos, neg, progress=gr.Progress()):
             if not (pos and pos.strip()):
                 raise gr.Error("Enter a prompt first.")
             backend, ident = discovery.parse_model_value(model)
             if not backend:
                 raise gr.Error("Select a model from the dropdown first.")
+            try:
+                live = bool(paths.get_sd_live_preview()) and backend == "sd"
+            except Exception:
+                live = False
             gen_sd.clear_abort()
+            gen_sd.clear_preview()
             files, n = [], int(count)
             last_seed = None  # actual seed of the LAST image generated (SD path)
             if backend == "native":
@@ -2071,27 +2324,79 @@ class ImageSuite(WAN2GPPlugin):
                     self._release_native_model()  # don't leave the native model stacked under a later SDXL load
             else:  # sd
                 lora_list = self._lora_list(loras, mult)
+                # SDXL refiner: resolve the picker value (sd::<path>) to a checkpoint
+                # path only when the checkbox is on AND an SD-family model is picked.
+                # Empty/disabled → "" → single-pass (current behaviour, no regression).
+                refiner_ckpt = ""
+                if refiner_enable and refiner_model:
+                    r_backend, r_ident = discovery.parse_model_value(refiner_model)
+                    if r_backend == "sd":
+                        refiner_ckpt = r_ident
                 self.acquire_gpu(state)
                 try:
                     self._sd_loading(progress)
                     nsteps, total = int(steps), max(1, n) * max(1, int(steps))
-                    for i in range(n):
-                        if gen_sd.was_aborted():
-                            break
-                        sd = (int(seed) + i) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
-                        files += gen_sd.generate_txt2img(
-                            ident, pos, neg, width, height, steps, cfg, sd,
-                            sampler=sampler or "DPM++ 2M", scheduler=scheduler or "",
-                            clip_skip=int(clip_skip), loras=lora_list,
-                            callback=self._sd_step_cb(progress, i, nsteps, total))
-                        last_seed = sd
+
+                    def _do_batch():
+                        nonlocal files, last_seed
+                        for i in range(n):
+                            if gen_sd.was_aborted():
+                                break
+                            sd = (int(seed) + i) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
+                            files += gen_sd.generate_txt2img(
+                                ident, pos, neg, width, height, steps, cfg, sd,
+                                sampler=sampler or "DPM++ 2M", scheduler=scheduler or "",
+                                clip_skip=int(clip_skip), loras=lora_list, turbo=turbo,
+                                hr_scale=float(hr_scale), hr_denoise=float(hr_denoise),
+                                refiner_checkpoint=refiner_ckpt,
+                                refiner_switch_at=float(refiner_switch_at),
+                                refiner_steps=int(refiner_steps),
+                                refiner_cfg=float(refiner_cfg),
+                                callback=self._sd_step_cb(progress, i, nsteps, total,
+                                                          live_preview=live))
+                            last_seed = sd
+
+                    if live:
+                        # Run the blocking diffusers batch on a worker thread and
+                        # stream decoded preview frames out of this generator as the
+                        # step callback publishes them. The GPU lock is held across
+                        # the whole thing — we join the worker before releasing it.
+                        worker_err = {}
+                        def _worker():
+                            try:
+                                _do_batch()
+                            except BaseException as e:  # surface on the main thread
+                                worker_err["e"] = e
+                        th = threading.Thread(target=_worker, daemon=True)
+                        th.start()
+                        last_seq = -1
+                        while th.is_alive():
+                            seq, img = gen_sd.get_preview()
+                            if seq != last_seq and img is not None:
+                                last_seq = seq
+                                # Yield a preview frame; gallery/seed unchanged so far.
+                                # picked is a gr.State (which doesn't accept gr.update),
+                                # so pass None mid-stream — the final yield sets the real
+                                # selection. The user can't trigger Send/Save while this
+                                # event is still streaming, so the transient None is safe.
+                                yield (gr.update(), None, gr.update(),
+                                       gr.update(), gr.update(value=img))
+                            th.join(timeout=0.15)
+                        th.join()
+                        if worker_err:
+                            raise worker_err["e"]
+                    else:
+                        _do_batch()
                 finally:
                     self.release_gpu(state)
+                    gen_sd.clear_preview()
             if gen_sd.was_aborted():
                 raise gr.Error("Txt2img aborted.")
             if not files:
                 raise gr.Error("Generation produced no images.")
-            return self._gallery_result(files, mode) + (self._seed_update(last_seed),)
+            # Final frame: real results + clear the preview image.
+            yield self._gallery_result(files, mode) + (
+                self._seed_update(last_seed), gr.update(value=None))
         return _run
 
     def _make_img2img(self, mode):
@@ -2101,8 +2406,8 @@ class ImageSuite(WAN2GPPlugin):
         RESIZE = {"Just resize": 0, "Crop and resize": 1, "Resize and fill": 2}
 
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
-                 width, height, count, loras, mult, denoise, resize_mode, pos, neg,
-                 init_image, progress=gr.Progress()):
+                 width, height, count, loras, mult, turbo, denoise, resize_mode,
+                 pos, neg, init_image, progress=gr.Progress()):
             backend, ident = discovery.parse_model_value(model)
             if not backend:
                 raise gr.Error("Select a model from the dropdown first.")
@@ -2149,7 +2454,7 @@ class ImageSuite(WAN2GPPlugin):
                             ident, init_image, pos, neg, width, height, steps, cfg, sd,
                             denoise=float(denoise), sampler=sampler or "DPM++ 2M",
                             scheduler=scheduler, resize_mode=RESIZE.get(resize_mode, 0),
-                            clip_skip=int(clip_skip), loras=lora_list,
+                            clip_skip=int(clip_skip), loras=lora_list, turbo=turbo,
                             callback=self._sd_step_cb(progress, i, nsteps, total))
                         last_seed = sd
                 finally:
@@ -2169,7 +2474,7 @@ class ImageSuite(WAN2GPPlugin):
 
     def _inpaint_core(self, state, backend, ident, comp, mask, pos, neg, *,
                       denoise, steps, cfg, clip_skip, seed, sampler, scheduler,
-                      loras, mult, feather=4, inpaint_fill="original",
+                      loras, mult, turbo="Off", feather=4, inpaint_fill="original",
                       full_res=False, padding=32, seamless=False, count=1,
                       api=None, progress=None):
         """``count`` inpaint passes over a prepared composite(RGB) + mask(L), under a
@@ -2240,7 +2545,7 @@ class ImageSuite(WAN2GPPlugin):
                     clip_skip=int(clip_skip), mask_blur=int(feather),
                     inpainting_fill=self._FILL.get(inpaint_fill, 1),
                     full_res=bool(full_res), padding=int(padding),
-                    seamless=bool(seamless),
+                    seamless=bool(seamless), turbo=turbo,
                     progress=progress, loras=lora_list, callback=cb)
                 # Abort fired mid-image → drop this partial, keep the completed ones.
                 if gen_sd.was_aborted():
@@ -2256,7 +2561,7 @@ class ImageSuite(WAN2GPPlugin):
         api = self._api  # closed over so the click is webui-wrapped
 
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
-                 width, height, count, loras, mult, denoise, feather, mask_mode,
+                 width, height, count, loras, mult, turbo, denoise, feather, mask_mode,
                  inpaint_fill, inpaint_area, padding, seamless, pos, neg,
                  composite_url, mask_url, progress=gr.Progress()):
             backend, ident = discovery.parse_model_value(model)
@@ -2285,7 +2590,7 @@ class ImageSuite(WAN2GPPlugin):
                 state, backend, ident, comp, mask, pos, neg, denoise=denoise,
                 steps=steps, cfg=cfg, clip_skip=clip_skip, seed=seed,
                 sampler=sampler, scheduler=scheduler, loras=loras, mult=mult,
-                feather=feather, inpaint_fill=inpaint_fill,
+                turbo=turbo, feather=feather, inpaint_fill=inpaint_fill,
                 full_res=(inpaint_area == "Only masked"), count=count,
                 padding=padding, seamless=bool(seamless), api=api, progress=progress)
             if not outs:
@@ -2698,6 +3003,28 @@ class ImageSuite(WAN2GPPlugin):
                 "||document.querySelector('#imagesuite-modify-out input'); "
                 "return [el ? el.value : edited, ref]; }"))
 
+        # Remove background (BiRefNet): segment the subject, apply the alpha as a
+        # cutout (transparent background) and reload it onto the Modify canvas so
+        # further crop/colour edits stack on the cutout. Like _match, the js flushes
+        # the editor export first so c['out'] is current.
+        def _removebg(edited):
+            src = _durl_to_pil(edited)
+            if src is None:
+                raise gr.Error("Load an image into the Modify canvas first.")
+            mask = self._segment_subject(src)              # 'L' alpha, white = subject
+            cut = src.convert("RGBA")
+            cut.putalpha(mask.resize(cut.size) if mask.size != cut.size else mask)
+            durl = self._pil_to_dataurl(cut)
+            return (modify_canvas.modify_bg_bridge_html(durl, "modify", nonce=time.time()),
+                    "✂️ Background removed.")
+        c["mod_removebg"].click(
+            _removebg, inputs=[c["out"]],
+            outputs=[c["bg_bridge"], c["mod_status"]],
+            js=("(edited) => { try{ window.__is_modify_exportnow(); }catch(e){} "
+                "var el=document.querySelector('#imagesuite-modify-out textarea')"
+                "||document.querySelector('#imagesuite-modify-out input'); "
+                "return el ? el.value : edited; }"))
+
         # Save the edited image into the results gallery (so send-to can act on it).
         def _save(edited):
             img = _durl_to_pil(edited)
@@ -2904,6 +3231,21 @@ class ImageSuite(WAN2GPPlugin):
         def _set_vae(name):
             paths.set_sd_vae("" if (not name or name == settings_panel._VAE_NONE) else name)
         s["sdxl_vae"].change(_set_vae, inputs=[s["sdxl_vae"]])
+
+        # Persist the SD memory policy ('balanced' default == current behaviour).
+        # gen_sd.get_pipeline() re-reads it before each load(), so it applies to the
+        # next SD generation without a restart.
+        def _set_mem_policy(policy):
+            paths.set_sd_mem_policy(policy)
+        s["sd_mem_policy"].change(_set_mem_policy, inputs=[s["sd_mem_policy"]])
+
+        # Persist the live-preview toggle (default OFF). Takes effect on the next
+        # Txt2Img generation (read at gen time); a page reload reveals/hides the
+        # preview Image since its initial visibility is read at build time.
+        if "sd_live_preview" in s:
+            def _set_live_preview(on):
+                paths.set_sd_live_preview(bool(on))
+            s["sd_live_preview"].change(_set_live_preview, inputs=[s["sd_live_preview"]])
 
         # Link an existing models folder into the shared OrphanSuite area, then
         # refresh the page dropdowns + the shared-dir textboxes (which now resolve

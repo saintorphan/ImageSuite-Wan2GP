@@ -170,6 +170,43 @@ def set_sd_vae(name) -> None:
     set_shared("sd_vae", str(name or ""))
 
 
+def get_sd_live_preview() -> bool:
+    """Whether to decode in-progress SD latents to a small live preview during
+    sampling (TAESD). OFF by default == current behaviour (no extra decode work,
+    no preview image). Shared across saintorphan plugins via .orphansuite.json."""
+    return bool(get_shared("sd_live_preview", False))
+
+
+def set_sd_live_preview(value) -> None:
+    """Persist the live-preview toggle to the cross-plugin .orphansuite.json
+    (False = OFF, the default)."""
+    set_shared("sd_live_preview", bool(value))
+
+
+# Memory policy for the bundled SD/SDXL pipeline (how load/unload manage VRAM):
+#   "balanced"   — move the pipe to CUDA on load, fully free on unload (default;
+#                  current behaviour — the next gen re-reads the checkpoint from disk).
+#   "keep"       — keep the pipe resident across the GPU handoff (skip the full free
+#                  on unload) so back-to-back SD gens don't re-read ~6.5GB each time.
+#   "sequential" — accelerate sequential CPU offload: lowest peak VRAM, streams
+#                  weights per-step (slower) for tight GPUs.
+_SD_MEM_POLICIES = ("balanced", "keep", "sequential")
+
+
+def get_sd_mem_policy() -> str:
+    """The SD pipeline memory policy ('balanced' default == current behaviour).
+    Shared across saintorphan plugins via .orphansuite.json."""
+    val = str(get_shared("sd_mem_policy", "") or "").strip().lower()
+    return val if val in _SD_MEM_POLICIES else "balanced"
+
+
+def set_sd_mem_policy(value) -> None:
+    """Persist the SD memory policy to the cross-plugin .orphansuite.json. Anything
+    unrecognised falls back to 'balanced' (current behaviour)."""
+    val = str(value or "").strip().lower()
+    set_shared("sd_mem_policy", val if val in _SD_MEM_POLICIES else "balanced")
+
+
 # --- roots -----------------------------------------------------------------
 
 def lab_root() -> Path:

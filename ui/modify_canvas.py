@@ -83,6 +83,13 @@ input[type=range]{width:100%}
         </div>
       </div>
       <div class="sec">
+        <div class="seclabel">Transform</div>
+        <div class="row2">
+          <button id="fliph" title="Flip horizontally">&#8596; Flip H</button>
+          <button id="flipv" title="Flip vertically">&#8597; Flip V</button>
+        </div>
+      </div>
+      <div class="sec">
         <div class="seclabel">Resize output</div>
         <label class="fld" style="cursor:pointer"><span>Resize export</span>
           <input type="checkbox" id="rs_on"></label>
@@ -287,6 +294,17 @@ document.getElementById('applycrop').addEventListener('click',function(){ if(!ha
     crop={x:0,y:0,w:W,h:H}; render(); pushExport(); }; im.src=t.toDataURL('image/png'); });
 document.getElementById('resetcrop').addEventListener('click',function(){ if(!hasBg) return;
   crop={x:0,y:0,w:W,h:H}; render(); pushExport(); });
+
+// -- transform: flip the working image; mirror the crop rect so it tracks content --
+function flipImage(horiz){ if(!hasBg) return;
+  var t=document.createElement('canvas'); t.width=W; t.height=H; var tc=t.getContext('2d');
+  if(horiz){ tc.translate(W,0); tc.scale(-1,1); } else { tc.translate(0,H); tc.scale(1,-1); }
+  tc.drawImage(baseImg,0,0,W,H);
+  var im=new Image(); im.onload=function(){ baseImg=im;
+    if(horiz) crop.x=W-(crop.x+crop.w); else crop.y=H-(crop.y+crop.h);
+    clampCrop(); render(); pushExport(); }; im.src=t.toDataURL('image/png'); }
+document.getElementById('fliph').addEventListener('click',function(){ flipImage(true); });
+document.getElementById('flipv').addEventListener('click',function(){ flipImage(false); });
 
 function bindCol(id,vid,setter,suffix){ var el=document.getElementById(id),lab=document.getElementById(vid);
   el.addEventListener('input',function(e){ setter(+e.target.value); lab.textContent=e.target.value; render(); pushExport(); }); }

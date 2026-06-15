@@ -149,6 +149,8 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
         </div>
         <div class="fld"><span>Auto-grow</span><span id="dilv">8</span></div>
         <input type="range" id="dil" min="0" max="60" value="8">
+        <div class="fld"><span>Select tol.</span><span id="wtolv">40</span></div>
+        <input type="range" id="wtol" min="0" max="120" value="40" title="Colour tolerance for the magic wand and the fill bucket (higher = matches more)">
         <div class="row3">
           <button id="invmask" title="Invert the mask">&#9680;</button>
           <button id="clrmask" title="Clear the mask">&#8856;</button>
@@ -235,10 +237,10 @@ var restoreBuf=document.createElement('canvas'),rbx=restoreBuf.getContext('2d');
 // stacking of draw layers between base (bottom) and mask (top)
 var drawLayers=[],active=0,layerSeq=0;
 
-var tool='brush',color='#e83e8c',size=14,opacity=1.0,hardness=0.8;
+var tool='brush',color='#e83e8c',secondaryColor=null,size=14,opacity=1.0,hardness=0.8;
 var lassoPts=[],cloneSrc=null,cloneOff={dx:0,dy:0};
 var mode='draw';  // 'mask' | 'draw' | 'drawmask'
-var autoMask=false,dilate=8,showMask=true;
+var autoMask=false,dilate=8,showMask=true,wandTol=40;
 var drawing=false,sx=0,sy=0,lastX=0,lastY=0;
 var undoStack=[],redoStack=[];
 var baseScale=1,viewScale=1;
@@ -368,7 +370,7 @@ function floodFill(sxp,syp){
     if(t.isMask){ fr=fg=fb=255; fa=255; }
     else { var c=hex2rgb(color); fr=c[0];fg=c[1];fb=c[2];fa=Math.round(opacity*255); }
     if(tr===fr&&tg===fg&&tb===fb&&ta===fa) return;
-    var stack=[idx],seen=new Uint8Array(W*H),tol=40;
+    var stack=[idx],seen=new Uint8Array(W*H),tol=wandTol;
     function m(i){ return Math.abs(d[i]-tr)<=tol&&Math.abs(d[i+1]-tg)<=tol&&Math.abs(d[i+2]-tb)<=tol&&Math.abs(d[i+3]-ta)<=tol; }
     while(stack.length){ var i=stack.pop(),pi=i>>2; if(pi<0||pi>=W*H||seen[pi]||!m(i)) continue; seen[pi]=1;
       d[i]=fr;d[i+1]=fg;d[i+2]=fb;d[i+3]=fa; var x=pi%W;
@@ -381,10 +383,10 @@ function hex2rgb(h){ h=h.replace('#',''); if(h.length===3)h=h[0]+h[0]+h[1]+h[1]+
 function pickColor(xp,yp){ var t=document.createElement('canvas'); t.width=W;t.height=H; var tc=t.getContext('2d');
   if(baseImg) tc.drawImage(baseImg,0,0,W,H); drawLayers.forEach(function(l){ if(l.visible) tc.drawImage(l.cv,0,0); });
   var p=tc.getImageData(Math.floor(xp),Math.floor(yp),1,1).data;
-  color='#'+[p[0],p[1],p[2]].map(function(v){return ('0'+v.toString(16)).slice(-2);}).join('');
-  document.getElementById('pick').value=color; markSwatch(); }
+  setColor('#'+[p[0],p[1],p[2]].map(function(v){return ('0'+v.toString(16)).slice(-2);}).join('')); }
 
-function magicWand(xp,yp){
+// op: 'replace' (default — clear then set), 'add' (Shift), 'subtract' (Alt)
+function magicWand(xp,yp,op){
   var t=document.createElement('canvas'); t.width=W;t.height=H; var tc=t.getContext('2d');
   if(baseImg) tc.drawImage(baseImg,0,0,W,H);
   drawLayers.forEach(function(l){ if(l.visible) tc.drawImage(l.cv,0,0); });
@@ -392,10 +394,13 @@ function magicWand(xp,yp){
   var sx0=Math.floor(xp),sy0=Math.floor(yp); var idx=(sy0*W+sx0)*4;
   var tr=d[idx],tg=d[idx+1],tb=d[idx+2];
   var sel=mbx.getImageData(0,0,W,H),sd=sel.data;
-  var stack=[idx],seen=new Uint8Array(W*H),tol=40;
+  if(op==='replace'){ for(var z=0;z<sd.length;z++) sd[z]=0; }   // start from an empty mask
+  var on=(op!=='subtract');                                     // add/replace set; subtract clears
+  var stack=[idx],seen=new Uint8Array(W*H),tol=wandTol;
   function m(i){ return Math.abs(d[i]-tr)<=tol&&Math.abs(d[i+1]-tg)<=tol&&Math.abs(d[i+2]-tb)<=tol; }
   while(stack.length){ var i=stack.pop(),pi=i>>2; if(pi<0||pi>=W*H||seen[pi]||!m(i)) continue; seen[pi]=1;
-    sd[i]=sd[i+1]=sd[i+2]=255; sd[i+3]=255; var x=pi%W;
+    if(on){ sd[i]=sd[i+1]=sd[i+2]=255; sd[i+3]=255; } else { sd[i]=sd[i+1]=sd[i+2]=0; sd[i+3]=0; }
+    var x=pi%W;
     if(x>0)stack.push(i-4); if(x<W-1)stack.push(i+4); stack.push(i-W*4); stack.push(i+W*4); }
   mbx.putImageData(sel,0,0);
 }
@@ -545,7 +550,8 @@ function down(e){ if(!hasBg) return; if(e.button!==undefined && e.button!==0) re
   if(mode!=='mask' && tool!=='xform' && tool!=='eye' && tool!=='wand' && tool!=='lasso'){
     var _al=activeLayer(); if(tSession===_al.id){ tSession=-1; tSnap=null; tBox=null; } }
   if(tool==='eye'){ pickColor(p.x,p.y); return; }
-  if(tool==='wand'){ pushUndo(mbx,'mask'); magicWand(p.x,p.y); compose(); pushExport(); return; }
+  if(tool==='wand'){ pushUndo(mbx,'mask');
+    var wop=e.shiftKey?'add':(e.altKey?'subtract':'replace'); magicWand(p.x,p.y,wop); compose(); pushExport(); return; }
   if(tool==='xform'){ ensureXform(); drawing=true; startXform(p); return; }
   if(tool==='lasso'){ pushUndo(mbx,'mask'); lassoPts=[{x:p.x,y:p.y}]; drawing=true; return; }
   if(tool==='clone'){ if(e.altKey||e.shiftKey){ cloneSrc={x:p.x,y:p.y}; drawCursor(p.x,p.y); return; }
@@ -613,10 +619,13 @@ function setMode(m){ mode=m; document.querySelectorAll('#modeseg button').forEac
   updateHardnessUI(); renderLayers(); }
 document.querySelectorAll('#modeseg button').forEach(function(b){ b.addEventListener('click',function(){ setMode(b.dataset.mode); }); });
 function markSwatch(){ document.querySelectorAll('#pal .sw').forEach(function(s){ s.classList.toggle('on',s.dataset.c.toLowerCase()===color.toLowerCase()); }); }
+// set the active colour, remembering the previous one as secondary (for the 'x' swap)
+function setColor(c){ if(c && color && c.toLowerCase()!==color.toLowerCase()) secondaryColor=color;
+  color=c; var pk=document.getElementById('pick'); if(pk) pk.value=c; markSwatch(); }
 var pal=document.getElementById('pal');
 __PALETTE__.forEach(function(c){ var s=document.createElement('div'); s.className='sw'; s.dataset.c=c; s.style.background=c;
-  s.addEventListener('click',function(){ color=c; document.getElementById('pick').value=c; markSwatch(); }); pal.appendChild(s); });
-document.getElementById('pick').addEventListener('input',function(e){ color=e.target.value; markSwatch(); });
+  s.addEventListener('click',function(){ setColor(c); }); pal.appendChild(s); });
+document.getElementById('pick').addEventListener('input',function(e){ setColor(e.target.value); });
 document.getElementById('size').addEventListener('input',function(e){ size=+e.target.value; document.getElementById('szv').textContent=size; });
 document.getElementById('op').addEventListener('input',function(e){ opacity=(+e.target.value)/100; document.getElementById('opv').textContent=e.target.value; });
 document.getElementById('hard').addEventListener('input',function(e){ hardness=(+e.target.value)/100; document.getElementById('hdv').textContent=e.target.value; });
@@ -637,6 +646,7 @@ document.getElementById('growmask').addEventListener('click',function(){ if(hasB
 document.getElementById('shrinkmask').addEventListener('click',function(){ if(hasBg) shrinkMask(); });
 document.getElementById('auto').addEventListener('click',function(){ autoMask=!autoMask; this.classList.toggle('on',autoMask); pushExport(); });
 document.getElementById('dil').addEventListener('input',function(e){ dilate=+e.target.value; document.getElementById('dilv').textContent=dilate; pushExport(); });
+document.getElementById('wtol').addEventListener('input',function(e){ wandTol=+e.target.value; document.getElementById('wtolv').textContent=wandTol; });
 document.getElementById('showmask').addEventListener('click',function(){ showMask=!showMask; this.classList.toggle('on',showMask); compose(); });
 document.getElementById('undo').addEventListener('click',function(){ restore(undoStack,redoStack); pushExport(); });
 document.getElementById('redo').addEventListener('click',function(){ restore(redoStack,undoStack); pushExport(); });
@@ -651,11 +661,19 @@ var fileinput=document.getElementById('fileinput');
 document.getElementById('upload').addEventListener('click',function(){ fileinput.click(); });
 fileinput.addEventListener('change',function(e){ var f=e.target.files[0]; if(!f) return;
   var rd=new FileReader(); rd.onload=function(){ setBg(rd.result); }; rd.readAsDataURL(f); e.target.value=''; });
+// nudge the brush size by a delta, clamped to the slider's min/max, keeping the
+// 'size' var, the slider position and the readout in sync.
+function bumpSize(delta){ var s=document.getElementById('size'); if(!s) return;
+  var mn=+s.min||1, mx=+s.max||200, v=Math.max(mn,Math.min(mx,size+delta));
+  size=v; s.value=v; document.getElementById('szv').textContent=v; }
 window.addEventListener('keydown',function(e){
   if(e.ctrlKey&&e.key==='z'){restore(undoStack,redoStack);pushExport();return;}
   if(e.ctrlKey&&(e.key==='y'||(e.shiftKey&&e.key==='Z'))){restore(redoStack,undoStack);pushExport();return;}
   if(e.ctrlKey&&(e.key==='c'||e.key==='C')){ e.preventDefault(); copyRegion(true); return; }
   if(e.ctrlKey&&(e.key==='v'||e.key==='V')){ e.preventDefault(); pasteClip(); return; }
+  if(e.key==='['){ bumpSize(-(size>20?5:1)); return; }
+  if(e.key===']'){ bumpSize(size>=20?5:1); return; }
+  if(e.key==='x'||e.key==='X'){ if(secondaryColor){ var prev=color; setColor(secondaryColor); secondaryColor=prev; } return; }
   var k={b:'brush',e:'eraser',r:'restore',g:'fill',i:'eye',w:'wand',l:'lasso',k:'clone',s:'smudge'}[e.key]; if(k) selTool(k); });
 
 // -- layers manager (horizontal): mask (top) · draw layers · background (bottom) --

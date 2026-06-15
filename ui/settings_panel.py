@@ -16,11 +16,20 @@ from __future__ import annotations
 import gradio as gr
 
 from ..core import models, paths, presets, projects
+from ..core.sd import sd_models
 from .page import SAMPLERS, SCHEDULERS
 
 
 _VRAM_ALL = "All models"
 _VRAM_LOW = "Low-VRAM only (light/quantized native models)"
+
+# Sentinel for "no custom VAE" — the checkpoint's own VAE (current behaviour).
+_VAE_NONE = "(none — use checkpoint VAE)"
+
+
+def _vae_choices() -> list[str]:
+    """``(none)`` + every VAE file (stem) discovered in the shared VAE dir."""
+    return [_VAE_NONE] + sd_models.scan_vaes(paths.sdxl_vae_dir())
 
 
 def build_settings_panel(native_dl_choices=None):
@@ -65,6 +74,20 @@ def build_settings_panel(native_dl_choices=None):
                     value=str(paths.models_dir()))
                 c["outputs_dir"] = gr.Textbox(label="Outputs (this plugin only)",
                                               value=str(paths.outputs_dir()))
+            with gr.Row():
+                c["sdxl_vae_dir"] = gr.Textbox(
+                    label="SDXL VAE folder (shared)",
+                    value=str(paths.sdxl_vae_dir()))
+                # Discovered-VAE picker. Default '' = none → the checkpoint's own VAE
+                # (current behaviour). Persist the chosen stem; the SD backend swaps it
+                # in on the next generation.
+                _vsel = paths.get_sd_vae()
+                c["sdxl_vae"] = gr.Dropdown(
+                    label="Custom VAE (SDXL/Pony/Illustrious)",
+                    choices=_vae_choices(),
+                    value=(_vsel if _vsel else _VAE_NONE),
+                    info="Swap in a custom VAE (e.g. sdxl-vae-fp16-fix) for all SD-family "
+                         "generations. '(none)' uses the checkpoint's own VAE.")
             with gr.Row():
                 c["save_dirs"] = gr.Button("Save folders", variant="primary")
                 c["rescan"] = gr.Button("Rescan models & LoRAs")

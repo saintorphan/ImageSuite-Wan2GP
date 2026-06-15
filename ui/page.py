@@ -21,10 +21,14 @@ from . import modify_canvas as _modify
 from . import enhance as _enhance
 from ..core import overlays as _ovcore
 from ..core import prompt_library as _plib
+from ..core.sd import sd_samplers as _sd_samplers
 
-SAMPLERS = ["DPM++ 2M", "DPM++ 2M SDE", "DPM++ 3M SDE", "Euler a", "Euler",
-            "Heun", "DDIM", "UniPC", "LCM", "default"]
-SCHEDULERS = ["", "Karras", "Exponential", "Normal", "SGM Uniform", "Simple"]
+# Sourced from the SD backend so only sampler/scheduler values create_scheduler()
+# actually supports are offered (anything else silently falls back to Euler /
+# Automatic). Each includes the neutral native sentinel ("default" / "") used by
+# Flux/Z-Image/Qwen, whose pipelines own their own scheduler.
+SAMPLERS = _sd_samplers.list_samplers()
+SCHEDULERS = _sd_samplers.list_schedulers()
 # Initial outpaint target sizes (SDXL set); refreshed per model family on change.
 _OUTPAINT_SIZES_INIT = ["1024×1024", "1152×896", "896×1152", "1216×832", "832×1216",
                         "1344×768", "768×1344", "1536×640", "640×1536"]
@@ -63,6 +67,15 @@ def _settings_bar(model_choices, lora_choices, mode):
             c["cfg"] = gr.Slider(1.0, 15.0, value=6.0, step=0.5, label="CFG")
             c["clip_skip"] = gr.Slider(1, 4, value=2, step=1, label="Clip skip")
             c["seed"] = gr.Number(value=-1, label="Seed (-1=random)", precision=0)
+        # Read-only "Last seed" + Reuse: when Seed is -1 the actual random seed used
+        # is otherwise lost (it's only in the sd_<seed>_*.png filename). The gen
+        # handlers surface it here; ♻ copies it back into Seed above (wired in
+        # plugin._wire_page).
+        with gr.Row():
+            c["last_seed"] = gr.Number(value=None, label="Last seed", precision=0,
+                                       interactive=False, scale=3)
+            c["reuse_seed"] = gr.Button("♻ Reuse seed", size="sm", scale=1,
+                                        min_width=110)
         # Resolution: a per-model preset picker (trained buckets by orientation) +
         # an aspect lock. Picking a preset fills Width/Height; with Lock on, dragging
         # one slider scales the other to hold the ratio (wired in plugin._wire_page).
@@ -121,6 +134,11 @@ def _settings_bar(model_choices, lora_choices, mode):
                     label="Inpaint area")
                 c["padding"] = gr.Slider(0, 256, value=32, step=8,
                                          label="Only masked padding (px)")
+                c["seamless"] = gr.Checkbox(
+                    value=False, label="Seamless blend",
+                    info="Laplacian pyramid paste-back — hides the mask seam at "
+                         "every frequency band instead of just feathering its edge. "
+                         "Off uses the plain feathered composite.")
     return c
 
 
@@ -158,6 +176,13 @@ def _prompt_block(c):
         c["enhance_pos"] = gr.Button("✨ Enhance prompt")
         c["enhance_neg"] = gr.Button("✨ Enhance negative")
         c["interrogate"] = gr.Button("🔍 Interrogate image")
+    with gr.Row():
+        # WD14 tag confidence (booru families only; BLIP captions ignore it) and
+        # whether interrogation overwrites the prompt (default) or appends tags.
+        c["interro_thresh"] = gr.Slider(0.1, 0.9, value=0.35, step=0.05,
+                                        label="Interrogate tag threshold")
+        c["interro_mode"] = gr.Radio(["Replace", "Append"], value="Replace",
+                                     label="Interrogate result")
 
 
 def _overlays_strip_block(c):

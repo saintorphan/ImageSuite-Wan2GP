@@ -28,7 +28,7 @@ class _SDConfig:
         self.model_paths = {
             "sd_checkpoint_dir": str(paths.sdxl_models_dir()),
             "sd_lora_dir": str(paths.sdxl_loras_dir()),
-            "sd_vae_dir": "",
+            "sd_vae_dir": str(paths.sdxl_vae_dir()),
             "sd_refiner_dir": "",
         }
 
@@ -123,13 +123,40 @@ def release_sd():
     _free_torch()
 
 
+def release_controlnet():
+    """Free the cached ControlNet pipeline on the main SD pipeline (best-effort).
+    Operates only on an already-built pipeline so it never forces a load."""
+    global _pipeline
+    try:
+        if _pipeline is not None:
+            _pipeline.unload_controlnet()
+    except Exception:
+        logger.debug("ControlNet unload failed", exc_info=True)
+    _free_torch()
+
+
+def release_body_double():
+    """Free the cached body-double pipeline on the main SD pipeline (best-effort).
+    Operates only on an already-built pipeline so it never forces a load."""
+    global _pipeline
+    try:
+        if _pipeline is not None:
+            _pipeline.unload_body_double()
+    except Exception:
+        logger.debug("body-double unload failed", exc_info=True)
+    _free_torch()
+
+
 def release_all():
     """Free *all* plugin-held GPU consumers: the main SD txt2img pipeline, the
-    standalone inpaint/IP-Adapter pipe, and (best-effort) the bundled BiRefNet
-    segmentation model. Registered as the GPU release_vram_callback so handing the
-    lock back to Wan2GP doesn't leak any of these into video generation."""
+    standalone inpaint/IP-Adapter pipe, the ControlNet + body-double pipes, and
+    (best-effort) the bundled BiRefNet segmentation model. Registered as the GPU
+    release_vram_callback so handing the lock back to Wan2GP doesn't leak any of
+    these into video generation."""
     release_sd()
     release_inpaint()
+    release_controlnet()
+    release_body_double()
     try:
         from .sd.segmentation import release_segmentation_model
         release_segmentation_model()
@@ -152,6 +179,13 @@ def available() -> bool:
         return False
 
 
+def _vae_name() -> str:
+    """The custom-VAE name to hand SDImagePipeline.load(). The persisted setting is
+    a file stem ('' = none); map '' to "Automatic" (the checkpoint's own VAE — current
+    behaviour, no regression)."""
+    return paths.get_sd_vae() or "Automatic"
+
+
 def _apply_loras(pipe, loras):
     """Apply a [{"name","weight"}] LoRA list to the loaded SD pipe (no-op if empty)."""
     if not loras:
@@ -171,7 +205,7 @@ def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cf
     if seed is None or int(seed) < 0:
         seed = _random.randint(0, 2**31 - 1)
     with models.no_auto_download():  # never silently pull weights/configs
-        pipe.load(checkpoint_path)
+        pipe.load(checkpoint_path, vae_name=_vae_name())
         # Clear any LoRAs left fused on the cached pipe from a prior gen (the empty
         # list must clear too, so this can't live inside _apply_loras), apply the
         # requested set, and remove them again afterward so they never contaminate
@@ -212,7 +246,7 @@ def generate_img2img(checkpoint_path, image_path, prompt, negative, width, heigh
     if seed is None or int(seed) < 0:
         seed = _random.randint(0, 2**31 - 1)
     with models.no_auto_download():
-        pipe.load(checkpoint_path)
+        pipe.load(checkpoint_path, vae_name=_vae_name())
         # See generate_txt2img: clear stale LoRAs, apply, and remove afterward.
         pipe.remove_loras()
         _apply_loras(pipe, loras)
@@ -240,13 +274,16 @@ def generate_img2img(checkpoint_path, image_path, prompt, negative, width, heigh
 def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0.75,
             steps=30, cfg=6.0, seed=-1, sampler="DPM++ 2M", scheduler="Karras",
             clip_skip=1, mask_blur=4, inpainting_fill=1, full_res=False, padding=32,
-            batch_size=1, loras=None, out_dir=None, callback=None, progress=None) -> list[str]:
+            seamless=False, batch_size=1, loras=None, out_dir=None, callback=None,
+            progress=None) -> list[str]:
     """Prompt-driven masked inpaint for manual touch-ups (no IP-Adapter). Returns the
     saved image paths (``batch_size`` of them).
 
     Inpaint-specific params mirror SupremeDiffusion's generate_inpaint: ``mask_blur``
     (px), ``inpainting_fill`` (0 fill / 1 original / 2 latent-noise / 3 latent-nothing),
-    ``full_res`` (inpaint only the masked region at full res) and ``padding`` (px)."""
+    ``full_res`` (inpaint only the masked region at full res) and ``padding`` (px).
+    ``seamless`` opts the paste-back into Laplacian pyramid blending (default off uses
+    the plain feathered composite)."""
     import random as _random
     from PIL import Image
     pipe = get_pipeline()
@@ -255,7 +292,7 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
     img = Image.open(image_path).convert("RGB") if isinstance(image_path, str) else image_path
     w, h = img.size
     with models.no_auto_download():
-        pipe.load(checkpoint_path)
+        pipe.load(checkpoint_path, vae_name=_vae_name())
         # Clear any LoRAs left fused from a prior gen before applying this set —
         # same as generate_txt2img/generate_img2img. The SDXL inpaint/img2img
         # variant pipes share the main pipe's UNet/VAE/text-encoders, so LoRA
@@ -272,6 +309,11 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
             except Exception:
                 logger.warning("failed applying inpaint LoRAs", exc_info=True)
                 ip = None
+        # Opt the paste-back composite into Laplacian pyramid blending for this call
+        # only — generate_inpaint / _inpaint_full_res read self._use_laplacian_blend.
+        # Restore the prior value afterward so the flag never leaks across calls.
+        prev_lap_blend = getattr(pipe, "_use_laplacian_blend", False)
+        pipe._use_laplacian_blend = bool(seamless)
         try:
             images = pipe.generate_inpaint(
                 image=img, mask=mask_image, prompt=prompt or "", negative_prompt=negative or "",
@@ -281,6 +323,7 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
                 inpainting_fill=int(inpainting_fill), full_res=bool(full_res),
                 padding=int(padding), batch_size=int(batch_size), callback=callback)
         finally:
+            pipe._use_laplacian_blend = prev_lap_blend
             if ip is not None:
                 try:
                     pipe._remove_loras_from_pipe(ip)

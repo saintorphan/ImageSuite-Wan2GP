@@ -141,19 +141,33 @@ def gen_output_dirs() -> list:
     return [cache_dir() / "sd_gen", cache_dir() / "inpaint"]
 
 
-def set_dirs(*, outputs=None, models=None, sdxl_models=None, sdxl_loras=None) -> None:
+def set_dirs(*, outputs=None, models=None, sdxl_models=None, sdxl_loras=None,
+             sdxl_vae=None) -> None:
     """Persist directory overrides. SHARED resources (face/ADetailer weights, SDXL
-    checkpoints + LoRAs) go to the cross-plugin .orphansuite.json so every plugin
-    follows; plugin-specific (outputs) goes to .imagesuite.json. '' clears it."""
+    checkpoints + LoRAs + VAEs) go to the cross-plugin .orphansuite.json so every
+    plugin follows; plugin-specific (outputs) goes to .imagesuite.json. '' clears it."""
     if outputs is not None:
         cfg = load_config()
         cfg["outputs_dir"] = str(Path(outputs).expanduser()) if outputs else ""
         save_config()
     for key, val in (("models_dir", models), ("sdxl_models_dir", sdxl_models),
-                     ("sdxl_loras_dir", sdxl_loras)):
+                     ("sdxl_loras_dir", sdxl_loras), ("sdxl_vae_dir", sdxl_vae)):
         if val is not None:
             set_shared_dir(key, val)
     ensure_dirs()
+
+
+def get_sd_vae() -> str:
+    """Name (file stem) of the custom SDXL VAE the SD backend should swap in, '' =
+    none (Automatic — the checkpoint's own VAE, current behaviour). Shared across
+    saintorphan plugins via .orphansuite.json."""
+    return str(get_shared("sd_vae", "") or "")
+
+
+def set_sd_vae(name) -> None:
+    """Persist the chosen custom SDXL VAE name to the cross-plugin .orphansuite.json
+    ('' clears it back to Automatic)."""
+    set_shared("sd_vae", str(name or ""))
 
 
 # --- roots -----------------------------------------------------------------
@@ -400,6 +414,11 @@ def sdxl_loras_dir() -> Path:
     return _shared_dir("sdxl_loras_dir", "sdxl_loras")
 
 
+def sdxl_vae_dir() -> Path:
+    """Shared folder of custom SDXL VAEs (e.g. sdxl-vae-fp16-fix)."""
+    return _shared_dir("sdxl_vae_dir", "sdxl_vae")
+
+
 def overlays_dir() -> Path:
     # User-managed library of overlay PNGs (transparent stickers, frames, etc.)
     # organised into folders via the Overlays tab. Own root by default.
@@ -413,7 +432,7 @@ def cache_dir() -> Path:
 def ensure_dirs() -> Path:
     """Create the directory tree if missing. Idempotent; called on plugin setup."""
     for d in (outputs_dir(), models_dir(), sdxl_models_dir(), sdxl_loras_dir(),
-              overlays_dir(), cache_dir()):
+              sdxl_vae_dir(), overlays_dir(), cache_dir()):
         try:
             d.mkdir(parents=True, exist_ok=True)
         except Exception:

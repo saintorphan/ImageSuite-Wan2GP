@@ -101,12 +101,24 @@ class SDImagePipeline:
         if torch.cuda.is_available():
             self.pipe = self.pipe.to("cuda")
 
-        # Try to enable xformers
+        # Attention: prefer diffusers' default SDPA (AttnProcessor2_0) on
+        # torch>=2 — it matches/beats xformers and drops a fragile optional dep,
+        # so we do NOT force xformers. Only opt in to xformers if it's actually
+        # importable, fully wrapped so a missing/broken xformers can't break load.
         try:
+            import xformers  # noqa: F401
             self.pipe.enable_xformers_memory_efficient_attention()
             logger.info("Enabled xformers attention for SD pipeline.")
         except Exception:
-            logger.debug("xformers not available, using default attention.")
+            logger.debug("xformers unavailable; using PyTorch SDPA attention.")
+
+        # channels_last UNet memory format: a free throughput win on Ampere+.
+        try:
+            if hasattr(self.pipe, "unet"):
+                self.pipe.unet.to(memory_format=torch.channels_last)
+                logger.debug("UNet set to channels_last memory format.")
+        except Exception:
+            logger.debug("Could not set UNet to channels_last; skipping.")
 
         # VAE memory helpers. Slicing (splits the batch) is free quality-wise.
         # Tiling is left at diffusers' default SDXL threshold (latent 128) so it ONLY
@@ -795,10 +807,25 @@ class SDImagePipeline:
         # edge never blends against masked-region fill garbage.
         crop_orig_scaled = original.crop(
             (paste_x, paste_y, paste_x + paste_w, paste_y + paste_h))
+        # Phase 4b: optional Laplacian pyramid blend of the generated crop into the
+        # TRUE original crop (same opt-in flag/default as generate_inpaint). Falls
+        # back to the alpha composite on any error so behaviour never regresses.
+        use_lap_blend = bool(getattr(self, "_use_laplacian_blend", False))
         results = []
         for gen_img in gen_images:
             gen_crop = gen_img.resize((paste_w, paste_h), Image.LANCZOS)
-            merged_crop = Image.composite(gen_crop, crop_orig_scaled, comp_mask)
+            if use_lap_blend:
+                try:
+                    from .laplacian_blend import laplacian_pyramid_blend
+                    merged_crop = laplacian_pyramid_blend(
+                        background=crop_orig_scaled, foreground=gen_crop,
+                        mask=comp_mask, levels=5,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Laplacian blend failed (%s) — falling back to alpha composite", exc)
+                    merged_crop = Image.composite(gen_crop, crop_orig_scaled, comp_mask)
+            else:
+                merged_crop = Image.composite(gen_crop, crop_orig_scaled, comp_mask)
             result = original.copy()
             result.paste(merged_crop, (paste_x, paste_y))
             results.append(result)

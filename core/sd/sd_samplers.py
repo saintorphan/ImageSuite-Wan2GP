@@ -38,9 +38,21 @@ _SAMPLER_OVERRIDE_KEYS: set[str] = {
 
 _SCHEDULER_OVERRIDES: dict[str, dict[str, Any]] = {
     "Automatic": {},
+    # "Normal" = diffusers default sigma schedule (no Karras/Exponential reshaping).
+    # An explicit, real option so the Illustrious-family preset default resolves to
+    # a genuine choice instead of silently falling back to "Automatic".
+    "Normal": {},
     "Karras": {"use_karras_sigmas": True},
     "Exponential": {"use_exponential_sigmas": True},
+    # A1111 "SGM Uniform" ≈ trailing timestep spacing in diffusers.
+    "SGM Uniform": {"timestep_spacing": "trailing"},
 }
+
+# Native pipelines (Flux/Z-Image/Qwen) own their own sampler/scheduler, so the UI
+# offers these neutral sentinels for them. They are NOT routed through
+# create_scheduler() — they only exist as valid dropdown/preset values.
+NATIVE_SAMPLER = "default"
+NATIVE_SCHEDULER = ""
 
 # Every sigma-spacing key any override can set. We strip these from an inherited
 # scheduler config before re-applying the current selection, otherwise a prior
@@ -60,14 +72,31 @@ def _import_scheduler_class(class_name: str):
     return cls
 
 
-def list_samplers() -> list[str]:
-    """Return available sampler names."""
-    return list(_SAMPLER_MAP.keys())
+def list_samplers(include_native: bool = True) -> list[str]:
+    """Return the sampler names the backend actually supports.
+
+    These are the keys create_scheduler() recognises (anything else falls back
+    to "Euler"). With ``include_native`` the neutral ``NATIVE_SAMPLER`` sentinel
+    used by native pipelines is appended so the value is offered in the UI.
+    """
+    names = list(_SAMPLER_MAP.keys())
+    if include_native:
+        names.append(NATIVE_SAMPLER)
+    return names
 
 
-def list_schedulers() -> list[str]:
-    """Return available scheduler variant names."""
-    return list(_SCHEDULER_OVERRIDES.keys())
+def list_schedulers(include_native: bool = True) -> list[str]:
+    """Return the scheduler variant names the backend actually supports.
+
+    These are the keys create_scheduler() recognises (anything else falls back
+    to "Automatic"). With ``include_native`` the neutral ``NATIVE_SCHEDULER``
+    sentinel used by native pipelines is prepended so the value is offered in
+    the UI.
+    """
+    names = list(_SCHEDULER_OVERRIDES.keys())
+    if include_native:
+        names.insert(0, NATIVE_SCHEDULER)
+    return names
 
 
 def create_scheduler(sampler_name: str, scheduler_name: str, config: dict | None = None) -> Any:

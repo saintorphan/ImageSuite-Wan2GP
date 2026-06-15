@@ -538,10 +538,13 @@ class ImageSuite(WAN2GPPlugin):
             return res[0] if isinstance(res, (list, tuple)) else res
         return gr.update()
 
-    def _interrogate(self, state, model, src, progress=gr.Progress(), *, mode):
+    def _interrogate(self, state, model, src, thresh, result_mode, cur_prompt,
+                     progress=gr.Progress(), *, mode):
         """Interrogate the page's image → prompt text. WD14 tags for booru
         families (Pony/Illustrious), BLIP caption otherwise. src is a filepath
-        (txt2img result / img2img init) or the inpaint canvas composite data-URL."""
+        (txt2img result / img2img init) or the inpaint canvas composite data-URL.
+        thresh is the WD14 tag confidence; result_mode ("Replace"/"Append")
+        controls whether the result overwrites or extends the current prompt."""
         if mode == "inpaint":
             img = self._decode_dataurl(src)
             if img is None:
@@ -565,7 +568,8 @@ class ImageSuite(WAN2GPPlugin):
         # native model for headroom, and frees the ONNX/BLIP VRAM afterward.
         self.acquire_gpu(state)
         try:
-            text = _interro.interrogate(path, fam, progress=progress)
+            text = _interro.interrogate(path, fam, threshold=float(thresh),
+                                        progress=progress)
         except Exception as e:
             traceback.print_exc()
             raise gr.Error(f"Interrogation failed: {e}")
@@ -573,6 +577,10 @@ class ImageSuite(WAN2GPPlugin):
             self.release_gpu(state)
         if not (text and text.strip()):
             raise gr.Error("Interrogation produced no text.")
+        text = text.strip()
+        # Append: extend the existing prompt (comma-joined) rather than overwrite.
+        if result_mode == "Append" and cur_prompt and cur_prompt.strip():
+            return cur_prompt.rstrip().rstrip(",") + ", " + text
         return text
 
     def _native_model_types(self):
@@ -1163,6 +1171,12 @@ class ImageSuite(WAN2GPPlugin):
         except Exception:
             traceback.print_exc()
 
+    @staticmethod
+    def _seed_update(last_seed):
+        """gr.update for the page's read-only "Last seed" field. ``None`` (native
+        seed<0, which doesn't surface its random seed) leaves the field unchanged."""
+        return gr.update() if last_seed is None else gr.update(value=int(last_seed))
+
     def _gallery_result(self, files, mode=None):
         """The (gallery, picked, save) tuple every generate handler returns.
 
@@ -1410,6 +1424,8 @@ class ImageSuite(WAN2GPPlugin):
     _PL_EXCLUDE = {"pl_name", "pl_saved", "res_preset", "res_lock", "ov_folder",
                    "out_size", "out_top", "out_bottom", "out_left", "out_right",
                    "out_feather",
+                   # read-only "Last seed" readout — surfaced from a gen, not a setting
+                   "last_seed",
                    # canvas bridge textboxes — transient data-URLs, not settings
                    # (the MultiCanvas state is saved separately as canvas_state)
                    "composite", "mask", "state",
@@ -1691,7 +1707,7 @@ class ImageSuite(WAN2GPPlugin):
     _PERSIST_KEYS = ["model", "sampler", "scheduler", "steps", "cfg", "clip_skip",
                      "seed", "width", "height", "count", "loras", "lora_mult",
                      "pos", "neg", "denoise", "resize_mode", "feather", "mask_mode",
-                     "inpaint_fill", "inpaint_area", "padding"]
+                     "inpaint_fill", "inpaint_area", "padding", "seamless"]
 
     def _wire_persist(self, ui):
         """Persist each tab's settings to <wan2gp_root>/.imagesuite.json on Generate and
@@ -1913,7 +1929,7 @@ class ImageSuite(WAN2GPPlugin):
         else:  # inpaint — inputs come from the PaintShop canvas (composite + mask)
             gen_inputs = [self.state] + SET + [
                 c["denoise"], c["feather"], c["mask_mode"], c["inpaint_fill"],
-                c["inpaint_area"], c["padding"], c["pos"], c["neg"],
+                c["inpaint_area"], c["padding"], c["seamless"], c["pos"], c["neg"],
                 c["composite"], c["mask"]]
             fn = self._make_inpaint(mode)
             # Pre-flush the canvas before reading composite/mask. Most edits push the
@@ -1938,7 +1954,14 @@ class ImageSuite(WAN2GPPlugin):
 
         c["generate"].click(
             fn, inputs=gen_inputs,
-            outputs=[c["gallery"], c["picked"], c["save"]], js=gen_js)
+            outputs=[c["gallery"], c["picked"], c["save"], c["last_seed"]], js=gen_js)
+
+        # ♻ Reuse seed: copy the actual seed used (surfaced into Last seed by the gen
+        # handler) back into the Seed input. No-op when Last seed is empty.
+        if "reuse_seed" in c and "last_seed" in c:
+            c["reuse_seed"].click(
+                lambda s: gr.update() if s in (None, "") else gr.update(value=int(s)),
+                inputs=[c["last_seed"]], outputs=[c["seed"]])
 
         # Click a gallery result to make IT the active selection — so Send-to /
         # Save As / the enhancement passes act on whichever image you pick, not just
@@ -1979,7 +2002,9 @@ class ImageSuite(WAN2GPPlugin):
                 # trailing progress= param — the lambda would drop it.
                 c["interrogate"].click(
                     functools.partial(self._interrogate, mode=mode),
-                    inputs=[self.state, c["model"], src], outputs=[c["pos"]])
+                    inputs=[self.state, c["model"], src, c["interro_thresh"],
+                            c["interro_mode"], c["pos"]],
+                    outputs=[c["pos"]])
 
         # Face/body swap, ADetailer (face+body), colour reference — Run on selected.
         if "face_run" in c:
@@ -2023,6 +2048,7 @@ class ImageSuite(WAN2GPPlugin):
                 raise gr.Error("Select a model from the dropdown first.")
             gen_sd.clear_abort()
             files, n = [], int(count)
+            last_seed = None  # actual seed of the LAST image generated (SD path)
             if backend == "native":
                 if self._gpu_busy(state):
                     raise gr.Error("A generation is already running — wait for it to finish.")
@@ -2036,6 +2062,10 @@ class ImageSuite(WAN2GPPlugin):
                                                   mode="txt2img",
                                                   loras=loras, mult_str=mult,
                                                   progress=progress, api=api, state=state)
+                    # Native randomizes a seed<0 internally and doesn't surface it; only
+                    # a fixed seed is known here. Leave Last seed alone otherwise.
+                    if int(seed) >= 0:
+                        last_seed = int(seed) + (n - 1)
                 finally:
                     self._restore_video_state(state, snap)
                     self._release_native_model()  # don't leave the native model stacked under a later SDXL load
@@ -2054,13 +2084,14 @@ class ImageSuite(WAN2GPPlugin):
                             sampler=sampler or "DPM++ 2M", scheduler=scheduler or "",
                             clip_skip=int(clip_skip), loras=lora_list,
                             callback=self._sd_step_cb(progress, i, nsteps, total))
+                        last_seed = sd
                 finally:
                     self.release_gpu(state)
             if gen_sd.was_aborted():
                 raise gr.Error("Txt2img aborted.")
             if not files:
                 raise gr.Error("Generation produced no images.")
-            return self._gallery_result(files, mode)
+            return self._gallery_result(files, mode) + (self._seed_update(last_seed),)
         return _run
 
     def _make_img2img(self, mode):
@@ -2081,6 +2112,7 @@ class ImageSuite(WAN2GPPlugin):
                 raise gr.Error("Enter a prompt first.")
             gen_sd.clear_abort()
             files, n = [], int(count)
+            last_seed = None  # actual seed of the LAST image generated (SD path)
             if backend == "native":
                 if self._gpu_busy(state):
                     raise gr.Error("A generation is already running — wait for it to finish.")
@@ -2095,6 +2127,10 @@ class ImageSuite(WAN2GPPlugin):
                                                   denoise=denoise, guide_path=init_image,
                                                   loras=loras, mult_str=mult,
                                                   progress=progress, api=api, state=state)
+                    # Native randomizes a seed<0 internally and doesn't surface it; only
+                    # a fixed seed is known here. Leave Last seed alone otherwise.
+                    if int(seed) >= 0:
+                        last_seed = int(seed) + (n - 1)
                 finally:
                     self._restore_video_state(state, snap)
                     self._release_native_model()  # don't leave the native model stacked under a later SDXL load
@@ -2115,6 +2151,7 @@ class ImageSuite(WAN2GPPlugin):
                             scheduler=scheduler, resize_mode=RESIZE.get(resize_mode, 0),
                             clip_skip=int(clip_skip), loras=lora_list,
                             callback=self._sd_step_cb(progress, i, nsteps, total))
+                        last_seed = sd
                 finally:
                     self.release_gpu(state)
             # An abort interrupts the diffusers loop mid-image, leaving a partial
@@ -2123,7 +2160,7 @@ class ImageSuite(WAN2GPPlugin):
                 raise gr.Error("img2img aborted.")
             if not files:
                 raise gr.Error("img2img produced no images.")
-            return self._gallery_result(files, mode)
+            return self._gallery_result(files, mode) + (self._seed_update(last_seed),)
         return _run
 
     # generate_inpaint's inpainting_fill code: 0 fill / 1 original /
@@ -2133,15 +2170,19 @@ class ImageSuite(WAN2GPPlugin):
     def _inpaint_core(self, state, backend, ident, comp, mask, pos, neg, *,
                       denoise, steps, cfg, clip_skip, seed, sampler, scheduler,
                       loras, mult, feather=4, inpaint_fill="original",
-                      full_res=False, padding=32, count=1, api=None, progress=None):
+                      full_res=False, padding=32, seamless=False, count=1,
+                      api=None, progress=None):
         """``count`` inpaint passes over a prepared composite(RGB) + mask(L), under a
         SINGLE GPU acquisition — one busy-check, a continuous progress bar across the
         batch, abort honoured between images (and the in-flight partial dropped), and
         a fresh random seed per image when ``seed`` < 0. Shared by the canvas Generate
-        (count = Batch count) and the Touch-Up outpaint (count 1). Returns a LIST of
-        result paths (empty if aborted before the first completed)."""
+        (count = Batch count) and the Touch-Up outpaint (count 1). Returns
+        ``(files, last_seed)``: a LIST of result paths (empty if aborted before the
+        first completed) and the actual seed of the last image (SD path; None on the
+        native path with seed<0, which doesn't surface its random seed)."""
         import random as _rng
         n = max(1, int(count))
+        last_seed = None  # actual seed of the LAST image generated (SD path)
 
         def _say(f, d):
             if progress is not None:
@@ -2171,10 +2212,14 @@ class ImageSuite(WAN2GPPlugin):
                         mode="inpaint", denoise=denoise, guide_path=guide_path,
                         mask_path=mask_path, loras=loras, mult_str=mult,
                         progress=progress, api=api, state=state)
+                # Native randomizes a seed<0 internally and doesn't surface it; only
+                # a fixed seed is known here.
+                if int(seed) >= 0:
+                    last_seed = int(seed) + (n - 1)
             finally:
                 self._restore_video_state(state, snap)
                 self._release_native_model()  # don't leave the native model stacked under a later SDXL load
-            return files
+            return files, last_seed
         # sd — one acquisition, loop count times for a real batch.
         lora_list = self._lora_list(loras, mult)
         self.acquire_gpu(state)
@@ -2195,22 +2240,24 @@ class ImageSuite(WAN2GPPlugin):
                     clip_skip=int(clip_skip), mask_blur=int(feather),
                     inpainting_fill=self._FILL.get(inpaint_fill, 1),
                     full_res=bool(full_res), padding=int(padding),
+                    seamless=bool(seamless),
                     progress=progress, loras=lora_list, callback=cb)
                 # Abort fired mid-image → drop this partial, keep the completed ones.
                 if gen_sd.was_aborted():
                     break
                 if outs:
                     files += outs
+                    last_seed = int(sd)
         finally:
             self.release_gpu(state)
-        return files
+        return files, last_seed
 
     def _make_inpaint(self, mode):
         api = self._api  # closed over so the click is webui-wrapped
 
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
                  width, height, count, loras, mult, denoise, feather, mask_mode,
-                 inpaint_fill, inpaint_area, padding, pos, neg,
+                 inpaint_fill, inpaint_area, padding, seamless, pos, neg,
                  composite_url, mask_url, progress=gr.Progress()):
             backend, ident = discovery.parse_model_value(model)
             if not backend:
@@ -2234,17 +2281,17 @@ class ImageSuite(WAN2GPPlugin):
             if mask_mode == "Inpaint not masked":
                 from PIL import ImageOps
                 mask = ImageOps.invert(mask)
-            outs = self._inpaint_core(
+            outs, last_seed = self._inpaint_core(
                 state, backend, ident, comp, mask, pos, neg, denoise=denoise,
                 steps=steps, cfg=cfg, clip_skip=clip_skip, seed=seed,
                 sampler=sampler, scheduler=scheduler, loras=loras, mult=mult,
                 feather=feather, inpaint_fill=inpaint_fill,
                 full_res=(inpaint_area == "Only masked"), count=count,
-                padding=padding, api=api, progress=progress)
+                padding=padding, seamless=bool(seamless), api=api, progress=progress)
             if not outs:
                 raise gr.Error("Inpaint aborted." if gen_sd.was_aborted()
                                else "Inpaint produced no image.")
-            return self._gallery_result(outs, mode)
+            return self._gallery_result(outs, mode) + (self._seed_update(last_seed),)
         return _run
 
     def _make_outpaint(self, mode):
@@ -2286,7 +2333,7 @@ class ImageSuite(WAN2GPPlugin):
             mask = Image.new("L", ext.size, 255)
             mask.paste(Image.new("L", comp.size, 0), (l, t))
             gen_sd.clear_abort()
-            outs = self._inpaint_core(  # outpaint is always a single pass (count 1)
+            outs, _last_seed = self._inpaint_core(  # outpaint is always a single pass (count 1)
                 state, backend, ident, ext, mask, pos, neg, denoise=1.0,
                 steps=steps, cfg=cfg, clip_skip=clip_skip, seed=seed,
                 sampler=sampler, scheduler=scheduler, loras=loras, mult=mult,
@@ -2295,6 +2342,7 @@ class ImageSuite(WAN2GPPlugin):
             if not outs:
                 raise gr.Error("Outpaint aborted." if gen_sd.was_aborted()
                                else "Outpaint produced no image.")
+            # The Touch-Up row has no Last seed field, so just return the gallery tuple.
             return self._gallery_result(outs, mode)
         return _run
 
@@ -2822,26 +2870,40 @@ class ImageSuite(WAN2GPPlugin):
             return f"✅ Unloaded the SDXL + helper models from VRAM{freed}."
         s["unload_models"].click(_unload_models, outputs=[s["unload_status"]])
 
-        def _save_dirs(outputs, sdxl_models, sdxl_loras, models_d):
+        def _save_dirs(outputs, sdxl_models, sdxl_loras, models_d, sdxl_vae):
             try:
                 paths.set_dirs(outputs=outputs or None, sdxl_models=sdxl_models or None,
-                               sdxl_loras=sdxl_loras or None, models=models_d or None)
+                               sdxl_loras=sdxl_loras or None, models=models_d or None,
+                               sdxl_vae=sdxl_vae or None)
                 status = ("✅ Directories saved & created. "
                           "(Re-run Scan to refresh the helper-weights status.)")
             except Exception as e:
                 status = f"⚠️ Could not save directories: {e}"
-            return [status] + _fresh_choices()
+            # Refresh the discovered-VAE picker against the (possibly new) VAE dir,
+            # keeping the current selection if it still resolves.
+            sel = paths.get_sd_vae()
+            return ([status] + _fresh_choices()
+                    + [gr.update(choices=settings_panel._vae_choices(),
+                                 value=(sel if sel else settings_panel._VAE_NONE))])
 
         s["save_dirs"].click(
             _save_dirs,
             inputs=[s["outputs_dir"], s["sdxl_models_dir"], s["sdxl_loras_dir"],
-                    s["models_dir"]],
-            outputs=[s["dirs_status"]] + model_dds + lora_dds)
+                    s["models_dir"], s["sdxl_vae_dir"]],
+            outputs=[s["dirs_status"]] + model_dds + lora_dds + [s["sdxl_vae"]])
 
         s["rescan"].click(
             lambda: ["🔄 Rescanned."] + _fresh_choices()
-            + [gr.update(choices=self._native_dl_choices())],
-            outputs=[s["dirs_status"]] + model_dds + lora_dds + [s["native_key"]])
+            + [gr.update(choices=self._native_dl_choices()),
+               gr.update(choices=settings_panel._vae_choices())],
+            outputs=[s["dirs_status"]] + model_dds + lora_dds
+                    + [s["native_key"], s["sdxl_vae"]])
+
+        # Persist the chosen custom VAE ('(none)' → '' = checkpoint's own VAE). Applied
+        # on the next SD generation (the pipeline swaps the VAE in at load time).
+        def _set_vae(name):
+            paths.set_sd_vae("" if (not name or name == settings_panel._VAE_NONE) else name)
+        s["sdxl_vae"].change(_set_vae, inputs=[s["sdxl_vae"]])
 
         # Link an existing models folder into the shared OrphanSuite area, then
         # refresh the page dropdowns + the shared-dir textboxes (which now resolve

@@ -2,6 +2,7 @@
   "tab": "ImageSuite",
   "inbox_key": "imagesuite_inbox",
   "payload": "frame",
+  "accepts": ["image"],
   "targets": [
     {"label": "Img2Img",     "slot": "img2img"},
     {"label": "MultiCanvas", "slot": "inpaint"},

@@ -85,8 +85,8 @@ input[type=range]{width:100%}
       <div class="sec">
         <div class="seclabel">Transform</div>
         <div class="row2">
-          <button id="fliph" title="Flip horizontally">&#8596; Flip H</button>
-          <button id="flipv" title="Flip vertically">&#8597; Flip V</button>
+          <button id="fliph" title="Flip horizontally">&#8596;</button>
+          <button id="flipv" title="Flip vertically">&#8597;</button>
         </div>
       </div>
       <div class="sec">

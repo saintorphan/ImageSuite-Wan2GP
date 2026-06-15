@@ -32,7 +32,7 @@ _CANVAS_DOC = r"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
 html,body{height:100%}
 body{background:#15151b;color:#ddd;overflow:hidden;user-select:none}
 #root{display:flex;flex-direction:column;height:100%;width:100%}
-#main{display:flex;flex:1;min-height:0}
+#main{display:flex;flex:1;min-height:0;position:relative}
 #wrap{flex:1;position:relative;overflow:auto;
   background:#101015 repeating-conic-gradient(#1a1a22 0% 25%,#141419 0% 50%) 0/24px 24px}
 #stage{position:relative;margin:10px auto;box-shadow:0 0 0 1px #000,0 6px 24px rgba(0,0,0,.5)}
@@ -49,6 +49,15 @@ body{background:#15151b;color:#ddd;overflow:hidden;user-select:none}
 #rail button{background:#2a2a35;border:1px solid #3a3a48;color:#cfcfe0;border-radius:6px;
   padding:6px 4px;font-size:11px;cursor:pointer;line-height:1.1}
 #rail button.on{background:#e83e8c;border-color:#e83e8c;color:#fff}
+#railhead{display:flex;justify-content:flex-end;margin:-2px 0 2px}
+#railhead button{padding:1px 9px;font-size:15px;line-height:1.2}
+#railexpand{position:absolute;top:10px;right:10px;z-index:20;background:#2a2a35;
+  border:1px solid #3a3a48;color:#cfcfe0;border-radius:6px;padding:4px 10px;font-size:15px;
+  line-height:1;cursor:pointer;display:none}
+#main.railcollapsed #rail{display:none}
+#main.railcollapsed #railexpand{display:block}
+.ovicon{width:34px;height:28px;padding:0;font-size:15px;display:inline-flex;
+  align-items:center;justify-content:center;line-height:1}
 .modeseg{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0}
 .modeseg button{border-radius:0}
 .modeseg button:first-child{border-radius:6px 0 0 6px}
@@ -106,6 +115,7 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
       <div id="empty">No image yet.<br>Use <b>&#8593; Upload</b> at the top of the tool rail,<br>or a "Send to MultiCanvas" button.</div>
     </div></div>
     <div id="rail">
+      <div id="railhead"><button id="railcollapse" title="Collapse the tool panel">&#187;</button></div>
       <div class="sec">
         <div class="seclabel">Mode</div>
         <div class="modeseg" id="modeseg">
@@ -195,14 +205,15 @@ input[type=color]{width:100%;height:26px;padding:0;border:1px solid #3a3a48;
         <input type="range" id="lopac" min="0" max="100" value="100" title="Opacity of the active layer">
       </div>
     </div>
+    <button id="railexpand" title="Show the tool panel">&#171;</button>
   </div>
   <div id="layers" title="Layers — drag draw layers to reorder; click to make active"></div>
   <div id="ovbar">
     <div id="ovhead">
       <button id="ovtoggle">&#9656; Overlays</button>
-      <button id="ovxform" class="ovbtn" title="Grab / transform the active layer (move · scale · rotate)">&#10021; Transform</button>
-      <button id="ovfliph" class="ovbtn" title="Flip the active layer horizontally">&#8596; Flip H</button>
-      <button id="ovflipv" class="ovbtn" title="Flip the active layer vertically">&#8597; Flip V</button>
+      <button id="ovxform" class="ovbtn ovicon" title="Transform the active layer — move · scale · rotate">&#10021;</button>
+      <button id="ovfliph" class="ovbtn ovicon" title="Flip the active layer horizontally">&#8596;</button>
+      <button id="ovflipv" class="ovbtn ovicon" title="Flip the active layer vertically">&#8597;</button>
       <span id="ovhint">drag a thumbnail or an image file onto the canvas → new layer · double-click to preview</span>
     </div>
     <div id="ovstrip"></div>
@@ -614,6 +625,13 @@ document.getElementById('flipv').addEventListener('click',function(){ flipLayer(
 // overlay-section duplicates (under the canvas, by the layers/overlays strip)
 document.getElementById('ovfliph').addEventListener('click',function(){ flipLayer(true); });
 document.getElementById('ovflipv').addEventListener('click',function(){ flipLayer(false); });
+// collapse / restore the tool rail (rail is on the right; >> hides it, << brings it back)
+document.getElementById('railcollapse').addEventListener('click',function(){
+  document.getElementById('main').classList.add('railcollapsed');
+  window.dispatchEvent(new Event('resize')); });
+document.getElementById('railexpand').addEventListener('click',function(){
+  document.getElementById('main').classList.remove('railcollapsed');
+  window.dispatchEvent(new Event('resize')); });
 document.getElementById('ovxform').addEventListener('click',function(){ if(!hasBg) return; selTool('xform'); ensureXform(); });
 document.getElementById('growmask').addEventListener('click',function(){ if(hasBg) growMask(); });
 document.getElementById('shrinkmask').addEventListener('click',function(){ if(hasBg) shrinkMask(); });

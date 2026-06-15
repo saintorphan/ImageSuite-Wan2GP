@@ -2622,7 +2622,10 @@ class ImageSuite(WAN2GPPlugin):
         c["mod_match"].click(
             _match, inputs=[c["out"], c["mod_ref"]],
             outputs=[c["bg_bridge"], c["mod_status"]],
-            js="() => { try{ window.__is_modify_exportnow(); }catch(e){} }")
+            js=("(edited, ref) => { try{ window.__is_modify_exportnow(); }catch(e){} "
+                "var el=document.querySelector('#imagesuite-modify-out textarea')"
+                "||document.querySelector('#imagesuite-modify-out input'); "
+                "return [el ? el.value : edited, ref]; }"))
 
         # Save the edited image into the results gallery (so send-to can act on it).
         def _save(edited):
@@ -2632,10 +2635,16 @@ class ImageSuite(WAN2GPPlugin):
             gallery, picked, save = self._gallery_result(
                 [self._save_img(img, "modify")], "modify")
             return gallery, picked, save, "💾 Saved to results."
+        # js MUST return the inputs — a js= that returns undefined nulls them (Gradio
+        # 5.29). So flush the editor's export, then read the freshly-written hidden
+        # textbox and return it as `edited` (else _save receives None → saves nothing).
         c["mod_save"].click(
             _save, inputs=[c["out"]],
             outputs=[c["gallery"], c["picked"], c["save"], c["mod_status"]],
-            js="() => { try{ window.__is_modify_exportnow(); }catch(e){} }")
+            js=("(edited) => { try{ window.__is_modify_exportnow(); }catch(e){} "
+                "var el=document.querySelector('#imagesuite-modify-out textarea')"
+                "||document.querySelector('#imagesuite-modify-out input'); "
+                "return el ? el.value : edited; }"))
 
         # Gallery select → picked (mirrors _wire_page's _pick) so send-to / Save As act
         # on whichever saved result is clicked.

@@ -131,7 +131,7 @@ input[type=range]{width:100%}
 <script>
 (function(){
 var MODE="__MODE__";
-var W=0,H=0,hasBg=false,baseImg=null;
+var W=0,H=0,hasBg=false,baseImg=null,origImg=null;  // origImg = full image as first loaded (for Reset crop)
 var wrap=document.getElementById('wrap'),stage=document.getElementById('stage');
 var bg=document.getElementById('bg'),disp=document.getElementById('disp');
 var bgx=bg.getContext('2d'),dx=disp.getContext('2d');
@@ -293,6 +293,9 @@ document.getElementById('applycrop').addEventListener('click',function(){ if(!ha
   var im=new Image(); im.onload=function(){ baseImg=im; setSize(im.naturalWidth,im.naturalHeight);
     crop={x:0,y:0,w:W,h:H}; render(); pushExport(); }; im.src=t.toDataURL('image/png'); });
 document.getElementById('resetcrop').addEventListener('click',function(){ if(!hasBg) return;
+  // restore the full original image (undo any Apply crop) before re-selecting all.
+  if(origImg && baseImg!==origImg){ baseImg=origImg; baked={x:0,y:0,w:0,h:0};
+    setSize(origImg.naturalWidth,origImg.naturalHeight); }
   crop={x:0,y:0,w:W,h:H}; render(); pushExport(); });
 
 // -- transform: flip the working image; mirror the crop rect so it tracks content --
@@ -373,7 +376,7 @@ var exportTimer=null;
 function pushExport(){ if(!hasBg) return; rsInfo(); clearTimeout(exportTimer); exportTimer=setTimeout(exportNow,120); }
 try{ parent.window['__is_'+MODE+'_exportnow']=exportNow; }catch(e){}
 
-function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im;
+function setBg(dataUrl){ var im=new Image(); im.onload=function(){ baseImg=im; origImg=im;
   setSize(im.naturalWidth,im.naturalHeight);
   crop={x:0,y:0,w:W,h:H}; baked={x:0,y:0,w:W,h:H};
   aspect=0; document.querySelectorAll('#aspseg button').forEach(function(b){ b.classList.toggle('on',b.dataset.asp==='free'); });

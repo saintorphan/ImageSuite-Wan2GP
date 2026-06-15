@@ -17,6 +17,9 @@ from pathlib import Path
 from . import paths
 
 _CKPT_EXTS = (".safetensors", ".ckpt")
+# LoRAs additionally support .pt — the loader (_apply_loras_to_pipe in
+# sd_pipeline.py) accepts .safetensors/.ckpt/.pt, so scan that wider set.
+_LORA_EXTS = (".safetensors", ".ckpt", ".pt")
 
 
 def categorize_native(model_type: str) -> str | None:
@@ -77,7 +80,7 @@ def discover_sdxl_loras(loras_dir=None) -> list[dict]:
     out = []
     if d and Path(d).is_dir():
         for p in sorted(Path(d).rglob("*")):
-            if p.is_file() and p.suffix.lower() in _CKPT_EXTS:
+            if p.is_file() and p.suffix.lower() in _LORA_EXTS:
                 out.append({"name": p.stem, "path": str(p)})
     return out
 

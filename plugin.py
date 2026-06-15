@@ -406,6 +406,10 @@ class ImageSuite(WAN2GPPlugin):
                        loras=None, mult="", progress=gr.Progress()):
         if not picked:
             raise gr.Error("Select a result first.")
+        # Clear any stale abort flag from a prior cancelled gen (mirrors _enh_color /
+        # _enh_bodyswap) — otherwise the callback can trip _interrupt and discard the
+        # result until an unrelated handler clears it.
+        gen_sd.clear_abort()
         ident = self._sd_ident(model)
         self._require(["buffalo_l"] if detector == "face" else ["person_yolov8s_seg"],
                       f"{detector.title()} ADetailer")
@@ -1408,7 +1412,10 @@ class ImageSuite(WAN2GPPlugin):
                    "out_feather",
                    # canvas bridge textboxes — transient data-URLs, not settings
                    # (the MultiCanvas state is saved separately as canvas_state)
-                   "composite", "mask", "state"}
+                   "composite", "mask", "state",
+                   # Modify tab's edited-image export — a multi-MB base64 data-URL,
+                   # not a setting; would bloat project.json if serialized.
+                   "out"}
 
     def _pl_items(self, c):
         """Ordered (key, component) pairs this page saves/loads."""
@@ -1895,6 +1902,7 @@ class ImageSuite(WAN2GPPlugin):
         SET = [c["model"], c["sampler"], c["scheduler"], c["steps"], c["cfg"],
                c["clip_skip"], c["seed"], c["width"], c["height"], c["count"],
                c["loras"], c["lora_mult"]]
+        gen_js = None
         if mode == "txt2img":
             gen_inputs = [self.state] + SET + [c["pos"], c["neg"]]
             fn = self._make_txt2img(mode)
@@ -1908,14 +1916,29 @@ class ImageSuite(WAN2GPPlugin):
                 c["inpaint_area"], c["padding"], c["pos"], c["neg"],
                 c["composite"], c["mask"]]
             fn = self._make_inpaint(mode)
+            # Pre-flush the canvas before reading composite/mask. Most edits push the
+            # hidden fields through a 120ms-debounced pushExport (only pointer-up
+            # flushes synchronously), so a Generate within 120ms of a slider/opacity/
+            # grow/invert/undo/flip would otherwise send STALE pre-edit data. So force
+            # a synchronous exportNow(), then re-read the freshly-written composite/
+            # mask textareas (the last two inputs) and substitute them.
+            # Gradio 5.29: a js= that returns undefined NULLS the inputs (model arrives
+            # empty → "Select a model"), so we ...spread and RETURN every input value;
+            # only composite/mask are replaced. Mirrors the Modify save fix (~2644).
+            gen_js = (
+                "(...args) => { try{ window.__is_inpaint_exportnow(); }catch(e){}"
+                " function rd(id){ var el=document.querySelector('#'+id+' textarea')"
+                "||document.querySelector('#'+id+' input'); return el?el.value:null; }"
+                " var n=args.length;"
+                " var comp=rd('imagesuite-inpaint-composite');"
+                " if(comp!=null) args[n-2]=comp;"
+                " var msk=rd('imagesuite-inpaint-mask');"
+                " if(msk!=null) args[n-1]=msk;"
+                " return args; }")
 
-        # NOTE: no js= here. A js hook that returns undefined nulls the handler's
-        # inputs in Gradio (model arrived empty → "Select a model"). The canvas
-        # already pushes composite/mask into the hidden fields on every stroke, so
-        # the latest is present at click time without a pre-flush hook.
         c["generate"].click(
             fn, inputs=gen_inputs,
-            outputs=[c["gallery"], c["picked"], c["save"]])
+            outputs=[c["gallery"], c["picked"], c["save"]], js=gen_js)
 
         # Click a gallery result to make IT the active selection — so Send-to /
         # Save As / the enhancement passes act on whichever image you pick, not just
@@ -2948,7 +2971,7 @@ class ImageSuite(WAN2GPPlugin):
             raise gr.Error("Could not push the image to the Video Generator.")
         nav = gr.update()
         try:
-            nav = self.goto_video_tab(state)
+            nav = self.goto_media_tab(state)
         except Exception:
             pass
         return time.time(), nav
@@ -3199,7 +3222,7 @@ class ImageSuite(WAN2GPPlugin):
                     raise gr.Error("Could not push the frame to the Video Generator.")
                 nav = gr.update()
                 try:
-                    nav = self.goto_video_tab(state)
+                    nav = self.goto_media_tab(state)
                 except Exception:
                     pass
                 slot = "end image" if is_end else "init"

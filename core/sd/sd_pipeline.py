@@ -601,6 +601,12 @@ class SDImagePipeline:
             from PIL import ImageFilter
             mask = mask.filter(ImageFilter.GaussianBlur(radius=mask_blur))
 
+        # Keep the TRUE original (pre-fill) for compositing the non-masked
+        # areas back. The fill below pollutes the masked region with
+        # noise/gray/mean; compositing the feathered seam against that fill
+        # would leave a faint ring, so grab the original before _apply_inpaint_fill.
+        original = image.copy()
+
         # A1111-style masked-region pre-fill (inpainting_fill):
         #   0 = fill (neutral-color the region), 1 = original (default, no-op),
         #   2 = latent noise (RGB noise), 3 = latent nothing (mid-gray).
@@ -612,13 +618,12 @@ class SDImagePipeline:
 
         if full_res:
             return self._inpaint_full_res(
-                pipe, image, mask, raw_mask, prompt, negative_prompt,
+                pipe, image, original, mask, raw_mask, prompt, negative_prompt,
                 denoising_strength, width, height, steps, cfg_scale,
                 padding, batch_size, generator, callback, clip_skip,
             )
 
         # --- Whole-image inpainting with paste-back -----------------------
-        original = image.copy()
         orig_w, orig_h = original.size
 
         kwargs: dict[str, Any] = {
@@ -688,6 +693,7 @@ class SDImagePipeline:
         self,
         pipe,
         image,
+        true_original,
         mask,
         raw_mask,
         prompt: str,
@@ -707,7 +713,9 @@ class SDImagePipeline:
         import numpy as np
 
         orig_w, orig_h = image.size
-        original = image.copy()
+        # Composite against the TRUE original (pre-fill) so the feathered seam
+        # never blends against the masked-region fill garbage.
+        original = true_original.copy()
 
         # Find bounding box of the mask
         mask_np = np.array(raw_mask)
@@ -732,15 +740,23 @@ class SDImagePipeline:
         crop_mask = mask.crop(crop_box)
         crop_raw_mask = raw_mask.crop(crop_box)
 
-        # Run inpainting on the crop at the requested resolution
+        # Diffuse at the CROP's own aspect ratio — never the full-image w/h, which
+        # would stretch the masked region (distorted faces). Long side ~1024,
+        # snapped to multiples of 8, mirroring run_adetailer's tw/th sizing.
+        cw, ch = crop_img.size
+        scale = 1024.0 / max(cw, ch)
+        tw = max(8, (int(round(cw * scale)) // 8) * 8)
+        th = max(8, (int(round(ch * scale)) // 8) * 8)
+
+        # Run inpainting on the crop at the crop-derived resolution
         kwargs: dict[str, Any] = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
-            "image": crop_img.resize((width, height), Image.LANCZOS),
-            "mask_image": crop_mask.resize((width, height), Image.LANCZOS),
+            "image": crop_img.resize((tw, th), Image.LANCZOS),
+            "mask_image": crop_mask.resize((tw, th), Image.LANCZOS),
             "strength": denoising_strength,
-            "width": width,
-            "height": height,
+            "width": tw,
+            "height": th,
             "num_inference_steps": steps,
             "guidance_scale": cfg_scale,
             "num_images_per_prompt": batch_size,
@@ -775,11 +791,14 @@ class SDImagePipeline:
         comp_mask = comp_mask.filter(ImageFilter.GaussianBlur(radius=2))
         if original.size != (out_w, out_h):
             original = original.resize((out_w, out_h), Image.LANCZOS)
-        crop_img_scaled = crop_img.resize((paste_w, paste_h), Image.LANCZOS)
+        # Seam background = the TRUE original crop (pre-fill), so the feathered
+        # edge never blends against masked-region fill garbage.
+        crop_orig_scaled = original.crop(
+            (paste_x, paste_y, paste_x + paste_w, paste_y + paste_h))
         results = []
         for gen_img in gen_images:
             gen_crop = gen_img.resize((paste_w, paste_h), Image.LANCZOS)
-            merged_crop = Image.composite(gen_crop, crop_img_scaled, comp_mask)
+            merged_crop = Image.composite(gen_crop, crop_orig_scaled, comp_mask)
             result = original.copy()
             result.paste(merged_crop, (paste_x, paste_y))
             results.append(result)

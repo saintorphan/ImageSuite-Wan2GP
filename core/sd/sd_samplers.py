@@ -27,6 +27,15 @@ _SAMPLER_MAP: dict[str, tuple[str, dict[str, Any]]] = {
     "LCM": ("LCMScheduler", {}),
 }
 
+# Every per-sampler key any entry in _SAMPLER_MAP can set (e.g. algorithm_type,
+# solver_order). We strip these from an inherited scheduler config before
+# re-applying the current sampler, otherwise a prior "DPM++ SDE"/"3M SDE" gen
+# leaves its flags set when the user switches back to plain "DPM++ 2M" (whose
+# empty extra_kwargs would never reset them).
+_SAMPLER_OVERRIDE_KEYS: set[str] = {
+    k for _, extra in _SAMPLER_MAP.values() for k in extra
+}
+
 _SCHEDULER_OVERRIDES: dict[str, dict[str, Any]] = {
     "Automatic": {},
     "Karras": {"use_karras_sigmas": True},
@@ -116,8 +125,12 @@ def create_scheduler(sampler_name: str, scheduler_name: str, config: dict | None
     # If we have a config dict, use from_config pattern
     if config:
         clean_config = dict(config)
-        # Reset inherited sigma-spacing flags before applying the current overrides.
+        # Reset inherited sigma-spacing flags and per-sampler keys before applying
+        # the current sampler/overrides, so switching back to a plainer sampler
+        # doesn't keep the previous one's algorithm_type/solver_order/etc.
         for k in _SCHEDULER_OVERRIDE_KEYS:
+            clean_config.pop(k, None)
+        for k in _SAMPLER_OVERRIDE_KEYS:
             clean_config.pop(k, None)
         clean_config.update(extra_kwargs)
         clean_config.update(scheduler_overrides)

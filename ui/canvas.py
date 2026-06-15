@@ -305,7 +305,7 @@ function compose(){
     tc.fillStyle='#ff3344'; tc.fillRect(0,0,W,H); dx.drawImage(t,0,0); dx.restore(); }
 }
 
-function pos(e){ var r=disp.getBoundingClientRect(),t=e.touches?e.touches[0]:e;
+function pos(e){ var r=disp.getBoundingClientRect(),t=(e.touches&&e.touches.length)?e.touches[0]:((e.changedTouches&&e.changedTouches[0])||e);
   var x=(t.clientX-r.left)/r.width*W, y=(t.clientY-r.top)/r.height*H;
   // clamp inside the bitmap so getImageData/floodFill never index a row off the edge
   return {x:Math.max(0,Math.min(W-1,x)), y:Math.max(0,Math.min(H-1,y))}; }
@@ -368,10 +368,10 @@ function floodFill(sxp,syp){
     if(t.isMask){ fr=fg=fb=255; fa=255; }
     else { var c=hex2rgb(color); fr=c[0];fg=c[1];fb=c[2];fa=Math.round(opacity*255); }
     if(tr===fr&&tg===fg&&tb===fb&&ta===fa) return;
-    var stack=[idx],tol=40;
+    var stack=[idx],seen=new Uint8Array(W*H),tol=40;
     function m(i){ return Math.abs(d[i]-tr)<=tol&&Math.abs(d[i+1]-tg)<=tol&&Math.abs(d[i+2]-tb)<=tol&&Math.abs(d[i+3]-ta)<=tol; }
-    while(stack.length){ var i=stack.pop(); if(i<0||i>=d.length||!m(i)) continue;
-      d[i]=fr;d[i+1]=fg;d[i+2]=fb;d[i+3]=fa; var x=(i/4)%W;
+    while(stack.length){ var i=stack.pop(),pi=i>>2; if(pi<0||pi>=W*H||seen[pi]||!m(i)) continue; seen[pi]=1;
+      d[i]=fr;d[i+1]=fg;d[i+2]=fb;d[i+3]=fa; var x=pi%W;
       if(x>0)stack.push(i-4); if(x<W-1)stack.push(i+4); stack.push(i-W*4); stack.push(i+W*4); }
     ctx.putImageData(img,0,0);
   });
@@ -534,7 +534,7 @@ function flattenDown(){ if(active<=0) return; var top=drawLayers[active],below=d
   pushUndo(below.ctx,'draw'); below.ctx.drawImage(top.cv,0,0); below.src=null; drawLayers.splice(active,1); active=active-1;
   tSession=-1; tSnap=null; tBox=null; renderLayers(); compose(); pushExport(); }
 
-function down(e){ if(!hasBg) return; e.preventDefault(); var p=pos(e); sx=lastX=p.x; sy=lastY=p.y;
+function down(e){ if(!hasBg) return; if(e.button!==undefined && e.button!==0) return; e.preventDefault(); var p=pos(e); sx=lastX=p.x; sy=lastY=p.y;
   // erase/restore source bookkeeping (only touch the active layer for tools that need it)
   if(tool==='eraser'&&mode!=='mask') ensureSrc(activeLayer());   // snapshot so the restore brush can bring erased pixels back
   else if(mode!=='mask'&&(tool==='brush'||tool==='fill'||tool==='clone'||tool==='smudge'||tool==='rect'||tool==='ellipse'||tool==='line')) activeLayer().src=null;  // new positive content on the layer → re-base

@@ -1,8 +1,8 @@
 {
   "name": "Image Suite",
   "author": "saintorphan",
-  "version": "0.2.2",
-  "description": "Three-in-one image workbench: Txt2Img, Img2Img and MultiCanvas (layered draw / mask / inpaint) sub-tabs for Flux, Z-Image and the SDXL lineup (Pony, Illustrious). Save any result to the other pages, Img2Vid, the Prompt Library, or disk.",
+  "version": "0.3.0",
+  "description": "Image workbench: Txt2Img, Img2Img, MultiCanvas (layered draw / mask / inpaint) and a Modify editor (crop / resize / flip / colour) for Flux, Z-Image and the SDXL lineup (Pony, Illustrious). Save any result to the other pages, Img2Vid, the Prompt Library, disk — or, with the SendTo plugin, to other tabs and plugins.",
   "date": "2026-06-14",
   "wan2gp_version": "11.90",
   "url": "https://github.com/saintorphan/ImageSuite-Wan2GP"

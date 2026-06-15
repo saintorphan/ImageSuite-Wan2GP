@@ -3,17 +3,19 @@
 </p>
 
 <h1 align="center">Image Suite</h1>
-<p align="center"><em>A three-in-one image workbench, as a Wan2GP plugin.</em></p>
+<p align="center"><em>A multi-page image workbench, as a Wan2GP plugin.</em></p>
 
-> ### ⚠️ Extremely early release
-> **This is a very early build — please expect the occasional quirk.** If something
-> misbehaves, please [**open an issue**](https://github.com/saintorphan/ImageSuite-Wan2GP/issues)
-> and I'll get to squashing it ASAP.
+<p align="center">🎉 <strong>Now an official Wan2GP plugin</strong> — install it straight from the Wan2GP <strong>Plugin Manager</strong>.</p>
+
+> ### ⚠️ Still a young release
+> **Expect the occasional quirk.** If something misbehaves, please
+> [**open an issue**](https://github.com/saintorphan/ImageSuite-Wan2GP/issues) and
+> I'll squash it ASAP.
 
 Image Suite drops a single gold-bordered **Image Suite** tab into Wan2GP with three
-generation pages — **Txt2Img**, **Img2Img** and **MultiCanvas** — plus an
-**Overlays** library and a **⚙ Settings** tab. A header bar lets you **save and load
-whole Projects** — your entire workspace — at any time.
+generation pages — **Txt2Img**, **Img2Img** and **MultiCanvas** — a **Modify** image
+editor, an **Overlays** library and a **⚙ Settings** tab. A header bar lets you **save
+and load whole Projects** — your entire workspace — at any time.
 
 ## ✨ Highlights
 
@@ -41,11 +43,26 @@ A proper PaintShop-style canvas, not a single mask box:
 - **Complex inpainting** — mask mode, masked-content fill, inpaint area and
   padding, plus **outpaint** to extend the image outward and let the model paint
   in the new edges.
+- **Collapsible tool rail** — fold the tool panel away (`»`) for a full-width canvas,
+  and bring it back (`«`) when you need it.
 
-### 🎬 Send to Img2Vid
-One button plants **any** generated still straight into Wan2GP's video generator
-as an Img2Vid start frame — go from image to video without leaving the app. (You
-can also bounce a result between the three pages, or **Save As**.)
+### 🖌 Modify — quick image editor
+A no-model editing page for any result or uploaded image:
+- **Crop** with aspect presets (Free / 1:1 / 4:3 / 3:4 / 16:9 / 9:16), drag handles
+  and rule-of-thirds guides.
+- **Resize output** — export at a target resolution independent of the crop (e.g. crop
+  a 1:1 region and emit it at 1024×1024), with presets, W×H and aspect lock.
+- **Flip** horizontal / vertical, plus zoom & pan.
+- **Colour correction** — brightness / contrast / saturation / hue / warmth, live.
+- **Colour match** — transfer a reference image's palette (LAB mean/std) onto your edit.
+- Save the edit to results, then send it anywhere.
+
+### 🎬 Send anywhere — Img2Vid, other tabs & plugins
+Plant **any** result straight into Wan2GP's video generator as an img2vid **init or end**
+image — image to video without leaving the app. Bounce a result between the four pages,
+or **Save As**. With the companion **SendTo** plugin installed, a unified **Send to**
+picker on every tab also routes results — and whole **video clips** from the gallery — to
+other OrphanSuite plugins like **Reel2Reel**.
 
 ### 🧑‍🎨 Face & body swap + post-processing
 A built-in enhancement suite you can run on any result: **ADetailer** face & body
@@ -71,9 +88,9 @@ Settings reclaims disk from old generations that aren't part of a project — an
 you how much space it'll free first.
 
 ### 🔗 Part of OrphanSuite — shared across my plugins
-Image Suite is one of the **OrphanSuite** plugins (alongside **Reel2Reel** and
-**Replicant CharLab** — both not yet released), which share setup so you configure
-things once:
+Image Suite is one of the **OrphanSuite** plugins (alongside **Reel2Reel**,
+**Replicant CharLab** and the **SendTo** router — not all released yet), which share
+setup so you configure things once:
 
 - **Unified config** — SDXL/Pony/Illustrious checkpoints, LoRAs and face/ADetailer
   weights live in a single shared `.orphansuite.json`. Set a folder once (in *any*
@@ -84,8 +101,8 @@ things once:
   shared area, without copying or moving the originals.
 - **Shared right-click menu** — right-click **any image** in Wan2GP for an
   **OrphanSuite** section (*Open / Save / Copy* plus *Send to Img2Vid*,
-  *ImageSuite (Img2Img)*, *ImageSuite (MultiCanvas)*); it loads straight into the right
-  page. A **Settings toggle** limits it to Image Suite's own images if you'd rather keep
+  *ImageSuite (Img2Img)*, *ImageSuite (MultiCanvas)*, *ImageSuite (Modify)*); it loads
+  straight into the right page. A **Settings toggle** limits it to Image Suite's own images if you'd rather keep
   Wan2GP's native right-click everywhere else (applied live, no reload). As the other
   plugins land they register their own surfaces into the *same* shared menu, so
   everything cross-talks.

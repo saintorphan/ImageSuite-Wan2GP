@@ -144,6 +144,20 @@ REGISTRY: list[ModelSpec] = [
     ModelSpec("ip_adapter", "IP-Adapter (body swap identity)",
               "Body swap: applies the source person's identity.", required=False,
               repo="h94/IP-Adapter"),
+    # --- ControlNet (txt2img/img2img guidance, SDXL family) ---
+    # Per-type standalone SDXL ControlNets used by the ControlNet accordion. Each is
+    # downloadable on demand from the Prereqs panel; generation runs offline and
+    # raises a clear "download it first" error if absent (never auto-pulls).
+    ModelSpec("controlnet_canny_sdxl", "ControlNet Canny (SDXL)",
+              "ControlNet guidance: edge/Canny conditioning for SDXL/Pony/Illustrious.",
+              required=False, repo="diffusers/controlnet-canny-sdxl-1.0"),
+    ModelSpec("controlnet_depth_sdxl", "ControlNet Depth (SDXL)",
+              "ControlNet guidance: depth (Midas) conditioning for SDXL family.",
+              required=False, repo="diffusers/controlnet-depth-sdxl-1.0"),
+    ModelSpec("controlnet_union_sdxl", "ControlNet Union (SDXL, all-in-one)",
+              "ControlNet guidance: xinsir all-in-one SDXL ControlNet (canny/depth/"
+              "pose/lineart/tile in one model). Recommended default.",
+              required=False, repo="xinsir/controlnet-union-sdxl-1.0"),
     ModelSpec("ip_adapter_faceid", "IP-Adapter FaceID (true identity)",
               "Colour Reference 'FaceID' variants: transfers the reference face's "
               "identity (InsightFace embeddings) instead of just its look.",
@@ -154,6 +168,20 @@ REGISTRY: list[ModelSpec] = [
 # Now an IP-Adapter masked inpaint (no ControlNet/openpose): BiRefNet (body mask),
 # buffalo_l (head detect), IP-Adapter (source appearance).
 BODY_SWAP_KEYS = ["birefnet", "buffalo_l", "ip_adapter"]
+
+
+def replace_person_keys(is_sdxl: bool) -> list[str]:
+    """Models the 'Replace Person' path needs present (or it errors, never
+    auto-downloads). It copies the target's POSE via an OpenPose ControlNet and
+    the reference's IDENTITY via IP-Adapter FaceID (InsightFace embeddings):
+      - birefnet         → person segmentation mask (the region to replace)
+      - buffalo_l        → InsightFace face embeddings for FaceID identity
+      - ip_adapter_faceid→ FaceID adapter weights (true identity transfer)
+      - openpose_annotator → extract the pose control map from the target
+      - the OpenPose ControlNet matching the chosen checkpoint's family.
+    The ControlNet key depends on SDXL vs SD1.5, hence the parameter."""
+    cn = "controlnet_openpose_sdxl" if is_sdxl else "controlnet_openpose_sd15"
+    return ["birefnet", "buffalo_l", "ip_adapter_faceid", "openpose_annotator", cn]
 
 
 def by_key(key: str) -> ModelSpec | None:

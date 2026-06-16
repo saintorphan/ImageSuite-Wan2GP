@@ -298,7 +298,7 @@ class SDImagePipeline:
             if self._body_double_pipe is not None:
                 self._teardown_body_double(unloading=True)
             if self._controlnet_pipe is not None:
-                self._teardown_controlnet()
+                self._teardown_controlnet(unloading=True)
             if self._refiner_pipe is not None:
                 del self._refiner_pipe
                 self._refiner_pipe = None
@@ -316,7 +316,8 @@ class SDImagePipeline:
             # here, leaking VRAM right as we're trying to release it).
             self._teardown_body_double(unloading=True)
         if self._controlnet_pipe is not None:
-            self._teardown_controlnet()
+            # unloading=True for the same reason — a full unload only frees.
+            self._teardown_controlnet(unloading=True)
         if self._refiner_pipe is not None:
             del self._refiner_pipe
             self._refiner_pipe = None
@@ -511,6 +512,7 @@ class SDImagePipeline:
         ip_adapter_image: Any = None,
         ip_adapter_variant: str = "plus",
         ip_adapter_scale: float = 0.0,
+        advanced_prompt: bool = False,
     ) -> list:
         """Generate images from text prompt, with optional SDXL refiner pass.
 
@@ -528,15 +530,17 @@ class SDImagePipeline:
         use_refiner = bool(refiner_checkpoint) and self._model_type == "sdxl"
 
         kwargs: dict[str, Any] = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
             "width": width,
             "height": height,
             "num_inference_steps": steps,
             "guidance_scale": cfg_scale,
             "num_images_per_prompt": batch_size,
         }
-        self._apply_clip_skip_kwarg(kwargs, clip_skip)
+        # Prompt conditioning: raw strings (+clip_skip) by default, or compel-built
+        # weighted/long embeds when advanced_prompt is on (falls back to raw on any
+        # failure). Built against the main pipe.
+        self._apply_prompt(kwargs, self.pipe, prompt, negative_prompt, clip_skip,
+                           advanced_prompt)
 
         # Optional IP-Adapter reference-look conditioning (CLIP variants only).
         ip_loaded = False
@@ -619,6 +623,7 @@ class SDImagePipeline:
         batch_size: int = 1,
         clip_skip: int = 1,
         callback: Optional[Callable] = None,
+        advanced_prompt: bool = False,
     ) -> list:
         """Generate images from an input image + prompt."""
         self._ensure_loaded()
@@ -648,15 +653,15 @@ class SDImagePipeline:
         generator = self._make_generator(seed)
 
         kwargs: dict[str, Any] = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
             "image": image,
             "strength": denoising_strength,
             "num_inference_steps": steps,
             "guidance_scale": cfg_scale,
             "num_images_per_prompt": batch_size,
         }
-        self._apply_clip_skip_kwarg(kwargs, clip_skip)
+        # Built against the img2img variant pipe (shares the main pipe's encoders).
+        self._apply_prompt(kwargs, pipe, prompt, negative_prompt, clip_skip,
+                           advanced_prompt)
         if generator is not None:
             kwargs["generator"] = generator
         if callback is not None:
@@ -693,6 +698,7 @@ class SDImagePipeline:
         batch_size: int = 1,
         clip_skip: int = 1,
         callback: Optional[Callable] = None,
+        advanced_prompt: bool = False,
     ) -> list:
         """Generate inpainted images.
 
@@ -761,14 +767,13 @@ class SDImagePipeline:
                 pipe, image, original, mask, raw_mask, prompt, negative_prompt,
                 denoising_strength, width, height, steps, cfg_scale,
                 padding, batch_size, generator, callback, clip_skip,
+                advanced_prompt,
             )
 
         # --- Whole-image inpainting with paste-back -----------------------
         orig_w, orig_h = original.size
 
         kwargs: dict[str, Any] = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
             "image": image,
             "mask_image": mask,
             "strength": denoising_strength,
@@ -778,7 +783,9 @@ class SDImagePipeline:
             "guidance_scale": cfg_scale,
             "num_images_per_prompt": batch_size,
         }
-        self._apply_clip_skip_kwarg(kwargs, clip_skip)
+        # Built against the inpaint variant pipe (shares the main pipe's encoders).
+        self._apply_prompt(kwargs, pipe, prompt, negative_prompt, clip_skip,
+                           advanced_prompt)
         if generator is not None:
             kwargs["generator"] = generator
         if callback is not None:
@@ -848,6 +855,7 @@ class SDImagePipeline:
         generator,
         callback,
         clip_skip: int = 1,
+        advanced_prompt: bool = False,
     ) -> list:
         """Crop to masked region, inpaint, paste back at full resolution."""
         import numpy as np
@@ -890,8 +898,6 @@ class SDImagePipeline:
 
         # Run inpainting on the crop at the crop-derived resolution
         kwargs: dict[str, Any] = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
             "image": crop_img.resize((tw, th), Image.LANCZOS),
             "mask_image": crop_mask.resize((tw, th), Image.LANCZOS),
             "strength": denoising_strength,
@@ -901,7 +907,9 @@ class SDImagePipeline:
             "guidance_scale": cfg_scale,
             "num_images_per_prompt": batch_size,
         }
-        self._apply_clip_skip_kwarg(kwargs, clip_skip)
+        # Built against the inpaint variant pipe (shares the main pipe's encoders).
+        self._apply_prompt(kwargs, pipe, prompt, negative_prompt, clip_skip,
+                           advanced_prompt)
         if generator is not None:
             kwargs["generator"] = generator
         if callback is not None:
@@ -1515,9 +1523,10 @@ class SDImagePipeline:
         cache_key = (checkpoint_path, tuple(controlnet_types), mode)
         if self._controlnet_pipe is not None and self._cn_cache_key == cache_key:
             return self._controlnet_pipe
-        # Otherwise teardown existing and rebuild
+        # Otherwise teardown existing and rebuild — unloading=True so the teardown
+        # doesn't restore the main pipe we're about to unload again for the new CN pipe.
         if self._controlnet_pipe is not None:
-            self._teardown_controlnet()
+            self._teardown_controlnet(unloading=True)
 
         from .controlnet_types import get_controlnet_model
 
@@ -1530,6 +1539,12 @@ class SDImagePipeline:
 
         model_type = detect_model_type(checkpoint_path)
         is_sdxl = model_type == "sdxl"
+
+        # Match the ControlNet model's per-device dtype (get_controlnet_model loads
+        # fp16 on CUDA, fp32 on CPU — many fp16 ops are unimplemented on CPU). Forcing
+        # the pipe to fp16 unconditionally would mismatch a CPU-loaded fp32 CN model.
+        cn_dtype = torch.float16 if (torch is not None and torch.cuda.is_available()) else torch.float32
+        use_safetensors = checkpoint_path.endswith(".safetensors")
 
         # Load ControlNet model(s)
         logger.info("Loading ControlNet %s...", controlnet_types)
@@ -1546,24 +1561,24 @@ class SDImagePipeline:
                 pipe = StableDiffusionXLControlNetInpaintPipeline.from_single_file(
                     checkpoint_path,
                     controlnet=controlnet,
-                    torch_dtype=torch.float16,
-                    use_safetensors=checkpoint_path.endswith(".safetensors"),
+                    torch_dtype=cn_dtype,
+                    use_safetensors=use_safetensors,
                 )
             elif mode == "img2img":
                 from diffusers import StableDiffusionXLControlNetImg2ImgPipeline
                 pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_single_file(
                     checkpoint_path,
                     controlnet=controlnet,
-                    torch_dtype=torch.float16,
-                    use_safetensors=checkpoint_path.endswith(".safetensors"),
+                    torch_dtype=cn_dtype,
+                    use_safetensors=use_safetensors,
                 )
             else:
                 from diffusers import StableDiffusionXLControlNetPipeline
                 pipe = StableDiffusionXLControlNetPipeline.from_single_file(
                     checkpoint_path,
                     controlnet=controlnet,
-                    torch_dtype=torch.float16,
-                    use_safetensors=checkpoint_path.endswith(".safetensors"),
+                    torch_dtype=cn_dtype,
+                    use_safetensors=use_safetensors,
                 )
         else:
             if mode == "inpaint":
@@ -1571,24 +1586,24 @@ class SDImagePipeline:
                 pipe = StableDiffusionControlNetInpaintPipeline.from_single_file(
                     checkpoint_path,
                     controlnet=controlnet,
-                    torch_dtype=torch.float16,
-                    use_safetensors=checkpoint_path.endswith(".safetensors"),
+                    torch_dtype=cn_dtype,
+                    use_safetensors=use_safetensors,
                 )
             elif mode == "img2img":
                 from diffusers import StableDiffusionControlNetImg2ImgPipeline
                 pipe = StableDiffusionControlNetImg2ImgPipeline.from_single_file(
                     checkpoint_path,
                     controlnet=controlnet,
-                    torch_dtype=torch.float16,
-                    use_safetensors=checkpoint_path.endswith(".safetensors"),
+                    torch_dtype=cn_dtype,
+                    use_safetensors=use_safetensors,
                 )
             else:
                 from diffusers import StableDiffusionControlNetPipeline
                 pipe = StableDiffusionControlNetPipeline.from_single_file(
                     checkpoint_path,
                     controlnet=controlnet,
-                    torch_dtype=torch.float16,
-                    use_safetensors=checkpoint_path.endswith(".safetensors"),
+                    torch_dtype=cn_dtype,
+                    use_safetensors=use_safetensors,
                 )
 
         pipe.enable_sequential_cpu_offload()
@@ -1724,8 +1739,14 @@ class SDImagePipeline:
 
         return list(results)
 
-    def _teardown_controlnet(self) -> None:
-        """Destroy the ControlNet pipeline and free all VRAM."""
+    def _teardown_controlnet(self, unloading: bool = False) -> None:
+        """Destroy the ControlNet pipeline and free all VRAM.
+
+        When *unloading* is True the main pipe is NOT restored afterwards. A full
+        unload() (or a rebuild that's about to load a different CN pipe) must only
+        free — re-loading the ~6.5GB main pipe here would leak the VRAM we're
+        trying to release. Mirrors :meth:`_teardown_body_double`.
+        """
         pipe = self._controlnet_pipe
         if pipe is not None:
             try:
@@ -1757,6 +1778,22 @@ class SDImagePipeline:
             torch.cuda.empty_cache()
 
         logger.info("ControlNet pipeline cleaned up, VRAM freed.")
+
+        # Restore the main pipeline that _get_controlnet_pipe unloaded — but never
+        # during a full unload()/rebuild: re-loading the ~6.5GB main pipe here would
+        # leak the VRAM we're being called to free. Mirrors _teardown_body_double.
+        if not unloading and getattr(self, "_cn_main_was_loaded", False):
+            ckpt = getattr(self, "_cn_main_checkpoint", None)
+            vae = getattr(self, "_cn_main_vae", None) or "Automatic"
+            if ckpt:
+                try:
+                    logger.info("Restoring main SD pipeline: %s", ckpt)
+                    self.load(ckpt, vae)
+                except Exception:
+                    logger.warning("Failed to restore main SD pipeline after ControlNet", exc_info=True)
+        self._cn_main_was_loaded = False
+        self._cn_main_checkpoint = None
+        self._cn_main_vae = None
 
     def unload_controlnet(self) -> None:
         """Free the ControlNet pipeline."""
@@ -1923,6 +1960,50 @@ class SDImagePipeline:
         """Configure the pipeline's scheduler from sampler/scheduler names."""
         config = dict(self.pipe.scheduler.config)
         self.pipe.scheduler = create_scheduler(sampler, scheduler, config)
+
+    def _apply_prompt(self, kwargs: dict, pipe: Any, prompt: str,
+                      negative_prompt: str, clip_skip: int,
+                      advanced_prompt: bool) -> None:
+        """Set the prompt conditioning on a pending pipeline-call ``kwargs`` dict.
+
+        Two paths, chosen by *advanced_prompt*:
+
+          * OFF (default): the EXACT current behaviour — set ``prompt`` /
+            ``negative_prompt`` strings and apply ``clip_skip`` via the diffusers
+            kwarg. Nothing about this path changes.
+
+          * ON: build compel ``*_embeds`` (weights / BREAK / >77-token chunking)
+            for *pipe* and set them instead of the raw strings, with clip_skip
+            BAKED into the embeds (clip_skip + prompt_embeds are mutually exclusive
+            in diffusers, so we do NOT add the clip_skip kwarg here). On ANY failure
+            — compel absent, encode error, missing pooled — it transparently falls
+            back to the identical raw-string path so a gen never breaks.
+        """
+        def raw():  # the unchanged, byte-for-byte current path
+            kwargs["prompt"] = prompt
+            kwargs["negative_prompt"] = negative_prompt
+            self._apply_clip_skip_kwarg(kwargs, clip_skip)
+        if not advanced_prompt:
+            raw()
+            return
+        try:
+            from . import prompt_encode
+            if prompt_encode.prompt_is_plain(prompt, negative_prompt) \
+                    or not prompt_encode.compel_available():
+                raw()
+                return
+            embeds = prompt_encode.build_embeds(
+                pipe, self._model_type, prompt or "", negative_prompt or "",
+                clip_skip=clip_skip)
+        except Exception:
+            logger.warning("advanced prompt setup failed — using raw prompt",
+                           exc_info=True)
+            embeds = None
+        if embeds:
+            # Embeds carry clip_skip already; do NOT add the clip_skip kwarg.
+            kwargs.update(embeds)
+        else:
+            raw()
 
     @staticmethod
     def _apply_clip_skip_kwarg(kwargs: dict, clip_skip: int) -> None:

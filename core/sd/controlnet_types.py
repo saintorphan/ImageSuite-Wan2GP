@@ -214,6 +214,68 @@ _INIT_TIME_KWARGS = frozenset({
     "cache_dir",
 })
 
+# Map each detector class to the controlnet_aux *submodule* it lives in, so we can
+# import just that one detector (``from controlnet_aux.canny import CannyDetector``)
+# instead of ``import controlnet_aux`` — the package's top-level __init__ eagerly
+# imports every detector, including the mediapipe-backed ones, which can hard-crash
+# on import if mediapipe is missing/broken. A per-detector import keeps one broken
+# sibling from taking down the working ones, and (being inside run_preprocessor) it
+# never runs at plugin/module load.
+_PREPROCESSOR_SUBMODULES: dict[str, str] = {
+    "OpenposeDetector": "open_pose",
+    "CannyDetector": "canny",
+    "MidasDetector": "midas",
+    "LineartDetector": "lineart",
+    "NormalBaeDetector": "normalbae",
+    "MLSDdetector": "mlsd",
+    "HEDdetector": "hed",
+    "PidiNetDetector": "pidi",
+    "SamDetector": "segment_anything",
+    "ContentShuffleDetector": "shuffle",
+    "LineartAnimeDetector": "lineart_anime",
+    "DWposeDetector": "dwpose",
+}
+
+
+def _load_detector_cls(class_name: str):
+    """Import a single controlnet_aux detector class lazily and defensively.
+
+    Tries the per-detector submodule first (``from controlnet_aux.<mod> import
+    <Class>``) so a broken sibling detector (e.g. a mediapipe import error in the
+    face detector) can't stop a working preprocessor from loading. Falls back to
+    the package top-level for any class not in the submodule map. Any failure
+    raises a clear RuntimeError — it never propagates a raw ImportError that could
+    crash a caller; callers wrap run_preprocessor so generation is unaffected.
+    """
+    submod = _PREPROCESSOR_SUBMODULES.get(class_name)
+    if submod is not None:
+        try:
+            import importlib
+            module = importlib.import_module(f"controlnet_aux.{submod}")
+            cls = getattr(module, class_name, None)
+            if cls is not None:
+                return cls
+        except ImportError as e:
+            raise RuntimeError(
+                f"ControlNet preprocessor '{class_name}' could not be imported "
+                f"(controlnet_aux.{submod}): {e}.\n"
+                "Install/repair it with: pip install -U controlnet_aux"
+            ) from e
+    # Fallback: top-level package (also covers classes not in the submodule map).
+    try:
+        import controlnet_aux
+    except ImportError as e:
+        raise RuntimeError(
+            "controlnet_aux is required for ControlNet preprocessing.\n"
+            "Install it with: pip install controlnet_aux"
+        ) from e
+    cls = getattr(controlnet_aux, class_name, None)
+    if cls is None:
+        raise RuntimeError(
+            f"Preprocessor {class_name} not found in controlnet_aux"
+        )
+    return cls
+
 
 def run_preprocessor(
     cn_type_key: str,
@@ -247,18 +309,10 @@ def run_preprocessor(
     if not ct.preprocessor_class:
         return image
 
-    try:
-        import controlnet_aux
-    except ImportError:
-        raise RuntimeError(
-            "controlnet_aux is required for ControlNet preprocessing.\n"
-            "Install it with: pip install controlnet_aux"
-        )
-
-    # Get the detector class
-    detector_cls = getattr(controlnet_aux, ct.preprocessor_class, None)
-    if detector_cls is None:
-        raise RuntimeError(f"Preprocessor {ct.preprocessor_class} not found in controlnet_aux")
+    # Import the single detector class lazily and per-submodule so a missing/broken
+    # controlnet_aux (or one broken sibling detector) raises a clear error here but
+    # never crashes plugin load — the import never runs at module import time.
+    detector_cls = _load_detector_cls(ct.preprocessor_class)
 
     # Split overrides into init-time (from_pretrained) vs call-time (__call__).
     # An override naming a known init arg is rerouted so it actually lands on

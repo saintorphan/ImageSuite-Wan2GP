@@ -473,6 +473,47 @@ class ImageSuite(WAN2GPPlugin):
             self.release_gpu(state)
         return self._enh_result(res, before=picked)
 
+    def _enh_replace_person(self, state, rep_model, picked, ref, variant, ip_scale,
+                            cn_strength, denoise, pos="", neg="", rep_loras=None,
+                            rep_lora_mult="", progress=gr.Progress()):
+        """Replace the WHOLE person with the reference person, keeping the base's
+        pose. Pose is copied via an OpenPose ControlNet; identity comes from the
+        reference face via IP-Adapter FaceID. Runs on the SDXL model picked in the
+        Replace Person section — NOT the page model — so it works while the page
+        generates with Flux/Z-Image. Distinct from Body Swap (skin/texture only,
+        head preserved)."""
+        if not picked:
+            raise gr.Error("Select a result first.")
+        if not ref:
+            raise gr.Error("Add a reference person image (face must be visible).")
+        if not rep_model:
+            raise gr.Error("Pick an SDXL / Pony / Illustrious model for Replace Person.")
+        ident = self._sd_ident(rep_model)
+        variant = variant or "faceid_plus"
+        # Guard exactly the models this path needs for the chosen checkpoint family
+        # (SDXL vs SD1.5 use different OpenPose ControlNets). A missing model raises
+        # a clear "download it first" error — it never auto-downloads.
+        try:
+            from .core.sd.sd_models import detect_model_type
+            is_sdxl = detect_model_type(ident) == "sdxl"
+        except Exception:
+            is_sdxl = True  # default to the SDXL CN if detection fails
+        self._require(models.replace_person_keys(is_sdxl), "Replace Person")
+        # Clear any stale abort flag from a prior cancelled gen (mirrors _enh_color).
+        gen_sd.clear_abort()
+        self._release_faceswap()
+        self.acquire_gpu(state)
+        try:
+            progress(0.1, desc="Replace Person…")
+            res = gen_sd.replace_person(
+                ident, picked, ref, pos or "", neg or "",
+                cn_strength=float(cn_strength), ip_scale=float(ip_scale),
+                denoise=float(denoise), ip_variant=variant,
+                loras=self._lora_list(rep_loras, rep_lora_mult), progress=progress)
+        finally:
+            self.release_gpu(state)
+        return self._enh_result(res, before=picked)
+
     def _enh_color(self, state, model, picked, ref, variant, scale, denoise,
                    loras=None, mult="", progress=gr.Progress()):
         if not picked:
@@ -506,6 +547,194 @@ class ImageSuite(WAN2GPPlugin):
             self.release_gpu(state)
         return self._enh_result(res, before=picked)
 
+    # -- Batch apply: run one enhancement pass over many images ----------------
+    @staticmethod
+    def _batch_collect(source, folder, gallery_value):
+        """Resolve the batch source → a list of input image paths.
+
+        ``source`` == "folder": glob common image types under ``folder`` (top level,
+        sorted). ``source`` == "gallery": pull file paths out of the live Gallery
+        value (Gradio hands a list of dicts/tuples/strings; we cope with each shape).
+        Returns absolute, existing paths only."""
+        import glob as _glob
+        paths_out = []
+        if source == "folder":
+            d = (folder or "").strip()
+            if not d or not os.path.isdir(d):
+                raise gr.Error("Enter an existing source folder path for the batch.")
+            exts = ("png", "jpg", "jpeg", "webp", "bmp", "tiff")
+            seen = set()
+            for e in exts:
+                for pat in (e, e.upper()):
+                    for f in _glob.glob(os.path.join(d, f"*.{pat}")):
+                        if f not in seen:
+                            seen.add(f)
+                            paths_out.append(f)
+            paths_out.sort()
+        else:  # "gallery" — the live results gallery value
+            for item in (gallery_value or []):
+                p = None
+                if isinstance(item, (list, tuple)) and item:
+                    first = item[0]
+                    p = first.get("path") if isinstance(first, dict) else first
+                elif isinstance(item, dict):
+                    img = item.get("image")
+                    if isinstance(img, dict):
+                        p = img.get("path")
+                    p = p or item.get("path") or item.get("name")
+                elif isinstance(item, str):
+                    p = item
+                if p:
+                    paths_out.append(p)
+        out = []
+        for p in paths_out:
+            try:
+                ap = os.path.abspath(str(p))
+                if os.path.isfile(ap):
+                    out.append(ap)
+            except Exception:
+                pass
+        return out
+
+    def _enh_batch(self, state, op, source, folder, gallery_value, up_factor,
+                   model, face_ref, face_enhancer, face_blend, face_strength,
+                   adetf_pos, adetf_neg, adetb_pos, adetb_neg,
+                   color_ref, color_variant, color_scale, color_denoise,
+                   loras=None, mult="", progress=gr.Progress()):
+        """Run a single enhancement op over a folder / the current gallery, reusing
+        the matching section's settings. Per-image errors are caught so one bad file
+        can't abort the batch. Outputs go to a timestamped ``batch_<op>`` subfolder
+        and the count is reported. Mirrors the GPU-lock dance of the single-image
+        handlers (release SD/faceswap → acquire → run → release in finally)."""
+        srcs = self._batch_collect(source, folder, gallery_value)
+        if not srcs:
+            raise gr.Error("No images found for the batch — check the folder path "
+                           "or generate some results first.")
+
+        # Pre-flight: validate inputs / required models ONCE (so we fail fast with a
+        # clear message instead of N identical per-image errors), and pick the
+        # per-image runner. Each runner takes (src_path, out_path) → saved path.
+        op = op or "face"
+        from PIL import Image
+        if op == "face":
+            if not face_ref:
+                raise gr.Error("Add a reference face in the Face Swap section first.")
+            keys = ["inswapper_128", "buffalo_l"]
+            if face_enhancer and str(face_enhancer).lower() != "none":
+                keys.append(str(face_enhancer).lower())
+            self._require(keys, "Batch face swap")
+
+            def _run_one(src, out_path):
+                img = self._face_pipe().swap(
+                    source_path=face_ref, target_path=src,
+                    enhancer=(face_enhancer or None), blend_ratio=float(face_blend),
+                    enhancer_strength=float(face_strength))
+                img.save(out_path)
+                return out_path
+
+        elif op in ("adet_face", "adet_body"):
+            detector = "face" if op == "adet_face" else "person"
+            ident = self._sd_ident(model)
+            self._require(["buffalo_l"] if detector == "face"
+                          else ["person_yolov8s_seg"],
+                          f"Batch {detector.title()} ADetailer")
+            pos = adetf_pos if detector == "face" else adetb_pos
+            neg = adetf_neg if detector == "face" else adetb_neg
+            lora_list = self._lora_list(loras, mult)
+
+            def _run_one(src, out_path):
+                res = gen_sd.run_adetailer(ident, src, pos, neg, "DPM++ 2M", "Karras",
+                                           detector=detector, loras=lora_list)
+                if not res:
+                    return None
+                Image.open(res).convert("RGB").save(out_path)
+                return out_path
+
+        elif op == "color":
+            if not color_ref:
+                raise gr.Error("Add a colour / style reference in the Color "
+                               "Reference section first.")
+            ident = self._sd_ident(model)
+            variant = color_variant or "plus"
+            if str(variant).startswith("faceid"):
+                self._require(["ip_adapter_faceid", "buffalo_l"], "Batch FaceID reference")
+            else:
+                self._require(["ip_adapter"], "Batch colour reference")
+            lora_list = self._lora_list(loras, mult)
+
+            def _run_one(src, out_path):
+                base = Image.open(src).convert("RGB")
+                mask = Image.new("L", base.size, 255)
+                res = gen_sd.ip_adapter_inpaint(
+                    ident, src, color_ref, mask, "", "", denoise=float(color_denoise),
+                    ip_scale=float(color_scale), loras=lora_list, ip_variant=variant)
+                if not res:
+                    return None
+                Image.open(res).convert("RGB").save(out_path)
+                return out_path
+
+        elif op == "upscale":
+            scale = 4 if str(up_factor) == "4" else 2
+
+            def _run_one(src, out_path):
+                res = gen_sd.upscale(src, scale=scale, mode="lanczos")
+                if not res:
+                    return None
+                Image.open(res).convert("RGB").save(out_path)
+                return out_path
+
+        else:
+            raise gr.Error(f"Unknown batch operation: {op!r}")
+
+        # Output folder — a fresh timestamped batch_<op> dir under the cache.
+        out_dir = paths.cache_dir() / "batch" / f"batch_{op}_{int(time.time())}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # GPU/VRAM hygiene: clear any stale abort, free other pipes, take the lock
+        # once for the whole batch (not per image), release it in finally. The
+        # face-swap op uses the InsightFace pipe; the SD ops use the SD pipe.
+        gen_sd.clear_abort()
+        if op == "face":
+            gen_sd.release_sd()
+        else:
+            self._release_faceswap()
+        # Upscale (Lanczos) needs no GPU, but acquiring is cheap and keeps the same
+        # "don't run while a gen is busy" guard the other ops rely on.
+        self.acquire_gpu(state)
+        done, failed = 0, 0
+        total = len(srcs)
+        try:
+            for i, src in enumerate(srcs):
+                try:
+                    progress((i + 1) / max(1, total),
+                             desc=f"Batch {op}: {i + 1}/{total}")
+                except Exception:
+                    pass
+                stem = os.path.splitext(os.path.basename(src))[0]
+                out_path = str(out_dir / f"{stem}_{op}.png")
+                try:
+                    res = _run_one(src, out_path)
+                    if res:
+                        done += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+                    traceback.print_exc()
+        finally:
+            if op == "face":
+                self._release_faceswap()
+            self.release_gpu(state)
+
+        # Status-only: deliberately leave the gallery / selection untouched (batch
+        # is additive — it writes a folder, it doesn't replace your current results).
+        if done == 0:
+            return (f"⚠️ Batch **{op}** produced no outputs "
+                    f"({failed} skipped of {total}). See the console for per-image errors.")
+        return (f"✅ Batch **{op}** done — **{done}** image(s) written to "
+                f"`{out_dir}`" + (f", {failed} skipped" if failed else "") +
+                f" (of {total}).")
+
     def _wire_enhance(self, c):
         # Remember which compare widget ui.enhance built so the handlers return a
         # matching-length tuple; the extra outputs append after (gallery, picked, save)
@@ -535,10 +764,32 @@ class ImageSuite(WAN2GPPlugin):
             self._enh_bodyswap,
             inputs=[st, c["body_model"], picked, c["body_ref"], c["body_loras"],
                     c["body_lora_mult"]], outputs=out)
+        # Replace Person also runs on its own SDXL model → its own LoRA picker.
+        if "rep_run" in c:
+            c["rep_run"].click(
+                self._enh_replace_person,
+                inputs=[st, c["rep_model"], picked, c["rep_ref"], c["rep_variant"],
+                        c["rep_ip_scale"], c["rep_cn_strength"], c["rep_denoise"],
+                        c["rep_pos"], c["rep_neg"], c["rep_loras"],
+                        c["rep_lora_mult"]], outputs=out)
         c["color_run"].click(
             self._enh_color,
             inputs=[st, model, picked, c["color_ref"], c["color_variant"],
                     c["color_scale"], c["color_denoise"], lo, mu], outputs=out)
+        # Batch apply — reuses each section's settings, reads the live gallery for the
+        # "all current results" source, and writes ONLY a status line (additive: it
+        # writes a folder, never replaces the live results gallery or compare panel).
+        if "batch_run" in c:
+            c["batch_run"].click(
+                self._enh_batch,
+                inputs=[st, c["batch_op"], c["batch_source"], c["batch_folder"],
+                        c["gallery"], c["batch_upscale"], model,
+                        c["face_ref"], c["face_enhancer"], c["face_blend"],
+                        c["face_strength"], c["adetf_pos"], c["adetf_neg"],
+                        c["adetb_pos"], c["adetb_neg"], c["color_ref"],
+                        c["color_variant"], c["color_scale"], c["color_denoise"],
+                        lo, mu],
+                outputs=[c["batch_status"]])
         if cmp_out:
             self._wire_enh_compare(c)
 
@@ -1273,6 +1524,181 @@ class ImageSuite(WAN2GPPlugin):
                 gallery.append(p)
         return gallery, served[0], gr.update(value=served[0])
 
+    # ── XYZ sweep / parameter grid (SD path only) ───────────────────────────────
+    # Which generation param each axis varies, and how its value list is parsed.
+    # "none" disables the axis. sampler/scheduler take dropdown names verbatim; the
+    # rest are numeric. Kept as a class attr so the parser and label formatter agree.
+    _SWEEP_NUMERIC = {"seed": int, "steps": int, "clip_skip": int,
+                      "cfg": float, "denoise": float}
+
+    @classmethod
+    def _parse_sweep_values(cls, axis, raw):
+        """A sweep axis' comma-separated textbox -> a list of typed values (numbers for
+        numeric axes, trimmed strings for sampler/scheduler). Empty/"none" -> []. Bad
+        numeric tokens are skipped so one typo doesn't kill the whole sweep."""
+        if not axis or axis == "none" or not raw or not str(raw).strip():
+            return []
+        out = []
+        for tok in str(raw).split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            caster = cls._SWEEP_NUMERIC.get(axis)
+            if caster is None:          # sampler / scheduler — keep the name as typed
+                out.append(tok)
+                continue
+            try:
+                out.append(caster(tok))
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    @staticmethod
+    def _sweep_cell_label(axis, value):
+        """Short axis=value label drawn under each grid cell (e.g. 'steps=30')."""
+        if isinstance(value, float):
+            value = (f"{value:.2f}").rstrip("0").rstrip(".")
+        return f"{axis}={value}"
+
+    def _build_contact_sheet(self, cells, x_axis, x_vals, y_axis, y_vals, out_dir):
+        """Assemble a labelled contact-sheet PIL grid from a sweep's per-cell results
+        and save it as a PNG (returned as a path, or None on failure).
+
+        ``cells`` is a row-major list of result-path-lists (one per X×Y combination,
+        in the same order the cartesian product was generated). Each cell is drawn at
+        a uniform thumbnail size with an ``axis=value`` caption; row/column header
+        bands carry the Y/X labels. Best-effort: any error logs and returns None so the
+        individual images are still presented."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception:
+            traceback.print_exc()
+            return None
+        nx = max(1, len(x_vals))
+        ny = max(1, len(y_vals)) if y_vals else 1
+        # First existing thumbnail per cell (each cell may itself be a small batch;
+        # the grid shows the first image of each combination).
+        thumbs = []
+        for paths_list in cells:
+            img = None
+            for p in (paths_list or []):
+                try:
+                    img = Image.open(p).convert("RGB")
+                    break
+                except Exception:
+                    img = None
+            thumbs.append(img)
+        if not any(t is not None for t in thumbs):
+            return None
+        # Uniform cell from the largest source, capped so a big grid stays manageable.
+        cap = 384
+        cw = ch = cap
+        for t in thumbs:
+            if t is not None:
+                cw, ch = t.size
+                break
+        scale = min(cap / max(1, cw), cap / max(1, ch), 1.0)
+        cw, ch = max(1, int(cw * scale)), max(1, int(ch * scale))
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+        pad, cap_h = 8, 18
+        # Header bands: top for X, left for Y (only when that axis is active).
+        head_top = (cap_h + pad) if x_axis and x_axis != "none" else 0
+        head_left = (cap_h + pad) if (y_axis and y_axis != "none" and y_vals) else 0
+        cell_w, cell_h = cw + pad, ch + cap_h + pad
+        sheet_w = head_left + nx * cell_w + pad
+        sheet_h = head_top + ny * cell_h + pad
+        sheet = Image.new("RGB", (sheet_w, sheet_h), (24, 24, 28))
+        draw = ImageDraw.Draw(sheet)
+
+        def _text(x, y, s, fill=(235, 235, 235)):
+            try:
+                draw.text((x, y), str(s), fill=fill, font=font)
+            except Exception:
+                pass
+        # Column (X) headers across the top band.
+        if head_top:
+            for xi in range(nx):
+                cx = head_left + xi * cell_w + pad
+                _text(cx, pad // 2, self._sweep_cell_label(x_axis, x_vals[xi]))
+        for yi in range(ny):
+            cy_top = head_top + yi * cell_h + pad
+            # Row (Y) header in the left band, rotated would be ideal but plain is
+            # robust across PIL versions — draw it horizontally at the row top-left.
+            if head_left:
+                _text(pad // 2, cy_top, self._sweep_cell_label(
+                    y_axis, y_vals[yi]) if y_vals else "")
+            for xi in range(nx):
+                idx = yi * nx + xi
+                t = thumbs[idx] if idx < len(thumbs) else None
+                cx = head_left + xi * cell_w + pad
+                box = (cx, cy_top, cx + cw, cy_top + ch)
+                if t is not None:
+                    try:
+                        sheet.paste(t.resize((cw, ch)), (cx, cy_top))
+                    except Exception:
+                        draw.rectangle(box, outline=(90, 90, 90))
+                else:
+                    draw.rectangle(box, outline=(90, 90, 90))
+                    _text(cx + 4, cy_top + 4, "(failed)", fill=(200, 120, 120))
+                # Per-cell caption (the differing axis values for this cell).
+                parts = []
+                if x_axis and x_axis != "none":
+                    parts.append(self._sweep_cell_label(x_axis, x_vals[xi]))
+                if y_axis and y_axis != "none" and y_vals:
+                    parts.append(self._sweep_cell_label(y_axis, y_vals[yi]))
+                _text(cx + 2, cy_top + ch + 2, "  ".join(parts))
+        try:
+            import os
+            os.makedirs(out_dir, exist_ok=True)
+            dest = os.path.join(out_dir, f"xyz_grid_{int(time.time())}.png")
+            sheet.save(dest)
+            return dest
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def _run_sweep_sd(self, base, x_axis, x_vals, y_axis, y_vals, cell_fn,
+                      progress=None, desc="Sweep"):
+        """Drive an XYZ sweep over the EXISTING per-image SD generate path.
+
+        ``base`` is the dict of default per-image params (seed/steps/cfg/sampler/
+        scheduler/denoise/clip_skip). For each (x, y) combination this copies ``base``,
+        overrides the swept axis/axes, and calls ``cell_fn(params)`` — which must run
+        the page's normal single-image generate and return a LIST of result paths.
+        Returns ``(all_files, cells)``: every individual result path (flat) and the
+        row-major list of per-cell path-lists used to build the contact sheet. Honours
+        the cooperative abort flag between cells (the in-flight cell still finishes)."""
+        nx, ny = len(x_vals), (len(y_vals) if y_vals else 1)
+        total = max(1, nx * ny)
+        cells, all_files = [], []
+        done = 0
+        for yi in range(ny):
+            for xi in range(nx):
+                if gen_sd.was_aborted():
+                    cells.append([])
+                    continue
+                params = dict(base)
+                params[x_axis] = x_vals[xi]
+                if y_vals and y_axis and y_axis != "none":
+                    params[y_axis] = y_vals[yi]
+                if progress is not None:
+                    try:
+                        progress((done, total), desc=f"{desc} {done + 1}/{total}")
+                    except Exception:
+                        pass
+                try:
+                    out = cell_fn(params) or []
+                except Exception:
+                    traceback.print_exc()
+                    out = []
+                cells.append(out)
+                all_files += out
+                done += 1
+        return all_files, cells
+
     @staticmethod
     def _file_to_dataurl(path) -> str:
         """Local image path → PNG data-URL, for pushing into the canvas frame / overlay
@@ -1580,7 +2006,12 @@ class ImageSuite(WAN2GPPlugin):
                    "composite", "mask", "state",
                    # Modify tab's edited-image export — a multi-MB base64 data-URL,
                    # not a setting; would bloat project.json if serialized.
-                   "out"}
+                   "out",
+                   # Batch-apply controls — operational (which op / source / folder /
+                   # factor for a one-off run), not saved "prompt"/project settings.
+                   # The per-image enhance settings they reuse (prompts, sliders) are
+                   # still captured via their own keys.
+                   "batch_op", "batch_source", "batch_folder", "batch_upscale"}
 
     def _pl_items(self, c):
         """Ordered (key, component) pairs this page saves/loads."""
@@ -2127,22 +2558,38 @@ class ImageSuite(WAN2GPPlugin):
                c["clip_skip"], c["seed"], c["width"], c["height"], c["count"],
                c["loras"], c["lora_mult"], c["turbo"]]
         gen_js = None
+        # ControlNet inputs (SDXL family, default OFF) — appended last for txt2img &
+        # img2img so the handlers read them positionally after their existing args.
+        # Built only when the block exists (txt2img/img2img); inpaint has none.
+        cn_in = [c[k] for k in (
+            "cn_enable", "cn_type", "cn_image", "cn_use_raw", "cn_strength",
+            "cn_guidance_start", "cn_guidance_end", "cn_detect_res", "cn_image_res",
+            "cn_canny_low", "cn_canny_high") if k in c]
+        # XYZ sweep inputs (txt2img/img2img, SDXL family, default OFF). Appended AFTER
+        # the ControlNet inputs so both handlers read them positionally last; built
+        # only when the block exists (inpaint has no sweep accordion).
+        sweep_in = [c[k] for k in (
+            "sweep_enable", "sweep_x_axis", "sweep_x_values",
+            "sweep_y_axis", "sweep_y_values") if k in c]
         if mode == "txt2img":
             gen_inputs = [self.state] + SET + [
                 c["hr_scale"], c["hr_denoise"],
                 c["refiner_enable"], c["refiner_model"], c["refiner_switch_at"],
                 c["refiner_steps"], c["refiner_cfg"],
-                c["pos"], c["neg"]]
+                c["pos"], c["neg"], c["adv_prompt"]] + cn_in + sweep_in
             fn = self._make_txt2img(mode)
         elif mode == "img2img":
             gen_inputs = [self.state] + SET + [c["denoise"], c["resize_mode"],
-                                               c["pos"], c["neg"], c["input_image"]]
+                                               c["pos"], c["neg"], c["adv_prompt"],
+                                               c["input_image"]] + cn_in + sweep_in
             fn = self._make_img2img(mode)
         else:  # inpaint — inputs come from the PaintShop canvas (composite + mask)
+            # adv_prompt sits BEFORE composite/mask so the gen_js below (which rewrites
+            # args[n-2]=composite, args[n-1]=mask) keeps addressing the last two args.
             gen_inputs = [self.state] + SET + [
                 c["denoise"], c["feather"], c["mask_mode"], c["inpaint_fill"],
                 c["inpaint_area"], c["padding"], c["seamless"], c["pos"], c["neg"],
-                c["composite"], c["mask"]]
+                c["adv_prompt"], c["composite"], c["mask"]]
             fn = self._make_inpaint(mode)
             # Pre-flush the canvas before reading composite/mask. Most edits push the
             # hidden fields through a 120ms-debounced pushExport (only pointer-up
@@ -2207,6 +2654,31 @@ class ImageSuite(WAN2GPPlugin):
             c["enhance_neg"].click(self._enhance, inputs=[self.state, c["neg"]],
                                    outputs=[c["neg"]])
 
+        # ControlNet preprocess preview: run the chosen preprocessor on the control
+        # image and show the condition map. Lightweight (controlnet_aux annotators) —
+        # no full GPU lock dance; just refuse while a generation is running.
+        if "cn_preprocess" in c:
+            def _cn_preview(state, cn_type, cn_image, detect_res, image_res,
+                            canny_low, canny_high):
+                if not cn_image:
+                    return gr.update(), "Load a control image first."
+                if self._gpu_busy(state):
+                    return gr.update(), "A generation is running — try again after it finishes."
+                try:
+                    out = gen_sd.preprocess_control(
+                        cn_type, cn_image, detect_res=int(detect_res),
+                        image_res=int(image_res), canny_low=int(canny_low),
+                        canny_high=int(canny_high))
+                    return gr.update(value=out), f"Preprocessed with {cn_type}."
+                except Exception as e:
+                    traceback.print_exc()
+                    return gr.update(), f"Preprocess failed: {e}"
+            c["cn_preprocess"].click(
+                _cn_preview,
+                inputs=[self.state, c["cn_type"], c["cn_image"], c["cn_detect_res"],
+                        c["cn_image_res"], c["cn_canny_low"], c["cn_canny_high"]],
+                outputs=[c["cn_preview"], c["cn_status"]])
+
         # Interrogate the page's image → prompt. WD14 tags for booru families
         # (Pony/Illustrious), BLIP caption otherwise. Image source per page:
         # txt2img = selected result, img2img = init image, inpaint = canvas.
@@ -2269,7 +2741,8 @@ class ImageSuite(WAN2GPPlugin):
             self._make_outpaint(mode),
             inputs=[self.state, c["model"], c["sampler"], c["scheduler"], c["steps"],
                     c["cfg"], c["clip_skip"], c["seed"], c["loras"], c["lora_mult"],
-                    c["out_feather"], c["pos"], c["neg"], c["composite"], c["out_size"],
+                    c["out_feather"], c["pos"], c["neg"], c["adv_prompt"],
+                    c["composite"], c["out_size"],
                     c["out_top"], c["out_bottom"], c["out_left"], c["out_right"]],
             outputs=out)
         c["out_abort"].click(self._abort, inputs=[self.state])
@@ -2288,12 +2761,28 @@ class ImageSuite(WAN2GPPlugin):
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
                  width, height, count, loras, mult, turbo, hr_scale, hr_denoise,
                  refiner_enable, refiner_model, refiner_switch_at, refiner_steps,
-                 refiner_cfg, pos, neg, progress=gr.Progress()):
+                 refiner_cfg, pos, neg, adv_prompt,
+                 cn_enable, cn_type, cn_image, cn_use_raw, cn_strength,
+                 cn_guidance_start, cn_guidance_end, cn_detect_res, cn_image_res,
+                 cn_canny_low, cn_canny_high,
+                 sweep_enable=False, sweep_x_axis="none", sweep_x_values="",
+                 sweep_y_axis="none", sweep_y_values="", progress=gr.Progress()):
             if not (pos and pos.strip()):
                 raise gr.Error("Enter a prompt first.")
             backend, ident = discovery.parse_model_value(model)
             if not backend:
                 raise gr.Error("Select a model from the dropdown first.")
+            # ControlNet (SDXL only, default OFF). Enabled + SD backend → run the
+            # ControlNet path instead of plain txt2img. Native models ignore it.
+            use_cn = bool(cn_enable) and backend == "sd"
+            if use_cn and not cn_image:
+                raise gr.Error("ControlNet is enabled — load a control image first.")
+            # XYZ sweep (SD path only, default OFF). When enabled with an SD model and
+            # a valid X axis, generation is delegated to the sweep branch below, which
+            # reuses the same gen_sd.generate_txt2img per cell. ControlNet + sweep is
+            # not combined (the sweep targets the plain txt2img params).
+            use_sweep = (bool(sweep_enable) and backend == "sd" and not use_cn
+                         and sweep_x_axis and sweep_x_axis != "none")
             try:
                 live = bool(paths.get_sd_live_preview()) and backend == "sd"
             except Exception:
@@ -2332,6 +2821,70 @@ class ImageSuite(WAN2GPPlugin):
                     r_backend, r_ident = discovery.parse_model_value(refiner_model)
                     if r_backend == "sd":
                         refiner_ckpt = r_ident
+                # ── XYZ sweep branch (default OFF) ─────────────────────────────
+                # Runs the cartesian product of the X (and optional Y) value lists
+                # through gen_sd.generate_txt2img — one cell at a time, count images
+                # each — then assembles a labelled contact-sheet grid. Yields the
+                # final gallery (individual images + the grid) and returns; the normal
+                # batch path below is untouched. Denoise isn't a txt2img param, so a
+                # denoise axis is silently dropped here.
+                if use_sweep:
+                    x_axis, y_axis = sweep_x_axis, (sweep_y_axis or "none")
+                    x_vals = self._parse_sweep_values(x_axis, sweep_x_values)
+                    if x_axis == "denoise":
+                        x_vals = []  # txt2img has no denoise — ignore that axis
+                    y_vals = ([] if y_axis in ("none", x_axis)
+                              else self._parse_sweep_values(y_axis, sweep_y_values))
+                    if y_axis == "denoise":
+                        y_vals = []
+                    if not x_vals:
+                        raise gr.Error(
+                            "XYZ sweep is on but the X axis has no usable values — "
+                            "enter a comma-separated list (or disable the sweep).")
+                    base = {"seed": int(seed), "steps": int(steps), "cfg": float(cfg),
+                            "sampler": sampler or "DPM++ 2M", "scheduler": scheduler or "",
+                            "clip_skip": int(clip_skip), "denoise": 0.0}
+
+                    def _cell(params):
+                        # A fresh random seed per cell when the page Seed is -1 AND seed
+                        # isn't the swept axis (so a seed axis still uses its list).
+                        sd = params["seed"]
+                        if int(sd) < 0:
+                            sd = _rng.randint(0, 2**31 - 1)
+                        return gen_sd.generate_txt2img(
+                            ident, pos, neg, width, height, int(params["steps"]),
+                            float(params["cfg"]), int(sd),
+                            sampler=params["sampler"] or "DPM++ 2M",
+                            scheduler=params["scheduler"] or "",
+                            clip_skip=int(params["clip_skip"]), loras=lora_list,
+                            turbo=turbo, hr_scale=float(hr_scale),
+                            hr_denoise=float(hr_denoise),
+                            refiner_checkpoint=refiner_ckpt,
+                            refiner_switch_at=float(refiner_switch_at),
+                            refiner_steps=int(refiner_steps),
+                            refiner_cfg=float(refiner_cfg),
+                            advanced_prompt=bool(adv_prompt),
+                            batch_size=max(1, int(count)))
+                    self.acquire_gpu(state)
+                    try:
+                        self._sd_loading(progress)
+                        sweep_files, cells = self._run_sweep_sd(
+                            base, x_axis, x_vals, y_axis, y_vals, _cell,
+                            progress=progress, desc="Sweep")
+                    finally:
+                        self.release_gpu(state)
+                        gen_sd.clear_preview()
+                    if gen_sd.was_aborted():
+                        raise gr.Error("XYZ sweep aborted.")
+                    if not sweep_files:
+                        raise gr.Error("XYZ sweep produced no images.")
+                    grid = self._build_contact_sheet(
+                        cells, x_axis, x_vals, y_axis, y_vals,
+                        str(paths.cache_dir() / "sd_gen"))
+                    out_files = ([grid] + sweep_files) if grid else sweep_files
+                    yield self._gallery_result(out_files, mode) + (
+                        self._seed_update(None), gr.update(value=None))
+                    return
                 self.acquire_gpu(state)
                 try:
                     self._sd_loading(progress)
@@ -2343,6 +2896,23 @@ class ImageSuite(WAN2GPPlugin):
                             if gen_sd.was_aborted():
                                 break
                             sd = (int(seed) + i) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
+                            if use_cn:
+                                # ControlNet txt2img: control image steers a single CN.
+                                # Hi-res/refiner don't apply on this path (separate pipe).
+                                files += gen_sd.run_controlnet(
+                                    ident, cn_image, pos, neg, width, height, steps, cfg, sd,
+                                    cn_type=cn_type, cn_strength=float(cn_strength),
+                                    guidance_start=float(cn_guidance_start),
+                                    guidance_end=float(cn_guidance_end),
+                                    use_raw=bool(cn_use_raw), source_image=None,
+                                    sampler=sampler or "DPM++ 2M", scheduler=scheduler or "Karras",
+                                    clip_skip=int(clip_skip), loras=lora_list, turbo=turbo,
+                                    detect_res=int(cn_detect_res), image_res=int(cn_image_res),
+                                    canny_low=int(cn_canny_low), canny_high=int(cn_canny_high),
+                                    callback=self._sd_step_cb(progress, i, nsteps, total,
+                                                              live_preview=live))
+                                last_seed = sd
+                                continue
                             files += gen_sd.generate_txt2img(
                                 ident, pos, neg, width, height, steps, cfg, sd,
                                 sampler=sampler or "DPM++ 2M", scheduler=scheduler or "",
@@ -2352,6 +2922,7 @@ class ImageSuite(WAN2GPPlugin):
                                 refiner_switch_at=float(refiner_switch_at),
                                 refiner_steps=int(refiner_steps),
                                 refiner_cfg=float(refiner_cfg),
+                                advanced_prompt=bool(adv_prompt),
                                 callback=self._sd_step_cb(progress, i, nsteps, total,
                                                           live_preview=live))
                             last_seed = sd
@@ -2407,7 +2978,12 @@ class ImageSuite(WAN2GPPlugin):
 
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
                  width, height, count, loras, mult, turbo, denoise, resize_mode,
-                 pos, neg, init_image, progress=gr.Progress()):
+                 pos, neg, adv_prompt, init_image,
+                 cn_enable, cn_type, cn_image, cn_use_raw, cn_strength,
+                 cn_guidance_start, cn_guidance_end, cn_detect_res, cn_image_res,
+                 cn_canny_low, cn_canny_high,
+                 sweep_enable=False, sweep_x_axis="none", sweep_x_values="",
+                 sweep_y_axis="none", sweep_y_values="", progress=gr.Progress()):
             backend, ident = discovery.parse_model_value(model)
             if not backend:
                 raise gr.Error("Select a model from the dropdown first.")
@@ -2415,6 +2991,13 @@ class ImageSuite(WAN2GPPlugin):
                 raise gr.Error("Load an init image first.")
             if not (pos and pos.strip()):
                 raise gr.Error("Enter a prompt first.")
+            # ControlNet (SDXL only, default OFF). Enabled + SD backend → img2img with
+            # ControlNet conditioning. Falls back to the control image if none is given.
+            use_cn = bool(cn_enable) and backend == "sd"
+            # XYZ sweep (SD path only, default OFF). Delegated to the sweep branch below
+            # when enabled with an SD model + a valid X axis; not combined with ControlNet.
+            use_sweep = (bool(sweep_enable) and backend == "sd" and not use_cn
+                         and sweep_x_axis and sweep_x_axis != "none")
             gen_sd.clear_abort()
             files, n = [], int(count)
             last_seed = None  # actual seed of the LAST image generated (SD path)
@@ -2441,6 +3024,57 @@ class ImageSuite(WAN2GPPlugin):
                     self._release_native_model()  # don't leave the native model stacked under a later SDXL load
             else:  # sd
                 lora_list = self._lora_list(loras, mult)
+                # ── XYZ sweep branch (default OFF) ─────────────────────────────
+                # Runs the cartesian product of the value lists through
+                # gen_sd.generate_img2img (count images per cell), then assembles a
+                # labelled contact-sheet grid. Returns early; the normal batch path
+                # below is untouched. img2img DOES support a denoise axis.
+                if use_sweep:
+                    x_axis, y_axis = sweep_x_axis, (sweep_y_axis or "none")
+                    x_vals = self._parse_sweep_values(x_axis, sweep_x_values)
+                    y_vals = ([] if y_axis in ("none", x_axis)
+                              else self._parse_sweep_values(y_axis, sweep_y_values))
+                    if not x_vals:
+                        raise gr.Error(
+                            "XYZ sweep is on but the X axis has no usable values — "
+                            "enter a comma-separated list (or disable the sweep).")
+                    base = {"seed": int(seed), "steps": int(steps), "cfg": float(cfg),
+                            "sampler": sampler or "DPM++ 2M",
+                            "scheduler": scheduler or "Karras",
+                            "clip_skip": int(clip_skip), "denoise": float(denoise)}
+
+                    def _cell(params):
+                        sd = params["seed"]
+                        if int(sd) < 0:
+                            sd = _rng.randint(0, 2**31 - 1)
+                        return gen_sd.generate_img2img(
+                            ident, init_image, pos, neg, width, height,
+                            int(params["steps"]), float(params["cfg"]), int(sd),
+                            denoise=float(params["denoise"]),
+                            sampler=params["sampler"] or "DPM++ 2M",
+                            scheduler=params["scheduler"],
+                            resize_mode=RESIZE.get(resize_mode, 0),
+                            clip_skip=int(params["clip_skip"]), loras=lora_list,
+                            turbo=turbo, advanced_prompt=bool(adv_prompt),
+                            batch_size=max(1, int(count)))
+                    self.acquire_gpu(state)
+                    try:
+                        self._sd_loading(progress)
+                        sweep_files, cells = self._run_sweep_sd(
+                            base, x_axis, x_vals, y_axis, y_vals, _cell,
+                            progress=progress, desc="Sweep")
+                    finally:
+                        self.release_gpu(state)
+                    if gen_sd.was_aborted():
+                        raise gr.Error("XYZ sweep aborted.")
+                    if not sweep_files:
+                        raise gr.Error("XYZ sweep produced no images.")
+                    grid = self._build_contact_sheet(
+                        cells, x_axis, x_vals, y_axis, y_vals,
+                        str(paths.cache_dir() / "sd_gen"))
+                    out_files = ([grid] + sweep_files) if grid else sweep_files
+                    return self._gallery_result(out_files, mode) + (
+                        self._seed_update(None),)
                 self.acquire_gpu(state)
                 try:
                     self._sd_loading(progress)
@@ -2450,11 +3084,30 @@ class ImageSuite(WAN2GPPlugin):
                             break
                         sd = (int(seed) + i) if int(seed) >= 0 else _rng.randint(0, 2**31 - 1)
                         progress((i, n), desc=f"Reimagining {i + 1}/{n}")
+                        if use_cn:
+                            # img2img + ControlNet: init image is denoised; the control
+                            # image (falls back to the init image) supplies conditioning.
+                            ctrl = cn_image or init_image
+                            files += gen_sd.run_controlnet(
+                                ident, ctrl, pos, neg, width, height, steps, cfg, sd,
+                                cn_type=cn_type, cn_strength=float(cn_strength),
+                                guidance_start=float(cn_guidance_start),
+                                guidance_end=float(cn_guidance_end),
+                                use_raw=bool(cn_use_raw), source_image=init_image,
+                                denoise=float(denoise),
+                                sampler=sampler or "DPM++ 2M", scheduler=scheduler or "Karras",
+                                clip_skip=int(clip_skip), loras=lora_list, turbo=turbo,
+                                detect_res=int(cn_detect_res), image_res=int(cn_image_res),
+                                canny_low=int(cn_canny_low), canny_high=int(cn_canny_high),
+                                callback=self._sd_step_cb(progress, i, nsteps, total))
+                            last_seed = sd
+                            continue
                         files += gen_sd.generate_img2img(
                             ident, init_image, pos, neg, width, height, steps, cfg, sd,
                             denoise=float(denoise), sampler=sampler or "DPM++ 2M",
                             scheduler=scheduler, resize_mode=RESIZE.get(resize_mode, 0),
                             clip_skip=int(clip_skip), loras=lora_list, turbo=turbo,
+                            advanced_prompt=bool(adv_prompt),
                             callback=self._sd_step_cb(progress, i, nsteps, total))
                         last_seed = sd
                 finally:
@@ -2476,7 +3129,7 @@ class ImageSuite(WAN2GPPlugin):
                       denoise, steps, cfg, clip_skip, seed, sampler, scheduler,
                       loras, mult, turbo="Off", feather=4, inpaint_fill="original",
                       full_res=False, padding=32, seamless=False, count=1,
-                      api=None, progress=None):
+                      advanced_prompt=False, api=None, progress=None):
         """``count`` inpaint passes over a prepared composite(RGB) + mask(L), under a
         SINGLE GPU acquisition — one busy-check, a continuous progress bar across the
         batch, abort honoured between images (and the in-flight partial dropped), and
@@ -2546,6 +3199,7 @@ class ImageSuite(WAN2GPPlugin):
                     inpainting_fill=self._FILL.get(inpaint_fill, 1),
                     full_res=bool(full_res), padding=int(padding),
                     seamless=bool(seamless), turbo=turbo,
+                    advanced_prompt=bool(advanced_prompt),
                     progress=progress, loras=lora_list, callback=cb)
                 # Abort fired mid-image → drop this partial, keep the completed ones.
                 if gen_sd.was_aborted():
@@ -2562,7 +3216,7 @@ class ImageSuite(WAN2GPPlugin):
 
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
                  width, height, count, loras, mult, turbo, denoise, feather, mask_mode,
-                 inpaint_fill, inpaint_area, padding, seamless, pos, neg,
+                 inpaint_fill, inpaint_area, padding, seamless, pos, neg, adv_prompt,
                  composite_url, mask_url, progress=gr.Progress()):
             backend, ident = discovery.parse_model_value(model)
             if not backend:
@@ -2592,7 +3246,8 @@ class ImageSuite(WAN2GPPlugin):
                 sampler=sampler, scheduler=scheduler, loras=loras, mult=mult,
                 turbo=turbo, feather=feather, inpaint_fill=inpaint_fill,
                 full_res=(inpaint_area == "Only masked"), count=count,
-                padding=padding, seamless=bool(seamless), api=api, progress=progress)
+                padding=padding, seamless=bool(seamless),
+                advanced_prompt=bool(adv_prompt), api=api, progress=progress)
             if not outs:
                 raise gr.Error("Inpaint aborted." if gen_sd.was_aborted()
                                else "Inpaint produced no image.")
@@ -2606,7 +3261,7 @@ class ImageSuite(WAN2GPPlugin):
         api = self._api  # closed over so the click is webui-wrapped
 
         def _run(state, model, sampler, scheduler, steps, cfg, clip_skip, seed,
-                 loras, mult, feather, pos, neg, composite_url, out_size,
+                 loras, mult, feather, pos, neg, adv_prompt, composite_url, out_size,
                  top, bottom, left, right, progress=gr.Progress()):
             backend, ident = discovery.parse_model_value(model)
             if not backend:
@@ -2643,7 +3298,8 @@ class ImageSuite(WAN2GPPlugin):
                 steps=steps, cfg=cfg, clip_skip=clip_skip, seed=seed,
                 sampler=sampler, scheduler=scheduler, loras=loras, mult=mult,
                 feather=max(8, int(feather)), inpaint_fill="fill",
-                full_res=False, padding=0, api=api, progress=progress)
+                full_res=False, padding=0, advanced_prompt=bool(adv_prompt),
+                api=api, progress=progress)
             if not outs:
                 raise gr.Error("Outpaint aborted." if gen_sd.was_aborted()
                                else "Outpaint produced no image.")
@@ -3024,6 +3680,54 @@ class ImageSuite(WAN2GPPlugin):
                 "var el=document.querySelector('#imagesuite-modify-out textarea')"
                 "||document.querySelector('#imagesuite-modify-out input'); "
                 "return el ? el.value : edited; }"))
+
+        # Upscale the edited image (2x/4x). "Fast" is a pure Lanczos resize (no
+        # model, no GPU — always works). "AI refine" runs a low-denoise tiled SDXL
+        # img2img pass for added detail (VRAM-capped via tiling). The result is
+        # saved straight into the results gallery so send-to can act on it.
+        def _upscale(edited, scale_lbl, mode_lbl, up_model, denoise,
+                     state, progress=gr.Progress()):
+            img = _durl_to_pil(edited)
+            if img is None:
+                raise gr.Error("Load an image into the Modify canvas first.")
+            scale = 4 if str(scale_lbl).startswith("4") else 2
+            tmp = self._save_img(img, "upscale_src")
+            ai = str(mode_lbl).startswith("AI")
+            if not ai:
+                # Phase A — Lanczos, no GPU.
+                progress(0.5, desc=f"Lanczos {scale}x…")
+                res = gen_sd.upscale(tmp, scale=scale, mode="lanczos")
+                gallery, picked, save = self._gallery_result([res], "modify")
+                return gallery, picked, save, f"🔼 Upscaled {scale}x (Lanczos)."
+            # Phase B — AI tiled refine. Needs an SDXL-family checkpoint.
+            if not gen_sd.available():
+                raise gr.Error("AI refine needs the SDXL backend (install the "
+                               "optional requirements). Use Fast (Lanczos) instead.")
+            if not up_model:
+                raise gr.Error("Pick an SDXL / Pony / Illustrious model for AI "
+                               "refine, or switch Mode to Fast (Lanczos).")
+            ident = self._sd_ident(up_model)
+            gen_sd.clear_abort()
+            self._release_faceswap()
+            gen_sd.release_sd()
+            self.acquire_gpu(state)
+            try:
+                res = gen_sd.upscale_tiled_refine(
+                    ident, tmp, scale=scale, denoise=float(denoise),
+                    progress=progress)
+            finally:
+                self.release_gpu(state)
+            gallery, picked, save = self._gallery_result([res], "modify")
+            return gallery, picked, save, f"🔼 Upscaled {scale}x (AI refine)."
+        c["mod_upscale"].click(
+            _upscale,
+            inputs=[c["out"], c["up_scale"], c["up_mode"], c["up_model"],
+                    c["up_denoise"], self.state],
+            outputs=[c["gallery"], c["picked"], c["save"], c["mod_status"]],
+            js=("(edited, a, b, d, e, f) => { try{ window.__is_modify_exportnow(); }catch(e){} "
+                "var el=document.querySelector('#imagesuite-modify-out textarea')"
+                "||document.querySelector('#imagesuite-modify-out input'); "
+                "return [el ? el.value : edited, a, b, d, e, f]; }"))
 
         # Save the edited image into the results gallery (so send-to can act on it).
         def _save(edited):

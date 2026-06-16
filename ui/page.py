@@ -225,11 +225,33 @@ def _prompt_library_block(c, mode):
         c["pl_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
 
 
+def _advanced_prompt_default() -> bool:
+    """Default the 'Advanced prompt' toggle ON only when compel is already importable
+    (so SDXL gets weights/BREAK/long-prompt out of the box where it works) and OFF
+    otherwise (no surprise install, raw-string path = current behaviour). Best-effort;
+    a build never breaks on this check."""
+    try:
+        from ..core import deps as _deps
+        return bool(_deps.has("compel"))
+    except Exception:
+        return False
+
+
 def _prompt_block(c):
     """Prompt + negative + Qwen-abliterated Enhance buttons (wired in plugin.py)."""
     c["pos"] = gr.Textbox(label="Prompt", lines=3, placeholder="Describe the image…")
     c["neg"] = gr.Textbox(label="Negative prompt", lines=2,
                           placeholder="low quality, blurry…")
+    # Advanced prompting (SDXL / Pony / Illustrious only): parse (token:1.3) weights,
+    # the BREAK chunk separator, and >77-token prompts via compel embeds. Default ON
+    # when compel is present, else OFF. Off = the exact raw-string path (weights
+    # literal, >77 tokens truncated) — current behaviour. Native models ignore it.
+    c["adv_prompt"] = gr.Checkbox(
+        value=_advanced_prompt_default(),
+        label="🎚 Advanced prompt (weights / BREAK / long)",
+        info="SDXL family only. Reads (token:1.3) emphasis, BREAK to start a new "
+             "77-token chunk, and prompts past 77 tokens. Off = raw text (weights "
+             "literal, long prompts truncated). Installs 'compel' on first use.")
     with gr.Row():
         c["enhance_pos"] = gr.Button("✨ Enhance prompt")
         c["enhance_neg"] = gr.Button("✨ Enhance negative")
@@ -241,6 +263,123 @@ def _prompt_block(c):
                                         label="Interrogate tag threshold")
         c["interro_mode"] = gr.Radio(["Replace", "Append"], value="Replace",
                                      label="Interrogate result")
+
+
+# ControlNet conditioning types offered in the UI. SINGLE ControlNet for now.
+# canny/depth/openpose have verified standalone SDXL ControlNet models; lineart/tile
+# need the all-in-one ControlNet Union model (download it from the Prereqs panel).
+_CONTROLNET_TYPES = [
+    ("Canny (edges)", "canny"),
+    ("Depth (Midas)", "depth"),
+    ("OpenPose (pose)", "openpose"),
+    ("Lineart", "lineart"),
+    ("Tile / raw", "tile"),
+]
+
+
+def _controlnet_block(c, mode):
+    """ControlNet accordion (txt2img / img2img, SDXL family). Default OFF: when the
+    Enable checkbox is unchecked the generation path is byte-for-byte unchanged.
+    Native Flux / Z-Image / Qwen ignore ControlNet entirely. SINGLE ControlNet for
+    now (the wrapper + pipeline already support multi — extend the inputs here)."""
+    with gr.Accordion("🎛 ControlNet (SDXL only)", open=False,
+                      elem_classes="imagesuite-acc"):
+        gr.Markdown(
+            "Guide the generation with a **control image** (edges / depth / pose / "
+            "lineart). **SDXL / Pony / Illustrious only** — native models ignore it. "
+            "Off (default) = no ControlNet. Download the ControlNet model for your "
+            "type from the **Prereqs** panel first (canny/depth/pose have their own "
+            "SDXL models; lineart/tile need **ControlNet Union**).",
+            elem_classes="imagesuite-help")
+        c["cn_enable"] = gr.Checkbox(value=False, label="Enable ControlNet")
+        with gr.Row():
+            c["cn_type"] = gr.Dropdown(
+                label="Type", choices=_CONTROLNET_TYPES, value="canny", scale=2)
+            c["cn_use_raw"] = gr.Checkbox(
+                value=False, label="Use raw image (skip preprocessor)", scale=1,
+                info="Feed the control image straight in (it's already a "
+                     "condition map, or for Tile).")
+        c["cn_image"] = gr.Image(
+            label="Control image", type="filepath", height=200,
+            elem_classes="imagesuite-initthumb")
+        with gr.Row():
+            c["cn_preprocess"] = gr.Button("🔎 Preprocess preview", size="sm", scale=1)
+        c["cn_preview"] = gr.Image(
+            label="Preprocessed (condition map)", type="filepath", height=200,
+            interactive=False)
+        with gr.Row():
+            c["cn_strength"] = gr.Slider(
+                0.0, 2.0, value=0.7, step=0.05, label="ControlNet strength",
+                info="Conditioning scale — how strongly the control image steers.")
+        with gr.Row():
+            c["cn_guidance_start"] = gr.Slider(
+                0.0, 1.0, value=0.0, step=0.05, label="Guidance start",
+                info="Fraction of the schedule before ControlNet kicks in.")
+            c["cn_guidance_end"] = gr.Slider(
+                0.0, 1.0, value=1.0, step=0.05, label="Guidance end",
+                info="Fraction of the schedule after which ControlNet stops.")
+        with gr.Accordion("Preprocessor options", open=False,
+                          elem_classes="imagesuite-acc"):
+            with gr.Row():
+                c["cn_detect_res"] = gr.Slider(
+                    256, 1024, value=512, step=64, label="Detect resolution")
+                c["cn_image_res"] = gr.Slider(
+                    256, 1536, value=512, step=64, label="Output resolution")
+            with gr.Row():
+                c["cn_canny_low"] = gr.Slider(
+                    1, 255, value=100, step=1, label="Canny low threshold")
+                c["cn_canny_high"] = gr.Slider(
+                    1, 255, value=200, step=1, label="Canny high threshold")
+        c["cn_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
+
+
+# XYZ-sweep axes. Each value is the per-image SD param the axis varies; the labels
+# read naturally in the accordion. "none" disables that axis. sampler/scheduler take
+# names from the dropdowns above (comma-separated); the rest take numbers.
+_SWEEP_AXES = [
+    ("(none)", "none"),
+    ("Seed", "seed"),
+    ("Steps", "steps"),
+    ("CFG", "cfg"),
+    ("Sampler", "sampler"),
+    ("Scheduler", "scheduler"),
+    ("Denoise", "denoise"),
+    ("Clip skip", "clip_skip"),
+]
+
+
+def _xyz_sweep_block(c, mode):
+    """Parameter sweep / XYZ grid (txt2img + img2img, SDXL family). Default OFF: when
+    the Enable checkbox is unchecked the normal single/batch Generate path runs
+    byte-for-byte unchanged. Enabled, it runs the cartesian product of the X (and
+    optional Y) value lists through the EXISTING per-image SD generate path and
+    assembles one labelled contact-sheet grid (saved alongside the individual images).
+    SD-path only — native Flux / Z-Image / Qwen ignore the sweep and gen normally."""
+    with gr.Accordion("🔬 XYZ sweep (parameter grid)", open=False,
+                      elem_classes="imagesuite-acc"):
+        gr.Markdown(
+            "Vary 1–2 settings across a **value list** and assemble a labelled "
+            "contact-sheet grid (plus the individual images). Pick an axis, enter a "
+            "comma-separated list (e.g. Steps `20, 30, 40` or Sampler "
+            "`Euler, DPM++ 2M`). Off (default) = normal Generate. **SDXL / Pony / "
+            "Illustrious only** — native models ignore it. Each cell reuses the "
+            "page's model / LoRAs / prompt; the per-image generator runs once per "
+            "combination, so a big grid takes a while." +
+            ("" if mode != "txt2img" else
+             " *Denoise* only applies on Img2Img."),
+            elem_classes="imagesuite-help")
+        c["sweep_enable"] = gr.Checkbox(value=False, label="Enable XYZ sweep")
+        with gr.Row():
+            c["sweep_x_axis"] = gr.Dropdown(
+                label="X axis", choices=_SWEEP_AXES, value="steps", scale=1)
+            c["sweep_x_values"] = gr.Textbox(
+                label="X values (comma-separated)", placeholder="20, 30, 40", scale=2)
+        with gr.Row():
+            c["sweep_y_axis"] = gr.Dropdown(
+                label="Y axis", choices=_SWEEP_AXES, value="none", scale=1)
+            c["sweep_y_values"] = gr.Textbox(
+                label="Y values (comma-separated)", placeholder="(leave blank for 1-D)",
+                scale=2)
 
 
 def _overlays_strip_block(c):
@@ -445,6 +584,27 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None,
                     c["mod_match"] = gr.Button("🎨 Apply colour match")
                 with gr.Row(elem_classes="imagesuite-genrow"):
                     c["mod_removebg"] = gr.Button("✂️ Remove background")
+                with gr.Accordion("Upscale", open=False,
+                                  elem_classes="imagesuite-acc"):
+                    gr.Markdown(
+                        "Enlarge the edited image. **Fast** is a high-quality "
+                        "Lanczos resize (no model, instant). **AI refine** adds "
+                        "detail with a low-denoise SDXL pass run in tiles "
+                        "(needs an SDXL / Pony / Illustrious model below).",
+                        elem_classes="imagesuite-help")
+                    with gr.Row():
+                        c["up_scale"] = gr.Radio(
+                            ["2x", "4x"], value="2x", label="Scale", scale=1)
+                        c["up_mode"] = gr.Radio(
+                            ["Fast (Lanczos)", "AI refine"],
+                            value="Fast (Lanczos)", label="Mode", scale=2)
+                    c["up_model"] = gr.Dropdown(
+                        label="AI-refine model (SDXL family)",
+                        choices=sdxl_choices or [], value=None)
+                    c["up_denoise"] = gr.Slider(
+                        0.05, 0.6, value=0.25, step=0.05,
+                        label="AI-refine strength (denoise)")
+                    c["mod_upscale"] = gr.Button("🔼 Upscale")
                 with gr.Row(elem_classes="imagesuite-genrow"):
                     c["mod_save"] = gr.Button("💾 Save to results", variant="primary")
                 c["mod_status"] = gr.Markdown("", elem_classes="imagesuite-genstatus")
@@ -470,6 +630,10 @@ def build_page(mode, model_choices=None, lora_choices=None, sdxl_choices=None,
                             elem_classes="imagesuite-initthumb")
             else:
                 _prompt_block(c)
+            # ControlNet (SDXL family, default OFF) — txt2img + img2img only.
+            _controlnet_block(c, mode)
+            # XYZ sweep / parameter grid (SDXL family, default OFF) — txt2img + img2img.
+            _xyz_sweep_block(c, mode)
             # Generate/Abort moved to the right column, directly under the results
             # gallery (see _results_block). The left column is inputs only now.
             c.update(_enhance.build_enhance_sections(mode, sdxl_choices, lora_choices))

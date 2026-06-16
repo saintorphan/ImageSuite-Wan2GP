@@ -118,6 +118,182 @@ def sharpen(image_path, radius=2.0, percent=120, threshold=3, out_dir=None) -> s
         return image_path
 
 
+# ---- Upscale (Lanczos always; optional SDXL tiled img2img refine) ----------
+# Phase A is a pure PIL resize — no model, no GPU, never fails on a missing
+# checkpoint. Phase B reuses the loaded SD pipe's img2img variant (shared
+# UNet/VAE — no second model) to add detail at a low denoise, run TILE-BY-TILE
+# so a 4x of a 1024² image (→4096²) never tries to diffuse the whole frame and
+# OOM a 12GB card. The tile path is best-effort: any failure falls back to the
+# Lanczos result so an upscale request never breaks.
+
+def upscale(image_path, scale=2, mode="lanczos", out_dir=None) -> str:
+    """High-quality resampled upscale (Phase A). ``scale`` 2 or 4; ``mode``
+    "lanczos" (default, sharpest) or "bicubic". No model, no GPU — always works.
+    Returns the saved PNG path (or the input path on any failure)."""
+    import time
+    from PIL import Image
+    try:
+        scale = 4 if int(scale) >= 4 else 2
+        resample = Image.BICUBIC if str(mode).lower() == "bicubic" else Image.LANCZOS
+        img = Image.open(image_path).convert("RGB")
+        w, h = img.size
+        up = img.resize((max(1, w * scale), max(1, h * scale)), resample)
+        out = Path(out_dir) if out_dir else (paths.cache_dir() / "upscale")
+        out.mkdir(parents=True, exist_ok=True)
+        f = out / f"upscale_{scale}x_{int(time.time() * 1000)}.png"
+        up.save(f)
+        return str(f)
+    except Exception:
+        logger.warning("upscale (resample) failed", exc_info=True)
+        return image_path
+
+
+def _tile_boxes(w, h, tile, overlap):
+    """Yield (x0, y0, x1, y1) tile boxes covering a w×h image, each ``tile`` px on
+    the long side with ``overlap`` px shared between neighbours. The last row/col
+    is clamped to the edge so tiles never run past the image."""
+    boxes = []
+    step = max(1, tile - overlap)
+    ys = list(range(0, max(1, h - overlap), step)) or [0]
+    xs = list(range(0, max(1, w - overlap), step)) or [0]
+    for y0 in ys:
+        for x0 in xs:
+            x1 = min(w, x0 + tile)
+            y1 = min(h, y0 + tile)
+            # Pull the box back so a clamped edge tile keeps the full tile size
+            # (better than a sliver tile the VAE handles poorly).
+            x0c = max(0, x1 - tile)
+            y0c = max(0, y1 - tile)
+            boxes.append((x0c, y0c, x1, y1))
+    return boxes
+
+
+def upscale_tiled_refine(checkpoint_path, image_path, scale=2, denoise=0.25,
+                         prompt="", negative="", steps=24, cfg=6.0, seed=-1,
+                         sampler="DPM++ 2M", scheduler="Karras", clip_skip=1,
+                         tile=1024, overlap=96, loras=None, out_dir=None,
+                         callback=None, progress=None) -> str:
+    """AI detail upscale (Phase B): Lanczos to the target size, then a LOW-denoise
+    img2img refine run tile-by-tile on the SD pipe's img2img variant (shared
+    UNet/VAE — no second model). Tiling caps peak VRAM so a 4x of a 1024² image
+    fits a 12GB card.
+
+    Best-effort: a tile that throws keeps its Lanczos pixels, and a total failure
+    falls back to the plain ``upscale`` result — an upscale request never breaks.
+    Requires the SDXL checkpoint present (guarded by the caller); runs offline
+    under no_auto_download so it never silently pulls weights. ``denoise`` is kept
+    low (~0.2-0.35) so it adds detail without changing content."""
+    import random as _random
+    import time
+    from PIL import Image, ImageFilter
+
+    def _say(frac, msg):
+        if progress is not None:
+            try:
+                progress(frac, desc=msg)
+            except Exception:
+                pass
+
+    # 1. Resample to the target resolution first (Phase A — always works).
+    base_path = upscale(image_path, scale=scale, mode="lanczos", out_dir=out_dir)
+    if not checkpoint_path:
+        return base_path  # no model → keep the Lanczos result
+
+    if seed is None or int(seed) < 0:
+        seed = _random.randint(0, 2**31 - 1)
+    tile = max(256, int(tile))
+    overlap = max(0, min(int(overlap), tile // 2))
+
+    try:
+        big = Image.open(base_path).convert("RGB")
+    except Exception:
+        logger.warning("tiled refine: could not open base; using Lanczos result",
+                       exc_info=True)
+        return base_path
+    W, H = big.size
+
+    # A small image that fits in one tile doesn't need tiling — but the refine
+    # dimensions must be multiples of 8 for the VAE, so snap per-tile below.
+    boxes = _tile_boxes(W, H, tile, overlap)
+    result = big.copy()
+    pipe = get_pipeline()
+
+    _say(0.1, "AI upscale: refining tiles…")
+    with models.no_auto_download():  # checkpoint must be present, never pulled
+        pipe.load(checkpoint_path, vae_name=_vae_name())
+        pipe.remove_loras()
+        _apply_loras(pipe, loras)
+        try:
+            n = len(boxes)
+            for i, (x0, y0, x1, y1) in enumerate(boxes):
+                if was_aborted():
+                    break
+                tw, th = x1 - x0, y1 - y0
+                # Snap the refine size to /8 for the VAE; refine at the tile's own
+                # resolution (no extra up/downscale of content).
+                rw = max(8, (tw // 8) * 8)
+                rh = max(8, (th // 8) * 8)
+                crop = result.crop((x0, y0, x1, y1))
+                try:
+                    out_imgs = pipe.generate_img2img(
+                        image=crop, prompt=prompt or "", negative_prompt=negative or "",
+                        denoising_strength=float(denoise), width=rw, height=rh,
+                        steps=int(steps), cfg_scale=float(cfg), seed=int(seed),
+                        sampler=sampler, scheduler=scheduler or "Karras",
+                        resize_mode=0, batch_size=1, clip_skip=int(clip_skip),
+                        callback=callback)
+                    ref = out_imgs[0] if out_imgs else None
+                except Exception:
+                    logger.warning("tiled refine: tile %d/%d failed; keeping Lanczos "
+                                   "pixels", i + 1, n, exc_info=True)
+                    ref = None
+                if ref is None:
+                    continue
+                if ref.size != (tw, th):
+                    ref = ref.resize((tw, th), Image.LANCZOS)
+                # Feathered paste so overlapping tiles blend rather than seam. Edge
+                # tiles touching the image border keep a hard edge there.
+                feather = max(1, overlap // 2)
+                mask = Image.new("L", (tw, th), 255)
+                if feather > 1:
+                    inner = Image.new("L", (max(1, tw - 2 * feather),
+                                            max(1, th - 2 * feather)), 255)
+                    m2 = Image.new("L", (tw, th), 0)
+                    m2.paste(inner, (feather, feather))
+                    mask = m2.filter(ImageFilter.GaussianBlur(radius=feather))
+                    # Don't feather against the true image border (no neighbour there).
+                    if x0 == 0 or y0 == 0 or x1 == W or y1 == H:
+                        hard = Image.new("L", (tw, th), 0)
+                        bx0 = 0 if x0 == 0 else feather
+                        by0 = 0 if y0 == 0 else feather
+                        bx1 = tw if x1 == W else tw - feather
+                        by1 = th if y1 == H else th - feather
+                        from PIL import ImageDraw
+                        ImageDraw.Draw(hard).rectangle((bx0, by0, bx1, by1), fill=255)
+                        # Combine: max of the feathered interior and the hard border keep.
+                        import numpy as _np
+                        mask = Image.fromarray(
+                            _np.maximum(_np.asarray(mask), _np.asarray(hard)), "L")
+                result.paste(ref, (x0, y0), mask)
+                _say(0.1 + 0.85 * (i + 1) / max(1, n),
+                     f"AI upscale: tile {i + 1}/{n}")
+        finally:
+            pipe.remove_loras()
+
+    if was_aborted():
+        return base_path  # interrupted — return the clean Lanczos upscale
+    out = Path(out_dir) if out_dir else (paths.cache_dir() / "upscale")
+    out.mkdir(parents=True, exist_ok=True)
+    f = out / f"upscale_ai_{int(scale)}x_{int(seed)}_{int(time.time() * 1000)}.png"
+    try:
+        result.save(f)
+        return str(f)
+    except Exception:
+        logger.warning("tiled refine: save failed; returning Lanczos result",
+                       exc_info=True)
+        return base_path
+
+
 def release_sd(force: bool = True):
     """Unload the cached SD txt2img pipeline + free its VRAM (the SDXL checkpoint
     is ~6.5GB). Call before a different heavy model needs the GPU.
@@ -345,7 +521,8 @@ def _pnginfo(checkpoint_path, prompt, negative, seed, steps, cfg, sampler,
 
 
 def _hires_fix(pipe, images, prompt, negative, width, height, hr_scale, hr_denoise,
-               steps, cfg, seed, sampler, scheduler, clip_skip, callback):
+               steps, cfg, seed, sampler, scheduler, clip_skip, callback,
+               advanced_prompt=False):
     """Latent hi-res fix: upscale each base txt2img image by ``hr_scale`` and run a
     low-denoise img2img second pass on the SAME loaded pipe (its img2img variant
     shares the UNet/VAE/text-encoders — no second model, minimal extra VRAM).
@@ -373,7 +550,8 @@ def _hires_fix(pipe, images, prompt, negative, width, height, hr_scale, hr_denoi
                 denoising_strength=float(hr_denoise), width=hw, height=hh,
                 steps=hr_steps, cfg_scale=float(cfg), seed=int(seed),
                 sampler=sampler, scheduler=scheduler or "Karras", resize_mode=0,
-                batch_size=1, clip_skip=int(clip_skip), callback=callback)
+                batch_size=1, clip_skip=int(clip_skip), callback=callback,
+                advanced_prompt=advanced_prompt)
             refined.append(out[0] if out else img)
         except Exception:
             logger.warning("hi-res fix pass failed; using base image", exc_info=True)
@@ -381,12 +559,29 @@ def _hires_fix(pipe, images, prompt, negative, width, height, hr_scale, hr_denoi
     return refined
 
 
+def _ensure_advanced_prompt(advanced_prompt) -> bool:
+    """Resolve the per-call advanced-prompt flag to whether the compel path should
+    run. Best-effort auto-install of compel on first use; any failure (or the flag
+    off) means the SD pipeline takes its exact current raw-string prompt path."""
+    if not advanced_prompt:
+        return False
+    try:
+        from . import deps
+        deps.ensure_advanced_prompt()
+        return True
+    except Exception:
+        logger.warning("compel auto-install failed — using raw prompt path",
+                       exc_info=True)
+        return False
+
+
 def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cfg,
                      seed, sampler="DPM++ 2M", scheduler="", batch_size=1,
                      clip_skip=1, out_dir=None, callback=None, loras=None,
                      turbo="Off", hr_scale=1.0, hr_denoise=0.4,
                      refiner_checkpoint="", refiner_switch_at=0.8,
-                     refiner_steps=10, refiner_cfg=7.0) -> list[str]:
+                     refiner_steps=10, refiner_cfg=7.0,
+                     advanced_prompt=False) -> list[str]:
     """Generate image(s) with an SD-family checkpoint; returns saved file paths.
 
     ``turbo`` ("Off"/LCM/Hyper-SD/Lightning) applies a distilled few-step preset:
@@ -405,6 +600,7 @@ def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cf
     refiner checkpoint is empty or can't be resolved, so behaviour never regresses."""
     import random as _random
     pipe = get_pipeline()
+    adv = _ensure_advanced_prompt(advanced_prompt)
     sampler, scheduler, steps, cfg, loras = _apply_turbo(
         turbo, sampler, scheduler, steps, cfg, loras)
     if seed is None or int(seed) < 0:
@@ -430,6 +626,7 @@ def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cf
                 refiner_switch_at=float(refiner_switch_at),
                 refiner_steps=int(refiner_steps),
                 refiner_cfg_scale=float(refiner_cfg),
+                advanced_prompt=adv,
             )
             # Hi-res fix second pass reuses the loaded pipe's img2img variant (same
             # UNet/VAE — no extra model). LoRAs are still applied here (shared with
@@ -438,7 +635,7 @@ def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cf
                 images = _hires_fix(
                     pipe, images, prompt, negative, width, height, hr_scale,
                     hr_denoise, steps, cfg, seed, sampler, scheduler, clip_skip,
-                    callback)
+                    callback, advanced_prompt=adv)
         finally:
             pipe.remove_loras()
     out = Path(out_dir) if out_dir else (paths.cache_dir() / "sd_gen")
@@ -459,7 +656,8 @@ def generate_txt2img(checkpoint_path, prompt, negative, width, height, steps, cf
 def generate_img2img(checkpoint_path, image_path, prompt, negative, width, height,
                      steps, cfg, seed, denoise=0.6, sampler="DPM++ 2M", scheduler="Karras",
                      resize_mode=0, batch_size=1, clip_skip=1, out_dir=None,
-                     callback=None, loras=None, turbo="Off") -> list[str]:
+                     callback=None, loras=None, turbo="Off",
+                     advanced_prompt=False) -> list[str]:
     """Reimagine an init image with an SD-family checkpoint (img2img). resize_mode
     fits the init image to width×height: 0 just-resize / 1 crop-and-resize /
     2 resize-and-fill (A1111/reForge codes).
@@ -467,6 +665,7 @@ def generate_img2img(checkpoint_path, image_path, prompt, negative, width, heigh
     ``turbo`` applies a distilled few-step preset (see generate_txt2img)."""
     import random as _random
     pipe = get_pipeline()
+    adv = _ensure_advanced_prompt(advanced_prompt)
     sampler, scheduler, steps, cfg, loras = _apply_turbo(
         turbo, sampler, scheduler, steps, cfg, loras)
     if seed is None or int(seed) < 0:
@@ -482,7 +681,8 @@ def generate_img2img(checkpoint_path, image_path, prompt, negative, width, heigh
                 denoising_strength=float(denoise), width=int(width), height=int(height),
                 steps=int(steps), cfg_scale=float(cfg), seed=int(seed), sampler=sampler,
                 scheduler=scheduler, resize_mode=int(resize_mode),
-                batch_size=int(batch_size), clip_skip=int(clip_skip), callback=callback)
+                batch_size=int(batch_size), clip_skip=int(clip_skip), callback=callback,
+                advanced_prompt=adv)
         finally:
             pipe.remove_loras()
     out = Path(out_dir) if out_dir else (paths.cache_dir() / "sd_gen")
@@ -503,7 +703,7 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
             steps=30, cfg=6.0, seed=-1, sampler="DPM++ 2M", scheduler="Karras",
             clip_skip=1, mask_blur=4, inpainting_fill=1, full_res=False, padding=32,
             seamless=False, batch_size=1, loras=None, out_dir=None, callback=None,
-            progress=None, turbo="Off") -> list[str]:
+            progress=None, turbo="Off", advanced_prompt=False) -> list[str]:
     """Prompt-driven masked inpaint for manual touch-ups (no IP-Adapter). Returns the
     saved image paths (``batch_size`` of them).
 
@@ -516,6 +716,7 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
     import random as _random
     from PIL import Image
     pipe = get_pipeline()
+    adv = _ensure_advanced_prompt(advanced_prompt)
     sampler, scheduler, steps, cfg, loras = _apply_turbo(
         turbo, sampler, scheduler, steps, cfg, loras)
     if seed is None or int(seed) < 0:
@@ -552,7 +753,8 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
                 steps=int(steps), cfg_scale=float(cfg), seed=int(seed), sampler=sampler,
                 scheduler=scheduler, clip_skip=int(clip_skip), mask_blur=int(mask_blur),
                 inpainting_fill=int(inpainting_fill), full_res=bool(full_res),
-                padding=int(padding), batch_size=int(batch_size), callback=callback)
+                padding=int(padding), batch_size=int(batch_size), callback=callback,
+                advanced_prompt=adv)
         finally:
             pipe._use_laplacian_blend = prev_lap_blend
             if ip is not None:
@@ -572,6 +774,122 @@ def inpaint(checkpoint_path, image_path, mask_image, prompt, negative, denoise=0
             saved.append(str(f))
         except Exception:
             logger.warning("failed saving inpaint", exc_info=True)
+    return saved
+
+
+# ---- ControlNet (SDXL family) ---------------------------------------------
+# Thin wrapper over SDImagePipeline.generate_controlnet. SINGLE ControlNet for now
+# (multi-CN would pass lists of types/strengths/control-images — generate_controlnet
+# already accepts them; extend the UI + this wrapper there). The standalone CN pipe
+# fully unloads the main pipe and runs under sequential CPU offload (12GB target);
+# release_controlnet() frees it and restores the main pipe.
+
+# Preprocessor overrides come from a tiny config-like object so we can reuse
+# controlnet_types.preprocessor_overrides_for without a full ProjectConfig.
+class _CNOverrides:
+    """Duck-typed config for controlnet_types.preprocessor_overrides_for — only the
+    cn_* attributes it reads need to exist; everything else falls back to defaults."""
+    def __init__(self, detect_res=512, image_res=512, canny_low=100, canny_high=200,
+                 openpose_hand=True, openpose_face=True):
+        self.cn_detect_resolution = int(detect_res)
+        self.cn_image_resolution = int(image_res)
+        self.cn_canny_low = int(canny_low)
+        self.cn_canny_high = int(canny_high)
+        self.cn_openpose_include_hand = bool(openpose_hand)
+        self.cn_openpose_include_face = bool(openpose_face)
+
+
+def preprocess_control(cn_type, image_path, detect_res=512, image_res=512,
+                       canny_low=100, canny_high=200, out_dir=None) -> str:
+    """Run a ControlNet preprocessor on ``image_path`` and save the condition map.
+
+    Used by the UI 'Preprocess preview' button. Auto-installs controlnet_aux on first
+    use; raises a clear error (never crashes) if a preprocessor is missing/broken.
+    Returns the saved PNG path. ``cn_type`` keys come from controlnet_types
+    (canny/depth/openpose/lineart/tile/...)."""
+    import time
+    from . import deps
+    from .sd import controlnet_types as cnt
+    deps.ensure({"controlnet_aux": "controlnet_aux"}, label="ControlNet preprocessor")
+    cfg = _CNOverrides(detect_res, image_res, canny_low, canny_high)
+    overrides = cnt.preprocessor_overrides_for(cn_type, cfg)
+    # Preprocessors download their own small annotator weights on first use; allow it
+    # here (this is an explicit, user-pressed action, not silent generation).
+    cond = cnt.run_preprocessor(cn_type, image_path, **overrides)
+    out = Path(out_dir) if out_dir else (paths.cache_dir() / "controlnet")
+    out.mkdir(parents=True, exist_ok=True)
+    f = out / f"cn_preview_{cn_type}_{int(time.time() * 1000)}.png"
+    cond.save(f)
+    return str(f)
+
+
+def run_controlnet(checkpoint_path, control_image, prompt, negative, width, height,
+                   steps, cfg, seed, cn_type="canny", cn_strength=0.7,
+                   guidance_start=0.0, guidance_end=1.0, use_raw=False,
+                   source_image=None, denoise=0.75, sampler="DPM++ 2M",
+                   scheduler="Karras", clip_skip=1, loras=None, turbo="Off",
+                   detect_res=512, image_res=512, canny_low=100, canny_high=200,
+                   batch_size=1, out_dir=None, callback=None) -> list[str]:
+    """Generate with a SINGLE ControlNet conditioning (SDXL family). Returns saved
+    paths.
+
+    Runs the chosen preprocessor on ``control_image`` (unless ``use_raw`` bypasses it
+    — for pre-made condition maps / tile), then SDImagePipeline.generate_controlnet.
+    ``source_image`` set → img2img-with-ControlNet (else txt2img). The ControlNet
+    model + its standalone pipe never auto-download under generation; a missing model
+    raises a clear error telling the user to fetch it from the Prereqs panel.
+
+    Multi-ControlNet would extend here: build lists of cn_type/cn_strength and stacked
+    control images and pass them straight through (generate_controlnet already handles
+    list inputs + MultiControlNetModel)."""
+    import random as _random
+    from . import deps
+    from .sd import controlnet_types as cnt
+    pipe = get_pipeline()
+    sampler, scheduler, steps, cfg, loras = _apply_turbo(
+        turbo, sampler, scheduler, steps, cfg, loras)
+    if seed is None or int(seed) < 0:
+        seed = _random.randint(0, 2**31 - 1)
+
+    # Preprocess the control image (unless bypassed). controlnet_aux is auto-installed
+    # on first use; a missing/broken preprocessor raises a clear error here (the
+    # caller surfaces it) instead of crashing — generation never silently breaks.
+    if use_raw:
+        cond = control_image
+    else:
+        deps.ensure({"controlnet_aux": "controlnet_aux"}, label="ControlNet preprocessor")
+        cfg_ov = _CNOverrides(detect_res, image_res, canny_low, canny_high)
+        overrides = cnt.preprocessor_overrides_for(cn_type, cfg_ov)
+        cond = cnt.run_preprocessor(cn_type, control_image, **overrides)
+
+    lora_list = loras or []
+    with models.no_auto_download():  # CN model + checkpoint must be present, never pulled
+        images = pipe.generate_controlnet(
+            control_images=[cond],
+            source_image=source_image,
+            prompt=prompt or "", negative_prompt=negative or "",
+            steps=int(steps), cfg_scale=float(cfg), seed=int(seed),
+            sampler=sampler or "DPM++ 2M", scheduler=scheduler or "Karras",
+            checkpoint_path=checkpoint_path,
+            controlnet_types=[cn_type], controlnet_strengths=[float(cn_strength)],
+            width=int(width), height=int(height),
+            denoising_strength=float(denoise),
+            num_images_per_prompt=int(batch_size),
+            control_guidance_start=float(guidance_start),
+            control_guidance_end=float(guidance_end),
+            clip_skip=int(clip_skip), loras=lora_list, callback=callback)
+    out = Path(out_dir) if out_dir else (paths.cache_dir() / "sd_gen")
+    out.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for i, img in enumerate(images or []):
+        f = out / f"cn_{int(seed)}_{i}.png"
+        try:
+            info = _pnginfo(checkpoint_path, prompt, negative, seed, steps, cfg,
+                            sampler, scheduler, clip_skip, img)
+            img.save(f, pnginfo=info)
+            saved.append(str(f))
+        except Exception:
+            logger.warning("failed saving ControlNet image %d", i, exc_info=True)
     return saved
 
 
@@ -1059,3 +1377,136 @@ def body_swap(checkpoint_path, base_path, source_person_path, prompt, negative,
             logger.warning("ADetailer pass failed; returning un-refined body swap",
                            exc_info=True)
     return res
+
+
+# ---- Replace Person (pose-copy ControlNet + IP-Adapter FaceID identity) -----
+# The most sophisticated SD enhancement: segment the WHOLE person in the base,
+# copy its POSE via an OpenPose ControlNet, and regenerate that region wearing the
+# reference person's IDENTITY (IP-Adapter FaceID / InsightFace embeddings). Unlike
+# Body Swap (a skin/texture IP-Adapter inpaint that preserves the original head),
+# this replaces the entire person — head included — so the result IS the reference
+# person, re-posed to match the base. Runs on the standalone body-double pipe
+# (sequential CPU offload, 12GB target); release_body_double() frees it.
+
+def _person_mask_for_replace(base_path, models_root):
+    """White = whole person to replace; black = background, kept. BiRefNet person
+    segmentation, lightly dilated + feathered so the new person fully covers the
+    old silhouette. Distinct from head_excluded_body_mask (body swap), which carves
+    out the head/hands — Replace Person regenerates the head too (identity comes
+    from the FaceID reference)."""
+    import numpy as np
+    from PIL import Image, ImageFilter
+    from .sd.segmentation import segment_foreground, release_segmentation_model
+    from . import deps
+    deps.ensure({"kornia": "kornia"})  # BiRefNet modeling code
+    mp = segment_foreground(base_path, models_root)
+    release_segmentation_model()
+    _free_torch()
+    person = np.array(Image.open(mp).convert("L"))
+    try:
+        os.unlink(mp)
+    except Exception:
+        pass
+    mask = (person > 127).astype("uint8") * 255
+    pil = Image.fromarray(mask, "L")
+    # Slight dilation (MaxFilter) so the regenerated person overruns the old edge,
+    # then a soft feather for a clean composite seam.
+    try:
+        pil = pil.filter(ImageFilter.MaxFilter(7))
+    except Exception:
+        pass
+    return pil
+
+
+def replace_person(checkpoint_path, base_path, reference_path, prompt, negative,
+                   cn_strength=0.7, ip_scale=0.7, denoise=0.85, cfg=7.0, steps=30,
+                   seed=-1, sampler="DPM++ 3M SDE", scheduler="Karras",
+                   ip_variant="faceid_plus", openpose_include_hand=True,
+                   openpose_include_face=True, loras=None, out_dir=None,
+                   progress=None) -> str | None:
+    """Replace the person in ``base_path`` with the reference person, keeping the
+    base's POSE. Pose is copied from the base via an OpenPose ControlNet; identity
+    is transferred from ``reference_path`` via IP-Adapter FaceID. SD-family
+    checkpoints only. Returns the saved path (or None on abort / no result).
+
+    ``ip_variant`` selects the FaceID weights — "faceid_plus" (FaceID-Plus-v2,
+    dual-guidance, default) or "faceid". Both need a clearly visible face in the
+    reference + the FaceID weights from Settings → Models; a "no face detected"
+    error surfaces before any diffusion runs.
+
+    Falls back through the body-double pipe under sequential CPU offload so it fits
+    a 12GB card. All required models are guarded by the caller (plugin._require);
+    generation itself runs offline and raises a clear error if a model is absent —
+    it never silently downloads. ``release_body_double()`` frees the pipe + restores
+    the main pipe afterward (already wired into release_all)."""
+    import random as _random
+    import time
+    from PIL import Image
+    from . import deps
+    from .sd import controlnet_types as cnt
+
+    def _say(frac, msg):
+        if progress is not None:
+            try:
+                progress(frac, desc=msg)
+            except Exception:
+                pass
+
+    clear_abort()
+    if seed is None or int(seed) < 0:
+        seed = _random.randint(0, 2**31 - 1)
+    # Model family (SDXL vs SD1.5) is detected internally by generate_body_double /
+    # _get_body_double_pipe; the caller (plugin) guards the matching OpenPose CN.
+    cn_type = "openpose"
+    models_root = str(paths.models_dir())
+
+    # 1. Person mask (region to replace) — done BEFORE freeing the txt2img pipe is
+    #    fine; segment_foreground uses its own BiRefNet model.
+    _say(0.15, "Segmenting person…")
+    mask = _person_mask_for_replace(base_path, models_root)
+    if was_aborted():
+        return None
+
+    # 2. Pose control map from the base. controlnet_aux auto-installs on first use;
+    #    a missing/broken preprocessor raises a clear error (caller surfaces it).
+    _say(0.35, "Extracting pose (OpenPose)…")
+    deps.ensure({"controlnet_aux": "controlnet_aux"}, label="OpenPose preprocessor")
+    cfg_ov = _CNOverrides(openpose_hand=bool(openpose_include_hand),
+                          openpose_face=bool(openpose_include_face))
+    overrides = cnt.preprocessor_overrides_for(cn_type, cfg_ov)
+    pose_img = cnt.run_preprocessor(cn_type, base_path, **overrides)
+    if was_aborted():
+        return None
+
+    # 3. Generate on the standalone body-double pipe. Free the txt2img checkpoint
+    #    first — the CN+IP pipe (and its own unload(force=True)) needs the VRAM.
+    _say(0.5, "Replacing person (pose + FaceID identity)…")
+    release_sd()
+    pipe = get_pipeline()
+    base = Image.open(base_path).convert("RGB")
+    ref = Image.open(reference_path).convert("RGB")
+    lora_list = loras or []
+    with models.no_auto_download():  # CN/FaceID/checkpoint must be present, never pulled
+        results = pipe.generate_body_double(
+            image=base, mask=mask, source_person=ref,
+            control_images=[pose_img],
+            prompt=prompt or "", negative_prompt=negative or "",
+            denoising_strength=float(denoise), steps=int(steps),
+            cfg_scale=float(cfg), seed=int(seed), sampler=sampler or "DPM++ 3M SDE",
+            scheduler=scheduler or "Karras", checkpoint_path=checkpoint_path,
+            controlnet_types=[cn_type], controlnet_strengths=[float(cn_strength)],
+            ip_adapter_variant=ip_variant, ip_adapter_scale=float(ip_scale),
+            num_images_per_prompt=1, callback=_abort_callback, loras=lora_list)
+    if _abort_flag:  # interrupted mid-run — discard the partial result
+        return None
+    if not results:
+        return None
+    out = Path(out_dir) if out_dir else (paths.cache_dir() / "swap")
+    out.mkdir(parents=True, exist_ok=True)
+    f = out / f"replace_{int(seed)}_{int(time.time())}.png"
+    try:
+        results[0].save(f)
+        return str(f)
+    except Exception:
+        logger.warning("failed saving Replace Person result", exc_info=True)
+        return None

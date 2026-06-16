@@ -17,6 +17,24 @@ BODY_SWAP_DEPS = {
     "ultralytics": "ultralytics",    # YOLOv8 (ADetailer / person detection)
 }
 
+# Advanced SDXL prompting: (token:1.3) weighting, BREAK, >77-token chunking — see
+# core.sd.prompt_encode. Optional; the feature is gated OFF when this isn't present.
+PROMPT_DEPS = {
+    "compel": "compel",              # weighted / long-prompt embedding builder
+}
+
+
+def has(import_name: str) -> bool:
+    """True if *import_name* is importable (cheap availability check; never installs).
+
+    Used by feature gates that must default a toggle ON only when an optional code
+    dep is already present, without triggering an install at import/UI-build time."""
+    try:
+        importlib.import_module(import_name)
+        return True
+    except Exception:
+        return False
+
 
 def ensure(import_to_pip: dict, progress=None, label="dependencies") -> bool:
     """pip-install any of import_to_pip whose import-name isn't importable. If a
@@ -70,3 +88,12 @@ def ensure(import_to_pip: dict, progress=None, label="dependencies") -> bool:
 
 def ensure_body_swap(progress=None) -> bool:
     return ensure(BODY_SWAP_DEPS, progress=progress, label="body-swap dependencies")
+
+
+def ensure_advanced_prompt(progress=None) -> bool:
+    """Auto-install ``compel`` for advanced SDXL prompting (weights/BREAK/long).
+
+    Returns True once importable. Best-effort callers should wrap this in try/except
+    and fall back to the raw-string prompt path when it raises (so a missing/failed
+    compel install can never break generation)."""
+    return ensure(PROMPT_DEPS, progress=progress, label="advanced-prompt dependencies")
